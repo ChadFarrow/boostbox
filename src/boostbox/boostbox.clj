@@ -1,6 +1,7 @@
 (ns boostbox.boostbox
   (:gen-class)
-  (:require [aleph.http :as httpd]
+  (:require [clojure.java.io :as io]
+            [aleph.http :as httpd]
             [babashka.http-client :as http]
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.endpoint]
@@ -8,6 +9,7 @@
             [dev.onionpancakes.chassis.core :as html]
             [manifold.deferred :as mf]
             [muuntaja.core :as m]
+            [jsonista.core :as json]
             [reitit.ring :as ring]
             [reitit.ring.middleware.muuntaja :as muuntaja]
             [reitit.ring.middleware.parameters]
@@ -15,13 +17,51 @@
             [boostbox.ulid :as ulid]))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Setup & Config ~~~~~~~~~~~~~~~~~~~
+(defmacro str$
+  "Compile-time string interpolation with ~{expr} syntax.
+   
+   (str$ \"Name: ~{name}, Age: ~{(+ age 1)}\")
+   => compiles to: (str \"Name: \" name \", Age: \" (+ age 1))"
+  [s]
+  (let [pattern #"~\{([^}]*)\}|([^~]+)"
+        parts (re-seq pattern s)
+        forms (reduce (fn [acc [_ expr text]]
+                        (cond-> acc
+                          text (conj text)
+                          expr (conj (read-string expr))))
+                      []
+                      parts)]
+    (if (empty? forms)
+      ""
+      `(str ~@forms))))
 
-(defn s3-client [account-id access-key secret-key]
-  (aws/client {:api :s3
-               :region "us-east-1" ;; TODO: need to put something? auto doesn't work. Seems to not matter with the endpoint override.
-               :endpoint-override {:protocol :https :hostname (str account-id ".r2.cloudflarestorage.com")}
-               :credentials-provider (aws-creds/basic-credentials-provider {:access-key-id access-key
-                                                                            :secret-access-key secret-key})}))
+(defn get-env
+  "System/getenv that throws with no default."
+  ([key] (let [val (System/getenv key)]
+           (if (nil? val)
+             (throw (ex-info (str$ "Missing ENV VAR: ~{key}") {:missing-var key}))
+             val)))
+  ([key default] (let [val (System/getenv key)]
+                   (or val default))))
+
+(defn assert-in-set [allowed val]
+  (let [valid? (allowed val)]
+    (assert valid? (str$ "Invalid value: ~{val}, allowed: ~{allowed}"))))
+
+(defn config []
+  (let [env (get-env "ENV" "PROD")
+        _ (assert-in-set #{"DEV" "STAGING" "PROD"} env)
+        storage (get-env "BB_STORAGE" "FS")
+        _ (assert-in-set #{"FS" "S3"} storage)
+        base-config {:env env :storage storage}
+        storage-config (case storage
+                         "FS" {:root-path (get-env "BB_FS_ROOT_PATH" "boosts")}
+                         "S3" {:endpoint (get-env "BB_S3_ENDPOINT")
+                               :region (get-env "BB_S3_REGION")
+                               :access-key (get-env "BB_S3_ACCESS_KEY")
+                               :secret-key (get-env "BB_S3_SECRET_KEY")
+                               :bucket (get-env "BB_S3_BUCKET")})]
+    (into base-config storage-config)))
 
 ;; ~~~~~~~~~~~~~~~~~~~ UUID/ULID ~~~~~~~~~~~~~~~~~~~
 
@@ -35,20 +75,72 @@
 (defn ulid->uuid [u]
   (-> u ulid/ulid->bytes uuid/as-uuid))
 
+(defn valid-ulid? [u]
+  (try
+    (let [as-uuid (ulid->uuid u)]
+      (= 7 (uuid/get-version as-uuid)))
+    (catch Exception _ false)))
+
+;; ~~~~~~~~~~~~~~~~~~~ Storage ~~~~~~~~~~~~~~~~~~~
+(defprotocol IStorage
+  (store [this id data])
+  (retrieve [this id]))
+
+;; ~~~~~~~~~~~~~~~~~~~ FS ~~~~~~~~~~~~~~~~~~~
+(defn timestamp->prefix
+  "Convert unix timestamp (milliseconds) to \"YYYY/MM/DD\" string.
+   
+   (timestamp->prefix 1762637504140) => \"2025/11/08\""
+  [unix-ms]
+  (let [inst (java.time.Instant/ofEpochMilli unix-ms)
+        zdt (java.time.ZonedDateTime/ofInstant inst (java.time.ZoneId/of "UTC"))
+        year (.getYear zdt)
+        month (format "%02d" (.getMonthValue zdt))
+        day (format "%02d" (.getDayOfMonth zdt))]
+    (str$ "~{year}/~{month}/~{day}")))
+
+(defrecord LocalStorage [root-path]
+  IStorage
+  (store [_ id data]
+    (let [timestamp (ulid/ulid->timestamp id)
+          prefix (timestamp->prefix timestamp)
+          output-file (io/file root-path prefix (str$ "~{id}.json"))
+          _ (-> output-file .getParentFile .mkdirs)]
+      (json/write-value output-file data)))
+  (retrieve [_ id]
+    (let [timestamp (ulid/ulid->timestamp id)
+          prefix (timestamp->prefix timestamp)
+          input-file (io/file root-path prefix (str$ "~{id}.json"))]
+      (json/read-value input-file))))
+
+;; ~~~~~~~~~~~~~~~~~~~ S3 ~~~~~~~~~~~~~~~~~~~
+(defn s3-client [endpoint region access-key secret-key]
+  (aws/client {:api :s3
+               :region region
+               :endpoint-override {:protocol :https :hostname endpoint}
+               :credentials-provider
+               (aws-creds/basic-credentials-provider
+                {:access-key-id access-key
+                 :secret-access-key secret-key})}))
+(defrecord S3Storage [client bucket]
+  IStorage
+  (store [_ id data] nil)
+  (retrieve [_ id] nil))
+
 ;; ~~~~~~~~~~~~~~~~~~~ GET View ~~~~~~~~~~~~~~~~~~~
 
 ;; ~~~~~~~~~~~~~~~~~~~ POST View ~~~~~~~~~~~~~~~~~~~
 
 ;; ~~~~~~~~~~~~~~~~~~~ HTTP Server ~~~~~~~~~~~~~~~~~~~
 
-(defn routes [s3-client podping-token]
-  [["/" {:get {:handler (fn [_] {:status 200 :body "GOT"})}}]
-   ["/store" {:post {:handler (fn [_] {:status 200 :body {:success true}})}}]])
+(defn routes [cfg]
+  [["/" {:get {:handler (fn [_] {:status 200 :body cfg})}}]
+   ["/boost" {:post {:handler (fn [_] {:status 200 :body {:success true}})}}]])
 
-(defn http-handler [s3-client podping-token]
+(defn http-handler [cfg]
   (ring/ring-handler
    (ring/router
-    (routes s3-client podping-token)
+    (routes cfg)
     {:data {:muuntaja m/instance
             :middleware [muuntaja/format-middleware
                          reitit.ring.middleware.parameters/parameters-middleware]}})
@@ -65,10 +157,10 @@
       deferred)))
 
 (defn serve
-  [s3-client podping-token]
+  [cfg]
   (let [env (or (System/getenv "ENV") "PROD")
         dev (= env "DEV")
-        handler-factory (fn [] (make-virtual (http-handler s3-client podping-token)))
+        handler-factory (fn [] (make-virtual (http-handler cfg)))
         handler (if dev (ring/reloading-ring-handler handler-factory) (handler-factory))]
     (httpd/start-server
      handler
@@ -80,12 +172,14 @@
       :executor :none})))
 
 (defn -main [& _]
-  (serve
-   (s3-client (System/getenv "CF_ACCOUNT_ID")
-              (System/getenv "CF_ACCESS_KEY")
-              (System/getenv "CF_SECRET_KEY"))
-   (System/getenv "PODPING_API_KEY")))
+  (let [cfg (config)]
+    (serve cfg)))
 
 (comment
   (def server (-main))
-  (.close server))
+  (.close server)
+  (def mystorage (LocalStorage. "/tmp/boosts"))
+  (def myid (gen-ulid))
+  (.store mystorage myid {:abc 123 :bcd "234"})
+  (.retrieve mystorage myid)
+  (config))
