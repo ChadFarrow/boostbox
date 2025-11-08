@@ -1,0 +1,9 @@
+.calva
+.clj-kondo
+.cpcache
+.env
+.devenv
+.lsp
+.nrepl-port
+result
+*.tar*
