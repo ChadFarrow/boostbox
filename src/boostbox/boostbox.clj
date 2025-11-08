@@ -10,7 +10,9 @@
             [muuntaja.core :as m]
             [reitit.ring :as ring]
             [reitit.ring.middleware.muuntaja :as muuntaja]
-            [reitit.ring.middleware.parameters]))
+            [reitit.ring.middleware.parameters]
+            [clj-uuid :as uuid]
+            [boostbox.ulid :as ulid]))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Setup & Config ~~~~~~~~~~~~~~~~~~~
 
@@ -20,6 +22,19 @@
                :endpoint-override {:protocol :https :hostname (str account-id ".r2.cloudflarestorage.com")}
                :credentials-provider (aws-creds/basic-credentials-provider {:access-key-id access-key
                                                                             :secret-access-key secret-key})}))
+
+;; ~~~~~~~~~~~~~~~~~~~ UUID/ULID ~~~~~~~~~~~~~~~~~~~
+
+(defn gen-ulid []
+  (let [id (uuid/v7)
+        id-bytes (uuid/as-byte-array id)
+        ;; n.b. treat as unsigned
+        id-int (BigInteger. 1 id-bytes)]
+    (ulid/encode id-int 26)))
+
+(defn ulid->uuid [u]
+  (-> u ulid/ulid->bytes uuid/as-uuid))
+
 ;; ~~~~~~~~~~~~~~~~~~~ GET View ~~~~~~~~~~~~~~~~~~~
 
 ;; ~~~~~~~~~~~~~~~~~~~ POST View ~~~~~~~~~~~~~~~~~~~
@@ -28,7 +43,7 @@
 
 (defn routes [s3-client podping-token]
   [["/" {:get {:handler (fn [_] {:status 200 :body "GOT"})}}]
-   ["/store" {:post {:handler (fn [_] {:status 200 :body "POSTED"})}}]])
+   ["/store" {:post {:handler (fn [_] {:status 200 :body {:success true}})}}]])
 
 (defn http-handler [s3-client podping-token]
   (ring/ring-handler
