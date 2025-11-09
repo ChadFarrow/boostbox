@@ -2,7 +2,6 @@
   (:gen-class)
   (:require [clojure.java.io :as io]
             [aleph.http :as httpd]
-            [babashka.http-client :as http]
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.endpoint]
             [cognitect.aws.credentials :as aws-creds]
@@ -18,7 +17,8 @@
             [reitit.coercion.malli]
             [clj-uuid :as uuid]
             [boostbox.ulid :as ulid]
-            [com.brunobonacci.mulog :as u])
+            [com.brunobonacci.mulog :as u]
+            [boostbox.images :as images])
   (:import java.net.URLEncoder))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Setup & Config ~~~~~~~~~~~~~~~~~~~
@@ -138,6 +138,34 @@
     "FS" (LocalStorage. (:root-path cfg))
     "S3" (S3Storage. nil nil)))
 
+;; ~~~~~~~~~~~~~~~~~~~ Homepage ~~~~~~~~~~~~~~~~~~~
+(defn homepage []
+  (fn [_]
+    {:status 200
+     :headers {"content-type" "text/html; charset=utf-8"}
+     :body
+     (html/html
+      [html/doctype-html5
+       [:html
+        [:head
+         [:meta {:charset "utf-8"}]
+         [:meta {:name "viewport", :content "width=device-width, initial-scale=1"}]
+         [:meta {:name "color-scheme", :content "light dark"}]
+         [:title "BoostBox"]
+         [:link {:rel "icon" :type "image/png" :href (str "data:image/png;base64," images/favicon)}]
+         [:link {:rel "stylesheet" :href "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css"}]
+         [:style "body { text-align: center; }
+               main { max-width: 600px; margin: 0 auto; padding: 2rem; }
+               h1 { margin-top: 1rem; }
+               p { font-size: 1.1rem; color: var(--muted-color); margin: 1.5rem 0; }
+               a { margin-top: 1rem; }"]]
+        [:body
+         [:main
+          [:img {:src (str "data:image/png;base64," images/v4vbox)}]
+          [:h1 "BoostBox"]
+          [:p "A simple API to store and serve boost metadata"]
+          [:a {:href "https://github.com/noblepayne/boostbox", :role "button"} "View on GitHub"]]]]])}))
+
 ;; ~~~~~~~~~~~~~~~~~~~ GET View ~~~~~~~~~~~~~~~~~~~
 (defn encode-header [data]
   (let [json-str (json/write-value-as-string data)
@@ -156,6 +184,7 @@
        [:meta {:name "viewport", :content "width=device-width, initial-scale=1"}]
        [:meta {:name "color-scheme", :content "light dark"}]
        [:title "RSS Payment Metadata"]
+       [:link {:rel "icon" :type "image/png" :href (str "data:image/png;base64," images/favicon)}]
        [:link {:rel "stylesheet" :href "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css"}]
        [:link {:rel "stylesheet" :href "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/atom-one-dark.min.css"}]
        [:script {:src "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"}]
@@ -219,7 +248,8 @@
 ;; ~~~~~~~~~~~~~~~~~~~ HTTP Server ~~~~~~~~~~~~~~~~~~~
 
 (defn routes [cfg storage]
-  [["/" {:get {:handler (fn [_] {:status 200 :body cfg})}}]
+  [["/" {:get {:handler (homepage)}}]
+   ["/health" {:get {:handler (fn [_] {:status 200 :body {:status :ok}})}}]
    ["/boost" {:post {:handler (add-boost cfg storage)}}]
    ["/boost/:id" {:get {:handler (get-boost-by-id cfg storage)}}]])
 
