@@ -14,7 +14,7 @@ Boostbox is a Clojure project designed to provide a straightforward API for stor
 
 - Store boost metadata.
 - Serve boost metadata by ID.
-- Integrates with S3-compatible storage.
+- S3-compatible storage integration is planned for a future release.
 
 ## Technologies
 
@@ -33,6 +33,14 @@ Boostbox is a Clojure project designed to provide a straightforward API for stor
 - [reitit](https://github.com/metosin/reitit): HTTP routing
 
 ## Getting Started
+
+### Configuration
+
+This project uses environment variables for configuration. You can find example configuration files:
+- `env.fs.template`: For local filesystem-based storage.
+- `env.s3.template`: For S3-compatible storage (e.g., Cloudflare R2).
+
+Copy one of these templates to `.env` and fill in the necessary values.
 
 ### Prerequisites
 
