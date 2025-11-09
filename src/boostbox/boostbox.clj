@@ -58,7 +58,10 @@
         _ (assert-in-set #{"DEV" "STAGING" "PROD"} env)
         storage (get-env "BB_STORAGE" "FS")
         _ (assert-in-set #{"FS" "S3"} storage)
-        base-config {:env env :storage storage}
+        port' (get-env "BB_PORT" "8080")
+        port (Integer/parseInt port')
+        base-url (get-env "BB_BASE_URL" (str "http://localhost:" port))
+        base-config {:env env :storage storage :port port :base-url base-url}
         storage-config (case storage
                          "FS" {:root-path (get-env "BB_FS_ROOT_PATH" "boosts")}
                          "S3" {:endpoint (get-env "BB_S3_ENDPOINT")
@@ -232,7 +235,7 @@
       {:status 400
        :body {:error "invalid boost" :boost body-params}}
       (let [id (gen-ulid)
-            url (str$ "/boost/~{id}")
+            url (str$ "~{(:base-url cfg)}/boost/~{id}")
             boost (assoc body-params :id id)]
         (try
           (.store storage id boost)
@@ -266,36 +269,37 @@
                (let [response (handler request)]
                  (assoc-in response [:headers "Access-Control-Allow-Origin"] "*")))))})
 
-(def exception-middleware
-  {:name ::exception
-   :wrap (fn [handler]
-           (fn [request]
-             (try
-               (handler request)
-               (catch Exception e
-                 {:status 500
-                  :exception e
-                  :body {:error "internal server error"}}))))})
-
 (defn http-handler [cfg storage]
   (ring/ring-handler
    (ring/router
     (routes cfg storage)
     {:data {:muuntaja m/instance
             :coercion reitit.coercion.malli/coercion
-            :middleware [muuntaja/format-response-middleware
-                         exception-middleware
+            :middleware [parameters/parameters-middleware
                          cors-middleware
-                         parameters/parameters-middleware
                          muuntaja/format-negotiate-middleware
+                         muuntaja/format-response-middleware
                          muuntaja/format-request-middleware
                          coercion/coerce-response-middleware
                          coercion/coerce-request-middleware]}})
    (ring/create-default-handler)))
 
-(defn correlation-id-wrapper [correlation-id handler]
+(defn exception-wrapper [handler]
   (fn [request]
-    (let [request (assoc request :correlation-id correlation-id)
+    (try
+      (handler request)
+      (catch Exception e
+        {:status 500
+         :exception e
+         :headers {"content-type" "application/json"}
+         :body "{\"error\": \"internal server error\"}"}))))
+
+(defn correlation-id-wrapper
+  [handler]
+  (fn [request]
+    (let [existing (get-in request [:headers "x-correlation-id"])
+          correlation-id (if existing existing (gen-ulid))
+          request (assoc request :correlation-id correlation-id)
           response (handler request)]
       (assoc-in response [:headers "x-correlation-id"] correlation-id))))
 
@@ -317,38 +321,29 @@
                              base)))}
              (handler request))))
 
-(defn make-virtual [f]
-  (fn [& args]
-    (let [df (mf/deferred)
-          correlation-id (gen-ulid)
-          ;; wrap f with logging and correlation id
-          f' (correlation-id-wrapper correlation-id (mulog-wrapper f))]
+(defn vthread-wrapper [handler]
+  (fn [request]
+    (let [df (mf/deferred)]
       (Thread/startVirtualThread
        (fn []
-         (try
-           (mf/success! df (apply f' args))
-           (catch Exception e
-             (u/log ::vthread-exception
-                    :exception e
-                    :method (:method args)
-                    :uri (:uri args)
-                    :status 500
-                    :correlation-id correlation-id)
-             (mf/success! df {:status 500
-                              :headers {"x-correlation-id" correlation-id
-                                        "content-type" "application/json"}
-                              :body "{\"error\": \"internal server error\"}"})))))
+         (mf/success! df (handler request))))
       df)))
+
+(def runner
+  (comp vthread-wrapper
+        correlation-id-wrapper
+        mulog-wrapper
+        exception-wrapper))
 
 (defn serve
   [cfg storage]
   (let [env (:env cfg)
         dev (= env "DEV")
-        handler-factory (fn [] (make-virtual (http-handler cfg storage)))
+        handler-factory (fn [] (runner (http-handler cfg storage)))
         handler (if dev (ring/reloading-ring-handler handler-factory) (handler-factory))]
     (httpd/start-server
      handler
-     {:port 8080
+     {:port (:port cfg)
       ;; When other than :none our handler is run on a thread pool.
       ;; As we are wrapping our handler in a new virtual thread per request
       ;; on our own, we have no risk of blocking the (aleph) handler thread and
@@ -358,7 +353,7 @@
 (defn -main [& _]
   (let [cfg (config)
         storage (make-storage cfg)
-        logger (u/start-publisher! {:type :console :pretty? true})
+        logger (u/start-publisher! {:type :console :pretty? (= (:env cfg) "DEV")})
         srv (serve cfg storage)]
     (.addShutdownHook (Runtime/getRuntime)
                       (Thread. (fn []
