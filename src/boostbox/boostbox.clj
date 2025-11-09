@@ -13,7 +13,6 @@
             [reitit.ring :as ring]
             [reitit.ring.middleware.muuntaja :as muuntaja]
             [reitit.ring.middleware.parameters :as parameters]
-            [reitit.ring.middleware.exception :as exception]
             [reitit.ring.malli]
             [reitit.ring.coercion :as coercion]
             [reitit.coercion.malli]
@@ -143,7 +142,7 @@
 (defn encode-header [data]
   (let [json-str (json/write-value-as-string data)
         ;; URL encode the entire JSON string
-        encoded (java.net.URLEncoder/encode json-str "UTF-8")]
+        encoded (URLEncoder/encode json-str "UTF-8")]
     encoded))
 (defn boost-view
   "Renders RSS payment metadata in a simple HTML page with JSON display."
@@ -200,13 +199,14 @@
 
 (defn add-boost [cfg storage]
   (fn [{:keys [:body-params] :as request}]
-    (if-not (valid-boost? body-params)
+    (if-not (valid-boost? body-params);
       {:status 400
        :body {:error "invalid boost" :boost body-params}}
       (let [id (gen-ulid)
-            url (str$ "/boost/~{id}")]
+            url (str$ "/boost/~{id}")
+            boost (assoc body-params :id id)]
         (try
-          (.store storage id body-params)
+          (.store storage id boost)
           {:status 200
            :body {:id id
                   :url url}}
@@ -223,6 +223,53 @@
    ["/boost" {:post {:handler (add-boost cfg storage)}}]
    ["/boost/:id" {:get {:handler (get-boost-by-id cfg storage)}}]])
 
+(def cors-middleware
+  {:name ::cors
+   :wrap (fn [handler]
+           (fn [request]
+             (if (= :options (:request-method request))
+               {:status 204
+                :headers {"Access-Control-Allow-Origin" "*"
+                          "Access-Control-Allow-Methods" "GET, POST, PUT, DELETE, OPTIONS"
+                          "Access-Control-Allow-Headers" "Content-Type"
+                          "Access-Control-Max-Age" "3600"}}
+               (let [response (handler request)]
+                 (assoc-in response [:headers "Access-Control-Allow-Origin"] "*")))))})
+
+(def mulog-middleware
+  {:name ::mulog
+   :wrap (fn [handler]
+           (fn [{:keys [:request-method :uri :query-params :path-params :body-params] :as request}]
+             #_(u/log ::WES :request (keys request))
+             (let [correlation-id (gen-ulid)
+                   request (assoc request :correlation-id correlation-id)]
+               (u/trace ::http-request
+                        [:correlation-id correlation-id
+                         :method request-method
+                         :uri uri
+                         :query-params query-params
+                         :path-params path-params
+                         :body-params body-params]
+                        (let [response (handler request)
+                              status (:status response)
+                              response (assoc-in response [:headers "x-correlation-id"] correlation-id)]
+                          (u/log ::http-response
+                                 :status status
+                                 :success (< status 400))
+                          response)))))})
+
+(def exception-middleware
+  {:name ::exception
+   :wrap (fn [handler]
+           (fn [request]
+             (try
+               (handler request)
+               (catch Exception e
+                 (u/log ::http-exception
+                        :exception e)
+                 {:status 500
+                  :body {:error "internal server error"}}))))})
+
 (defn http-handler [cfg storage]
   (ring/ring-handler
    (ring/router
@@ -232,7 +279,9 @@
             :middleware [parameters/parameters-middleware
                          muuntaja/format-negotiate-middleware
                          muuntaja/format-response-middleware
-                         #_exception/exception-middleware
+                         mulog-middleware
+                         exception-middleware
+                         cors-middleware
                          muuntaja/format-request-middleware
                          coercion/coerce-response-middleware
                          coercion/coerce-request-middleware]}})
@@ -271,6 +320,13 @@
         storage (make-storage cfg)
         logger (u/start-publisher! {:type :console :pretty? true})
         srv (serve cfg storage)]
+    (.addShutdownHook (Runtime/getRuntime)
+                      (Thread. (fn []
+                                 (u/log ::app-shutting-down)
+                                 (.close srv)
+                                 (Thread/sleep 500)
+                                 (logger)
+                                 (Thread/sleep 500))))
     {:srv srv :logger logger :config cfg :storage storage}))
 
 (defn stop [state]
