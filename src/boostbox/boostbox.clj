@@ -10,10 +10,13 @@
             [muuntaja.core :as m]
             [jsonista.core :as json]
             [reitit.ring :as ring]
-            [reitit.ring.middleware.muuntaja :as muuntaja]
-            [reitit.ring.middleware.parameters :as parameters]
             [reitit.ring.malli]
             [reitit.ring.coercion :as coercion]
+            [reitit.ring.middleware.muuntaja :as muuntaja]
+            [reitit.ring.middleware.parameters :as parameters]
+            [reitit.ring.middleware.exception :as exception]
+            [reitit.swagger :as swagger]
+            [reitit.swagger-ui :as swagger-ui]
             [reitit.coercion.malli]
             [clj-uuid :as uuid]
             [boostbox.ulid :as ulid]
@@ -132,8 +135,8 @@
                  :secret-access-key secret-key})}))
 (defrecord S3Storage [client bucket]
   IStorage
-  (store [_ id data] nil)
-  (retrieve [_ id] nil))
+  (store [_ id data] (throw (ex-info "not implemented yet!" {:type "S3"})))
+  (retrieve [_ id] (throw (ex-info "not implemented yet!" {:type "S3"}))))
 
 ;; ~~~~~~~~~~~~~~~~ IStorage Utils ~~~~~~~~~~~~~~~~
 (defn make-storage [cfg]
@@ -239,7 +242,7 @@
             boost (assoc body-params :id id)]
         (try
           (.store storage id boost)
-          {:status 200
+          {:status 201
            :body {:id id
                   :url url}}
           (catch Exception e
@@ -251,10 +254,23 @@
 ;; ~~~~~~~~~~~~~~~~~~~ HTTP Server ~~~~~~~~~~~~~~~~~~~
 
 (defn routes [cfg storage]
-  [["/" {:get {:handler (homepage)}}]
-   ["/health" {:get {:handler (fn [_] {:status 200 :body {:status :ok}})}}]
-   ["/boost" {:post {:handler (add-boost cfg storage)}}]
-   ["/boost/:id" {:get {:handler (get-boost-by-id cfg storage)}}]])
+  [["/" {:get {:no-doc true :handler (homepage)}}]
+   ["/openapi.json" {:get {:no-doc true :handler (swagger/create-swagger-handler)
+                           :swagger {:info {:title "BoostBox API"
+                                            :description "simple API to store boost metadata"}}}}]
+   ["/health" {:get {:handler (fn [_] {:status 200 :body {:status :ok}})
+                     :summary "healthcheck"
+                     :responses {200 {:body [:map [:status [:enum :ok]]]}}}}]
+   ["/boost" {:post {:handler (add-boost cfg storage)
+                     :summary "Store boost metadata"
+                     :parameters {:body [:map [:action [:enum "boost" "stream"]]]}
+                     :responses {201 {:body [:map [:id :string] [:url :string]]}}}}]
+   ["/boost/:id" {:get {:handler (get-boost-by-id cfg storage)
+                        :summary "lookup boost by id"
+                        :parameters {:path {:id :string}}
+                        :responses {200 {:body :string}
+                                    400 {:body [:map [:error :string] [:id :string]]}
+                                    404 {:body [:map [:error :string] [:id :string]]}}}}]])
 
 (def cors-middleware
   {:name ::cors
@@ -269,22 +285,40 @@
                (let [response (handler request)]
                  (assoc-in response [:headers "Access-Control-Allow-Origin"] "*")))))})
 
+(defn default-exception-handler
+  "Default safe handler for any exception."
+  [^Exception e _]
+  {:status 500
+   :headers {}
+   :exception e
+   :body {:error "internal server error"}})
+
 (defn http-handler [cfg storage]
   (ring/ring-handler
    (ring/router
     (routes cfg storage)
     {:data {:muuntaja m/instance
             :coercion reitit.coercion.malli/coercion
-            :middleware [parameters/parameters-middleware
+            :middleware [swagger/swagger-feature
+                         parameters/parameters-middleware
                          cors-middleware
                          muuntaja/format-negotiate-middleware
                          muuntaja/format-response-middleware
+                         (exception/create-exception-middleware
+                          (assoc exception/default-handlers
+                                 ;; replace default handler with ours
+                                 ::exception/default
+                                 default-exception-handler))
                          muuntaja/format-request-middleware
                          coercion/coerce-response-middleware
                          coercion/coerce-request-middleware]}})
-   (ring/create-default-handler)))
+   (ring/routes
+    (swagger-ui/create-swagger-ui-handler
+     {:path "/docs"
+      :config {:urls [{:name "openapi" :url "/openapi.json"}]}})
+    (ring/create-default-handler))))
 
-(defn exception-wrapper [handler]
+(defn exception-wrapper-of-last-resort [handler]
   (fn [request]
     (try
       (handler request)
@@ -333,7 +367,7 @@
   (comp vthread-wrapper
         correlation-id-wrapper
         mulog-wrapper
-        exception-wrapper))
+        exception-wrapper-of-last-resort))
 
 (defn serve
   [cfg storage]
