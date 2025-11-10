@@ -21,7 +21,8 @@
             [clj-uuid :as uuid]
             [boostbox.ulid :as ulid]
             [com.brunobonacci.mulog :as u]
-            [boostbox.images :as images])
+            [boostbox.images :as images]
+            [clojure.string :as str])
   (:import java.net.URLEncoder))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Setup & Config ~~~~~~~~~~~~~~~~~~~
@@ -46,7 +47,10 @@
         port' (get-env "BB_PORT" "8080")
         port (Integer/parseInt port')
         base-url (get-env "BB_BASE_URL" (str "http://localhost:" port))
-        base-config {:env env :storage storage :port port :base-url base-url}
+        allowed-keys (into #{} (map str/trim (-> (get-env "BB_ALLOWED_KEYS" "v4v4me")
+                                                 (str/split #","))))
+        _ (assert (seq allowed-keys) "must specify at least one key in BB_ALLOWED_KEYS (comma separated)")
+        base-config {:env env :storage storage :port port :base-url base-url :allowed-keys allowed-keys}
         storage-config (case storage
                          "FS" {:root-path (get-env "BB_FS_ROOT_PATH" "boosts")}
                          "S3" {:endpoint (get-env "BB_S3_ENDPOINT")
@@ -234,17 +238,29 @@
                :body {:error "error during boost storage"}})))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ HTTP Server ~~~~~~~~~~~~~~~~~~~
+(defn auth-middleware [allowed-keys]
+  (fn [handler]
+    (fn [request]
+      (if (allowed-keys (get-in request [:headers :bearer]))
+        (handler request)
+        {:status 401
+         :body {:error :unauthorized}}))))
 
 (defn routes [cfg storage]
   [["/" {:get {:no-doc true :handler (homepage)}}]
    ["/openapi.json" {:get {:no-doc true :handler (swagger/create-swagger-handler)
                            :swagger {:info {:title "BoostBox API"
-                                            :description "simple API to store boost metadata"}}}}]
+                                            :description "simple API to store boost metadata"}
+                                     :securityDefinitions {"auth" {:type :apiKey
+                                                                   :in :header
+                                                                   :name "Bearer"}}}}}]
    ["/health" {:get {:handler (fn [_] {:status 200 :body {:status :ok}})
                      :summary "healthcheck"
                      :responses {200 {:body [:map [:status [:enum :ok]]]}}}}]
    ["/boost" {:post {:handler (add-boost cfg storage)
+                     :middleware [(auth-middleware (:allowed-keys cfg))]
                      :summary "Store boost metadata"
+                     :swagger {:security [{"auth" []}]}
                      :parameters {:body [:map [:action [:enum "boost" "stream"]]]}
                      :responses {201 {:body [:map [:id :string] [:url :string]]}}}}]
    ["/boost/:id" {:get {:handler (get-boost-by-id cfg storage)
@@ -252,6 +268,7 @@
                         :parameters {:path {:id :string}}
                         :responses {200 {:body :string}
                                     400 {:body [:map [:error :string] [:id :string]]}
+                                    401 {:body [:map [:error :string] [:id :string]]}
                                     404 {:body [:map [:error :string] [:id :string]]}}}}]])
 
 (def cors-middleware
