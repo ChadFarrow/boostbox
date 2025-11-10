@@ -25,36 +25,18 @@
   (:import java.net.URLEncoder))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Setup & Config ~~~~~~~~~~~~~~~~~~~
-(defmacro str$
-  "Compile-time string interpolation with ~{expr} syntax.
-   
-   (str$ \"Name: ~{name}, Age: ~{(+ age 1)}\")
-   => compiles to: (str \"Name: \" name \", Age: \" (+ age 1))"
-  [s]
-  (let [pattern #"~\{([^}]*)\}|([^~]+)"
-        parts (re-seq pattern s)
-        forms (reduce (fn [acc [_ expr text]]
-                        (cond-> acc
-                          text (conj text)
-                          expr (conj (read-string expr))))
-                      []
-                      parts)]
-    (if (empty? forms)
-      ""
-      `(str ~@forms))))
-
 (defn get-env
   "System/getenv that throws with no default."
   ([key] (let [val (System/getenv key)]
            (if (nil? val)
-             (throw (ex-info (str$ "Missing ENV VAR: ~{key}") {:missing-var key}))
+             (throw (ex-info (str "Missing ENV VAR: " key) {:missing-var key}))
              val)))
   ([key default] (let [val (System/getenv key)]
                    (or val default))))
 
 (defn assert-in-set [allowed val]
   (let [valid? (allowed val)]
-    (assert valid? (str$ "Invalid value: ~{val}, allowed: ~{allowed}"))))
+    (assert valid? (str "Invalid value: " val ", allowed: " allowed))))
 
 (defn config []
   (let [env (get-env "ENV" "PROD")
@@ -108,20 +90,20 @@
         year (.getYear zdt)
         month (format "%02d" (.getMonthValue zdt))
         day (format "%02d" (.getDayOfMonth zdt))]
-    (str$ "~{year}/~{month}/~{day}")))
+    (str year "/" month "/" day)))
 
 (defrecord LocalStorage [root-path]
   IStorage
   (store [_ id data]
     (let [timestamp (ulid/ulid->timestamp id)
           prefix (timestamp->prefix timestamp)
-          output-file (io/file root-path prefix (str$ "~{id}.json"))
+          output-file (io/file root-path prefix (str id ".json"))
           _ (-> output-file .getParentFile .mkdirs)]
       (json/write-value output-file data)))
   (retrieve [_ id]
     (let [timestamp (ulid/ulid->timestamp id)
           prefix (timestamp->prefix timestamp)
-          input-file (io/file root-path prefix (str$ "~{id}.json"))]
+          input-file (io/file root-path prefix (str id ".json"))]
       (json/read-value input-file))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ S3 ~~~~~~~~~~~~~~~~~~~
@@ -238,7 +220,7 @@
       {:status 400
        :body {:error "invalid boost" :boost body-params}}
       (let [id (gen-ulid)
-            url (str$ "~{(:base-url cfg)}/boost/~{id}")
+            url (str (:base-url cfg) "/boost/" id)
             boost (assoc body-params :id id)]
         (try
           (.store storage id boost)
