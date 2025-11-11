@@ -301,7 +301,8 @@
             data-header (encode-header data)
             data-hiccup (boost-view data)]
         {:status 200
-         :headers {"x-rss-payment" data-header
+         :headers {"access-control-expose-headers" "x-rss-payment"
+                   "x-rss-payment" data-header
                    "content-type" "text/html; charset=utf-8"}
          :body (html/html data-hiccup)})
       (catch java.io.FileNotFoundException _
@@ -394,8 +395,8 @@
              (if (= :options (:request-method request))
                {:status 204
                 :headers {"Access-Control-Allow-Origin" "*"
-                          "Access-Control-Allow-Methods" "GET, POST, PUT, DELETE, OPTIONS"
-                          "Access-Control-Allow-Headers" "Content-Type"
+                          "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
+                          "Access-Control-Allow-Headers" "Content-Type, X-API-Key"
                           "Access-Control-Max-Age" "3600"}}
                (let [response (handler request)]
                  (assoc-in response [:headers "Access-Control-Allow-Origin"] "*")))))})
@@ -405,7 +406,7 @@
   [^Exception e _]
   {:status 500
    :headers {}
-   :exception e
+   ::exception e
    :body {:error "internal server error"}})
 
 (defn body-size-limiter-middleware [max-body-size]
@@ -478,7 +479,7 @@
                       :query-params query-params
                       :path-params path-params
                       :body-params body-params]
-              :capture (fn [{:keys [:status :exception] :as response}]
+              :capture (fn [{:keys [:status ::exception] :as response}]
                          (let [success (< status 400)
                                base {:status status
                                      :success success}]
