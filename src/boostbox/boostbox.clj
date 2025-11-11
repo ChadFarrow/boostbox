@@ -209,8 +209,11 @@
 ;; ~~~~~~~~~~~~~~~~~~~ GET View ~~~~~~~~~~~~~~~~~~~
 (defn encode-header [data]
   (let [json-str (json/write-value-as-string data)
-        ;; URL encode the entire JSON string
-        encoded (URLEncoder/encode json-str "UTF-8")]
+        ;; URL encode the entire JSON string, swap + for %20
+        encoded (.replace
+                 (URLEncoder/encode json-str "UTF-8")
+                 "+"
+                 "%20")]
     encoded))
 
 (defn format-sats
