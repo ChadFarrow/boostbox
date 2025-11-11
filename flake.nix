@@ -102,6 +102,18 @@
         ];
       };
     });
+    nixosModules = {
+      default = {
+        options,
+        config,
+        pkgs,
+        ...
+      }: {
+        imports = [./module.nix];
+        config.services.boostbox.package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      };
+    };
+
     packages = forAllPkgs (pkgs: let
       system = pkgs.stdenv.hostPlatform.system;
     in {
