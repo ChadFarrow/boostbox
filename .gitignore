@@ -10,3 +10,4 @@ logs.test.txt
 result
 *.tar*
 target
+staging

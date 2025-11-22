@@ -12,9 +12,48 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
     steps:
       - uses: actions/checkout@v5
-      - uses: cachix/install-nix-action@v31
+
+      - name: Restore build cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: build-cache
+          key: build2-${{ runner.os }}-${{ hashFiles('flake.lock', 'deps.lock') }}
+          restore-keys: |
+            build2-${{ runner.os }}-
+
+      - name: Build cache if missing
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache missing — installing Nix and rebuilding..."
+      - name: Install Nix
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: cachix/install-nix-action@v31
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
-      - run: ./test.sh
+
+      - name: Build cache
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/build-ci.sh
+          mkdir -p build-cache
+          cp deps.tar* build-cache
+          cp zstd.tar* build-cache
+          cp -L zstd build-cache
+
+      - name: Save newly built cache
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build-cache
+          key: build2-${{ runner.os }}-${{ hashFiles('flake.lock', 'deps.lock') }}
+
+      - name: Copy cached files
+        if: steps.cache-restore.outputs.cache-hit == 'true'
+        run: cp -v build-cache/* .
+
+      - name: Run tests
+        run: ./scripts/ci.sh
