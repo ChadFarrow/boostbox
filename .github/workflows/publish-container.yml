@@ -1,10 +1,17 @@
 name: Publish Container
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     tags:
       - "v*"
+    paths:
+      - "src/**"
+      - "flake.nix"
+      - "flake.lock"
+      - "deps.edn"
+      - "deps-lock.json"
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
