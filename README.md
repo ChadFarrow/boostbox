@@ -6,9 +6,9 @@
 
 A simple, lightweight, and self-hostable API for storing and retrieving [Podcasting 2.0](https://podcasting2.org/) payment metadata.
 
-Demo: [boostbox.noblepayne.com](https://boostbox.noblepayne.com)
+Demo: [boostbox.cloud](https://boostbox.cloud)
 
-Demo Boost: [01KB19TNRVE1RVQCXVFWY68PYG](https://boostbox.noblepayne.com/boost/01KB19TNRVE1RVQCXVFWY68PYG)
+Demo Boost: [01KB19TNRVE1RVQCXVFWY68PYG](https://boostbox.cloud/boost/01KB19TNRVE1RVQCXVFWY68PYG)
 
 ![Demo GIF (Jeff)](images/demo.gif)
 
@@ -33,7 +33,7 @@ The process is designed to be as simple as possible for podcast app developers.
 Your app gathers all the boostagram metadata and sends it as a JSON object to the `/boost` endpoint.
 
 ```sh
-curl -X POST https://boostbox.noblepayne.com/boost \
+curl -X POST https://boostbox.cloud/boost \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: v4v4me" \
   -d '{
@@ -59,8 +59,8 @@ BoostBox stores the metadata and returns a URL and a pre-formatted BOLT11 descri
 ```json
 {
   "id": "01K9R9E2JNE1CR0ME6CFM45T8E",
-  "url": "https://boostbox.noblepayne.com/boost/01K9R9E2JNE1CR0ME6CFM45T8E",
-  "desc": "rss::payment::boost https://boostbox.noblepayne.com/boost/01K9R9E2JNE1CR0ME6CFM45T8E Best episode ever!"
+  "url": "https://boostbox.cloud/boost/01K9R9E2JNE1CR0ME6CFM45T8E",
+  "desc": "rss::payment::boost https://boostbox.cloud/boost/01K9R9E2JNE1CR0ME6CFM45T8E Best episode ever!"
 }
 ```
 
@@ -73,10 +73,10 @@ Your app uses the `desc` field from the response as the description when paying 
 When the podcaster's receiving service (like Helipad, Alby, etc.) gets the payment, it can fetch the URL from the description. BoostBox will respond with the full, original metadata in the `x-rss-payment` HTTP header.
 
 ```sh
-curl -v "http://boostbox.noblepayne.com/boost/01K9R9E2JNE1CR0ME6CFM45T8E"
+curl -v "http://boostbox.cloud/boost/01K9R9E2JNE1CR0ME6CFM45T8E"
 
 > GET /boost/01K9R9E2JNE1CR0ME6CFM45T8E HTTP/1
-> Host: boostbox.noblepayne.com
+> Host: boostbox.cloud
 ...
 
 < HTTP/1 200
@@ -241,8 +241,8 @@ Stores boostagram metadata.
   ```json
   {
     "id": "01K9R9E2JNE1CR0ME6CFM45T8E",
-    "url": "https://noblepayne.boostbox.com/boost/01K9R9E2JNE1CR0ME6CFM45T8E",
-    "desc": "rss::payment::boost https://your-boostbox-instance.com/boost/01K9R9E2JNE1CR0ME6CFM45T8E Your message here"
+    "url": "https://boostbox.cloud/boost/01K9R9E2JNE1CR0ME6CFM45T8E",
+    "desc": "rss::payment::boost https://boostbox.cloud/boost/01K9R9E2JNE1CR0ME6CFM45T8E Your message here"
   }
   ```
 
