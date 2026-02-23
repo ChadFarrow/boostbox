@@ -35,6 +35,9 @@ clojure -M:test              # Direct Clojure test runner (no S3 tests)
 ```sh
 nix build                    # Compile via clj-nix
 ./result/bin/boostbox        # Run compiled binary
+
+clojure -T:build uber        # Build uberjar (no Nix required)
+java -jar target/boostbox.jar # Run uberjar
 ```
 
 ### Format check (CI)
@@ -75,12 +78,13 @@ Tests use Kaocha with cloverage for code coverage. The `run-with-storage` helper
 
 ### Deployment
 
+- **Railway:** Dockerfile-based deploy, `railway.toml` configures builder and healthcheck. Railway's `PORT` env var is mapped to `BB_PORT` automatically in the Dockerfile CMD.
+- **Docker:** Multi-stage `Dockerfile` builds an uberjar with `tools.build`, runs on `eclipse-temurin:21-jre-alpine`. Also available as `ghcr.io/noblepayne/boostbox:latest`.
 - **Nix:** `nix run github:noblepayne/boostbox`
-- **Docker:** `ghcr.io/noblepayne/boostbox:latest`
 - **NixOS module:** `module.nix` provides a systemd service with hardened settings
 
 ### Dependencies (deps.edn)
 
 HTTP: aleph (server), babashka.http-client (test client). Routing: reitit + swagger. Validation: malli. JSON: jsonista. HTML: chassis. AWS: cognitect.aws. Logging: mulog. IDs: clj-uuid.
 
-Aliases: `:repl` (NREPL + CIDER), `:test` (kaocha), `:test/watch`, `:outdated` (antq).
+Aliases: `:repl` (NREPL + CIDER), `:test` (kaocha), `:test/watch`, `:build` (tools.build uberjar), `:outdated` (antq).
