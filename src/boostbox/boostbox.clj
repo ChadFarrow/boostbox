@@ -436,7 +436,7 @@
 ;; ~~~~~~~~~~~~~~~~~~~ GET /boosts ~~~~~~~~~~~~~~~~~~~
 (defn list-boosts [cfg storage]
   (fn [request]
-    (let [boosts (.list-all storage)]
+    (let [boosts (vec (.list-all storage))]
       {:status 200
        :body boosts})))
 
