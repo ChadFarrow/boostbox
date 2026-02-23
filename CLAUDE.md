@@ -78,7 +78,7 @@ Tests use Kaocha with cloverage for code coverage. The `run-with-storage` helper
 
 ### Deployment
 
-- **Railway:** Dockerfile-based deploy, `railway.toml` configures builder and healthcheck. Railway's `PORT` env var is mapped to `BB_PORT` automatically in the Dockerfile CMD.
+- **Railway:** Dockerfile-based deploy at `https://tardbox.com`. `railway.toml` configures builder and healthcheck. Railway's `PORT` env var is mapped to `BB_PORT` automatically in the Dockerfile CMD. Domain via Namecheap DNS CNAME.
 - **Docker:** Multi-stage `Dockerfile` builds an uberjar with `tools.build`, runs on `eclipse-temurin:21-jre-alpine`. Also available as `ghcr.io/noblepayne/boostbox:latest`.
 - **Nix:** `nix run github:noblepayne/boostbox`
 - **NixOS module:** `module.nix` provides a systemd service with hardened settings
