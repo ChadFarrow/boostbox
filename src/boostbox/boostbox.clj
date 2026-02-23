@@ -104,7 +104,8 @@
 ;; ~~~~~~~~~~~~~~~~~~~ Storage ~~~~~~~~~~~~~~~~~~~
 (defprotocol IStorage
   (store [this id data])
-  (retrieve [this id]))
+  (retrieve [this id])
+  (list-all [this]))
 
 ;; ~~~~~~~~~~~~~~~~~~~ FS ~~~~~~~~~~~~~~~~~~~
 (defn timestamp->prefix
@@ -135,7 +136,15 @@
         (json/read-value input-file)
         (catch java.io.FileNotFoundException e
           (throw (ex-info "File not found during LocalStorage retrieve"
-                          {:cognitect.anomalies/category :cognitect.anomalies/not-found :exception e})))))))
+                          {:cognitect.anomalies/category :cognitect.anomalies/not-found :exception e}))))))
+  (list-all [_]
+    (let [root (io/file root-path)
+          json-files (->> (file-seq root)
+                          (filter #(str/ends-with? (.getName %) ".json")))]
+      (->> json-files
+           (map #(try (json/read-value %) (catch Exception _ nil)))
+           (remove nil?)
+           (sort-by #(get % "id") #(compare %2 %1))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ S3 ~~~~~~~~~~~~~~~~~~~
 (defn s3-client
@@ -163,6 +172,10 @@
                    :request {:Bucket bucket-name
                              :Key key-name}}))
 
+(defn s3-list [s3c bucket-name]
+  (aws/invoke s3c {:op :ListObjectsV2
+                   :request {:Bucket bucket-name}}))
+
 (defrecord S3Storage [client bucket]
   IStorage
   (store [_ id data]
@@ -180,7 +193,20 @@
           get-response (s3-get client bucket input-file)]
       (if (contains? get-response :cognitect.anomalies/category)
         (throw (ex-info "AWS Error during S3Storage retrieve" get-response))
-        (json/read-value (:Body get-response))))))
+        (json/read-value (:Body get-response)))))
+  (list-all [_]
+    (let [response (s3-list client bucket)]
+      (if (contains? response :cognitect.anomalies/category)
+        (throw (ex-info "AWS Error during S3Storage list-all" response))
+        (->> (:Contents response)
+             (map :Key)
+             (filter #(str/ends-with? % ".json"))
+             (map (fn [key-name]
+                    (let [get-response (s3-get client bucket key-name)]
+                      (when-not (contains? get-response :cognitect.anomalies/category)
+                        (json/read-value (:Body get-response))))))
+             (remove nil?)
+             (sort-by #(get % "id") #(compare %2 %1)))))))
 
 ;; ~~~~~~~~~~~~~~~~ IStorage Utils ~~~~~~~~~~~~~~~~
 
@@ -407,6 +433,13 @@
            ::exception e
            :body {:error "error during boost storage"}})))))
 
+;; ~~~~~~~~~~~~~~~~~~~ GET /boosts ~~~~~~~~~~~~~~~~~~~
+(defn list-boosts [cfg storage]
+  (fn [request]
+    (let [boosts (.list-all storage)]
+      {:status 200
+       :body boosts})))
+
 ;; ~~~~~~~~~~~~~~~~~~~ HTTP Server ~~~~~~~~~~~~~~~~~~~
 (defn auth-middleware [allowed-keys]
   (fn [handler]
@@ -432,6 +465,12 @@
                      :tags #{"admin"}
                      :summary "healthcheck"
                      :responses {200 {:body [:map [:status [:enum :ok]]]}}}}]
+   ["/boosts" {:get {:handler (list-boosts cfg storage)
+                     :tags #{"boosts"}
+                     :middleware [(auth-middleware (:allowed-keys cfg))]
+                     :summary "List all boosts"
+                     :swagger {:security [{"auth" []}]}
+                     :responses {200 {:body [:vector :map]}}}}]
    ["/boost" {:post {:handler (add-boost cfg storage)
                      :tags #{"boosts"}
                      :middleware [(auth-middleware (:allowed-keys cfg))]

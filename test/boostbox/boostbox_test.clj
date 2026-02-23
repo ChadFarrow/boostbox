@@ -34,6 +34,8 @@
             {:Body (java.io.ByteArrayInputStream. (.getBytes data "UTF-8"))}
             ;; Real S3 throws an exception, which the S3Storage record must catch
             {:Error {:aws/error-code "NoSuchKey"} :cognitect.anomalies/category :cognitect.anomalies/not-found}))
+        :ListObjectsV2
+        {:Contents (mapv (fn [[k _]] {:Key k}) @storage-atom)}
         (throw (ex-info (str "Unknown S3 operation: " op) {:op op}))))))
 
 ;; --- Test Server Setup ---
