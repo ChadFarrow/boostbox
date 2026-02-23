@@ -19,6 +19,5 @@ WORKDIR /app
 COPY --from=builder /app/target/boostbox.jar boostbox.jar
 
 EXPOSE 8080
-ENV BB_PORT=8080
 
-CMD ["java", "-jar", "boostbox.jar"]
+CMD ["sh", "-c", "BB_PORT=${PORT:-8080} exec java -jar boostbox.jar"]
