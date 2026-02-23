@@ -1,0 +1,86 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+BoostBox is a Clojure API for storing and retrieving Podcasting 2.0 payment metadata (boostagrams). Podcast apps POST boost metadata to `/boost`, receive a short URL, and that URL can later be fetched to retrieve the full metadata via an `x-rss-payment` HTTP header for Lightning invoice descriptions.
+
+## Build & Development Commands
+
+This project uses Nix flakes for all build/dev/test tooling.
+
+### Enter dev environment
+```sh
+./dev.sh
+```
+
+### Available scripts (inside dev shell)
+Run `scripts` to list all available commands. Key ones:
+- `scripts repl` — Start NREPL on 0.0.0.0:9998
+- `scripts tests` — Run full test suite (starts MinIO for S3 tests)
+- `scripts watch` — Run tests in watch mode
+- `scripts format` — Format all code (Clojure, Nix, Markdown via treefmt)
+- `scripts build` — Build with Nix
+- `scripts outdated` — Check for outdated dependencies
+- `scripts lock` — Update lock files
+
+### Run tests outside dev shell
+```sh
+./test.sh                    # Full suite with MinIO via Nix testenv
+clojure -M:test              # Direct Clojure test runner (no S3 tests)
+```
+
+### Build and run
+```sh
+nix build                    # Compile via clj-nix
+./result/bin/boostbox        # Run compiled binary
+```
+
+### Format check (CI)
+```sh
+nix flake check              # Runs treefmt formatting check
+```
+
+## Architecture
+
+### Source Layout
+
+- `src/boostbox/boostbox.clj` — Main application: config, storage, routes, middleware, HTML rendering, server startup (single-file monolith with `(:gen-class)`)
+- `src/boostbox/ulid.clj` — Custom ULID encoding/decoding using Crockford Base32
+- `src/boostbox/images.clj` — Base64-encoded image assets (favicon, logo)
+- `test/boostbox/boostbox_test.clj` — All tests (unit + integration, both storage backends)
+
+### Key Patterns
+
+**Storage protocol:** `IStorage` protocol with two implementations:
+- `LocalStorage` — filesystem, stores as `{root}/YYYY/MM/DD/{ulid}.json`
+- `S3Storage` — AWS/MinIO via `cognitect.aws`, same path structure
+
+**ID generation:** UUIDv7 → ULID (26-char Crockford Base32). The ULID embeds a timestamp used to derive the storage path.
+
+**Validation:** Malli schemas for request/response coercion, integrated with reitit routes.
+
+**HTTP stack:** Aleph server → reitit router → middleware chain (virtual threads, correlation IDs, MuLog logging, body size limiting, CORS, muuntaja content negotiation, Malli coercion, Swagger).
+
+**HTML rendering:** Chassis (hiccup-like DSL) for homepage and boost viewer pages.
+
+**BOLT11 description:** `rss::payment::{action} {url} {message}` format, truncated to 639-char limit.
+
+**Configuration:** All via environment variables (see README for full table). Key vars: `ENV`, `BB_PORT`, `BB_BASE_URL`, `BB_STORAGE`, `BB_ALLOWED_KEYS`.
+
+### Testing
+
+Tests use Kaocha with cloverage for code coverage. The `run-with-storage` helper runs integration tests against both FS and S3 backends. S3 tests require MinIO (started automatically by `./test.sh` or `scripts tests`). Set `BB_REAL_S3_IN_TEST=1` to enable real S3 tests.
+
+### Deployment
+
+- **Nix:** `nix run github:noblepayne/boostbox`
+- **Docker:** `ghcr.io/noblepayne/boostbox:latest`
+- **NixOS module:** `module.nix` provides a systemd service with hardened settings
+
+### Dependencies (deps.edn)
+
+HTTP: aleph (server), babashka.http-client (test client). Routing: reitit + swagger. Validation: malli. JSON: jsonista. HTML: chassis. AWS: cognitect.aws. Logging: mulog. IDs: clj-uuid.
+
+Aliases: `:repl` (NREPL + CIDER), `:test` (kaocha), `:test/watch`, `:outdated` (antq).
