@@ -237,6 +237,7 @@
   [data]
   (let [sats (format-sats (get data "value_msat_total"))]
     [(boost-metadata-row "ID:" (get data "id"))
+     (boost-metadata-row "Time:" (get data "timestamp"))
      (boost-metadata-row "From:" (get data "sender_name"))
      (boost-metadata-row "Amount:" (when sats (str sats " sats")))
      (boost-metadata-row "Show:" (get data "feed_title"))
