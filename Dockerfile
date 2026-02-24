@@ -9,6 +9,7 @@ RUN clojure -P
 # Build uberjar
 COPY build.clj ./
 COPY src/ src/
+COPY resources/ resources/
 RUN clojure -T:build uber
 
 # ---
