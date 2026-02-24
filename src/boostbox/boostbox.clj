@@ -232,12 +232,23 @@
      [:strong.boost-label label]
      [:span.boost-value value]]))
 
+(defn format-timestamp
+  "Format ISO-8601 timestamp to readable string like 'Feb 24, 2026 1:54 AM UTC'"
+  [ts]
+  (when ts
+    (try
+      (let [inst (java.time.Instant/parse ts)
+            zdt (java.time.ZonedDateTime/ofInstant inst (java.time.ZoneId/of "UTC"))
+            fmt (java.time.format.DateTimeFormatter/ofPattern "MMM d, yyyy h:mm a z")]
+        (.format zdt fmt))
+      (catch Exception _ ts))))
+
 (defn boost-detail-rows
   "Extracts common boost fields and renders metadata rows"
   [data]
   (let [sats (format-sats (get data "value_msat_total"))]
     [(boost-metadata-row "ID:" (get data "id"))
-     (boost-metadata-row "Time:" (get data "timestamp"))
+     (boost-metadata-row "Time:" (format-timestamp (get data "timestamp")))
      (boost-metadata-row "From:" (get data "sender_name"))
      (boost-metadata-row "Amount:" (when sats (str sats " sats")))
      (boost-metadata-row "Show:" (get data "feed_title"))
