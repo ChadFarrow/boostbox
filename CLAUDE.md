@@ -51,7 +51,9 @@ nix flake check              # Runs treefmt formatting check
 
 - `src/boostbox/boostbox.clj` — Main application: config, storage, routes, middleware, HTML rendering, server startup (single-file monolith with `(:gen-class)`)
 - `src/boostbox/ulid.clj` — Custom ULID encoding/decoding using Crockford Base32
-- `src/boostbox/images.clj` — Base64-encoded image assets (favicon, logo)
+- `src/boostbox/images.clj` — Loads base64 image assets (favicon, logo) from `resources/` at runtime
+- `resources/v4vbox.b64` — Base64-encoded background image for landing page
+- `resources/favicon.b64` — Base64-encoded favicon
 - `test/boostbox/boostbox_test.clj` — All tests (unit + integration, both storage backends)
 
 ### Key Patterns
@@ -66,7 +68,9 @@ nix flake check              # Runs treefmt formatting check
 
 **HTTP stack:** Aleph server → reitit router → middleware chain (virtual threads, correlation IDs, MuLog logging, body size limiting, CORS, muuntaja content negotiation, Malli coercion, Swagger).
 
-**HTML rendering:** Chassis (hiccup-like DSL) for homepage and boost viewer pages.
+**HTML rendering:** Chassis (hiccup-like DSL) for homepage and boost viewer pages. The homepage displays all stored boosts as clickable cards overlaid on a fixed background image. Shared helpers (`boost-detail-rows`, `boost-metadata-row`, `format-sats`) are used by both the homepage cards and the individual boost viewer page.
+
+**Image assets:** Base64 image data is stored in `resources/*.b64` files (not inline in source) to avoid exceeding JVM's 65535-byte constant pool limit during AOT compilation. The `build.clj` copies both `src/` and `resources/` into the uberjar.
 
 **BOLT11 description:** `rss::payment::{action} {url} {message}` format, truncated to 639-char limit.
 

@@ -234,18 +234,30 @@
      [:strong.boost-label label]
      [:span.boost-value value]]))
 
+(defn boost-detail-rows
+  "Extracts common boost fields and renders metadata rows"
+  [data]
+  (let [sats (format-sats (get data "value_msat_total"))]
+    [(boost-metadata-row "ID:" (get data "id"))
+     (boost-metadata-row "From:" (get data "sender_name"))
+     (boost-metadata-row "Amount:" (when sats (str sats " sats")))
+     (boost-metadata-row "Show:" (get data "feed_title"))
+     (boost-metadata-row "Episode:" (get data "item_title"))
+     (boost-metadata-row "App:" (get data "app_name"))
+     (boost-metadata-row "Message:" (get data "message"))]))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Homepage ~~~~~~~~~~~~~~~~~~~
 (def homepage-css
   (str "body { text-align: center; margin: 0; padding: 0; }"
-       "main { position: relative; width: 100vw; min-height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; display: flex; flex-direction: column; align-items: center; }"
-       ".overlay-top { margin-top: 2rem; width: 100%; max-width: 600px; padding: 1.5rem; background: rgba(0,0,0,0.6); border-radius: 12px; flex-shrink: 0; }"
+       "main { width: 100vw; height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; background-attachment: fixed; display: flex; flex-direction: column; align-items: center; overflow-y: auto; }"
+       ".overlay-top { margin-top: 2rem; width: 100%; max-width: 600px; padding: 1.5rem; background: rgba(40,30,20,0.75); border-radius: 12px; flex-shrink: 0; }"
        ".overlay-top h1 { margin: 0; color: #fff; font-size: 3rem; }"
        ".overlay-top p { font-size: 1.3rem; color: #ddd; margin: 0.5rem 0 0; }"
-       ".overlay-middle { width: 100%; max-width: 600px; padding: 1rem 0; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 1rem; }"
+       ".overlay-middle { width: 100%; max-width: 600px; padding: 1rem 0; display: flex; flex-direction: column; gap: 1rem; flex-shrink: 0; }"
        ".boost-card-link { text-decoration: none; color: inherit; }"
-       ".boost-card { background: rgba(0,0,0,0.85); border-radius: 12px; padding: 1rem 1.5rem; text-align: left; transition: background 0.2s; }"
-       ".boost-card:hover { background: rgba(0,0,0,0.92); }"
-       ".boost-card .boost-field { display: grid; grid-template-columns: minmax(80px, max-content) 1fr; gap: 0.5rem; align-items: start; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.15); }"
+       ".boost-card { background: rgba(40,30,20,0.92); border-radius: 12px; padding: 1rem 1.5rem; text-align: left; transition: background 0.2s; }"
+       ".boost-card:hover { background: rgba(40,30,20,0.97); }"
+       ".boost-card .boost-field { display: grid; grid-template-columns: minmax(80px, max-content) 1fr; gap: 0.5rem; align-items: start; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.1); }"
        ".boost-card .boost-field:last-child { border-bottom: none; }"
        ".boost-card .boost-label { color: #aaa; font-weight: 600; white-space: nowrap; font-size: 0.85rem; }"
        ".boost-card .boost-value { color: #fff; word-break: break-word; font-size: 0.85rem; }"
@@ -257,23 +269,8 @@
 (defn boost-card
   "Renders a single boost as a card for the homepage overlay"
   [boost]
-  (let [boost-id (get boost "id")
-        sender-name (get boost "sender_name")
-        value-msats (get boost "value_msat_total")
-        sats (format-sats value-msats)
-        feed-title (get boost "feed_title")
-        item-title (get boost "item_title")
-        app-name (get boost "app_name")
-        message (get boost "message")]
-    [:a.boost-card-link {:href (str "/boost/" boost-id)}
-     [:div.boost-card
-      (boost-metadata-row "ID:" boost-id)
-      (boost-metadata-row "From:" sender-name)
-      (boost-metadata-row "Amount:" (when sats (str sats " sats")))
-      (boost-metadata-row "Show:" feed-title)
-      (boost-metadata-row "Episode:" item-title)
-      (boost-metadata-row "App:" app-name)
-      (boost-metadata-row "Message:" message)]]))
+  [:a.boost-card-link {:href (str "/boost/" (get boost "id"))}
+   (into [:div.boost-card] (boost-detail-rows boost))])
 
 (defn homepage-head []
   (html/html
@@ -360,14 +357,7 @@
   "Renders RSS payment metadata in a simple HTML page with JSON display."
   [data]
   (let [boost-id (get data "id")
-        json-pretty (json/write-value-as-string data (json/object-mapper {:pretty true}))
-        sender-name (get data "sender_name")
-        value-msats (get data "value_msat_total")
-        sats (format-sats value-msats)
-        feed-title (get data "feed_title")
-        item-title (get data "item_title")
-        app-name (get data "app_name")
-        message (get data "message")]
+        json-pretty (json/write-value-as-string data (json/object-mapper {:pretty true}))]
     [html/doctype-html5
      [:html
       [:head
@@ -404,15 +394,7 @@
        [:main
         [:h1 "Boost Viewer"]
         [:section
-         [:article.boost-card
-          [:h3 "Boost Details"]
-          (boost-metadata-row "ID:" boost-id)
-          (boost-metadata-row "From:" sender-name)
-          (boost-metadata-row "Amount:" (str sats " sats"))
-          (boost-metadata-row "Show:" feed-title)
-          (boost-metadata-row "Episode:" item-title)
-          (boost-metadata-row "App:" app-name)
-          (boost-metadata-row "Message:" message)]]
+         (into [:article.boost-card [:h3 "Boost Details"]] (boost-detail-rows data))]
         [:section
          [:h3 "Metadata"]
          [:pre [:code {:class "language-json"} json-pretty]]]]
