@@ -230,24 +230,25 @@
          [:meta {:charset "utf-8"}]
          [:meta {:name "viewport", :content "width=device-width, initial-scale=1"}]
          [:meta {:name "color-scheme", :content "light dark"}]
-         [:title "BoostBox"]
+         [:title "TardBox"]
          [:link {:rel "icon" :type "image/png" :href (str "data:image/png;base64," images/favicon)}]
          [:link {:rel "stylesheet" :href "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css"}]
-         [:style "body { text-align: center; }
-               main { max-width: 600px; margin: 0 auto; padding: 2rem; }
-               h1 { margin-top: 1rem; }
-               p { font-size: 1.1rem; color: var(--muted-color); margin: 1.5rem 0; }
-               .button-group { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; margin-top: 2rem; }
+         [:style "body { text-align: center; margin: 0; padding: 0; }
+               main { position: relative; width: 100vw; height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; }
+               .overlay-top { position: absolute; top: 2rem; left: 50%; transform: translateX(-50%); width: 100%; max-width: 600px; padding: 1.5rem; background: rgba(0,0,0,0.6); border-radius: 12px; }
+               .overlay-top h1 { margin: 0; color: #fff; font-size: 3rem; }
+               .overlay-top p { font-size: 1.3rem; color: #ddd; margin: 0.5rem 0 0; }
+               .overlay-bottom { position: absolute; bottom: 2rem; left: 50%; transform: translateX(-50%); width: 100%; max-width: 600px; padding: 1rem; }
+               .button-group { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
                .button-group a { margin: 0; }"]]
         [:body
-         [:main
-          [:img {:src (str "data:image/png;base64," images/v4vbox)}]
-          [:h1 "BoostBox"]
-          [:p "A simple API to store and serve boost metadata"]
-          [:div.button-group
-           [:a {:href "/docs", :role "button"} "API Documentation"]
-           [:a {:href "/openapi.json", :role "button", :target "_blank"} "OpenAPI Spec"]
-           [:a {:href "https://github.com/noblepayne/boostbox", :role "button"} "View on GitHub"]]]]]])}))
+         [:main {:style (str "background-image: url('data:image/png;base64," images/v4vbox "');")}
+          [:div.overlay-top
+           [:h1 "TardBox"]
+           [:p "Store and serve your boostagrams"]]
+          [:div.overlay-bottom
+           [:div.button-group
+            [:a {:href "https://github.com/ChadFarrow/boostbox", :role "button"} "View on GitHub"]]]]]]])}))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Boost Schemas ~~~~~~~~~~~~~~~~~~~
 
