@@ -120,18 +120,19 @@
         day (format "%02d" (.getDayOfMonth zdt))]
     (str year "/" month "/" day)))
 
+(defn id->storage-key [id]
+  (let [timestamp (ulid/ulid->timestamp id)
+        prefix (timestamp->prefix timestamp)]
+    (str prefix "/" id ".json")))
+
 (defrecord LocalStorage [root-path]
   IStorage
   (store [_ id data]
-    (let [timestamp (ulid/ulid->timestamp id)
-          prefix (timestamp->prefix timestamp)
-          output-file (io/file root-path prefix (str id ".json"))
+    (let [output-file (io/file root-path (id->storage-key id))
           _ (-> output-file .getParentFile .mkdirs)]
       (json/write-value output-file data)))
   (retrieve [_ id]
-    (let [timestamp (ulid/ulid->timestamp id)
-          prefix (timestamp->prefix timestamp)
-          input-file (io/file root-path prefix (str id ".json"))]
+    (let [input-file (io/file root-path (id->storage-key id))]
       (try
         (json/read-value input-file)
         (catch java.io.FileNotFoundException e
@@ -176,37 +177,34 @@
   (aws/invoke s3c {:op :ListObjectsV2
                    :request {:Bucket bucket-name}}))
 
+(defn- check-aws-response [response operation]
+  (when (contains? response :cognitect.anomalies/category)
+    (throw (ex-info (str "AWS Error during " operation) response)))
+  response)
+
 (defrecord S3Storage [client bucket]
   IStorage
   (store [_ id data]
-    (let [timestamp (ulid/ulid->timestamp id)
-          prefix (timestamp->prefix timestamp)
-          output-file (str prefix "/" id ".json")
-          response (s3-put client bucket output-file "application/json"
+    (let [key (id->storage-key id)
+          response (s3-put client bucket key "application/json"
                            (json/write-value-as-string data))]
-      (when (contains? response :cognitect.anomalies/category)
-        (throw (ex-info "AWS Error during S3Storage store" response)))))
+      (check-aws-response response "S3Storage store")))
   (retrieve [_ id]
-    (let [timestamp (ulid/ulid->timestamp id)
-          prefix (timestamp->prefix timestamp)
-          input-file (str prefix "/" id ".json")
-          get-response (s3-get client bucket input-file)]
-      (if (contains? get-response :cognitect.anomalies/category)
-        (throw (ex-info "AWS Error during S3Storage retrieve" get-response))
-        (json/read-value (:Body get-response)))))
+    (let [get-response (check-aws-response
+                        (s3-get client bucket (id->storage-key id))
+                        "S3Storage retrieve")]
+      (json/read-value (:Body get-response))))
   (list-all [_]
-    (let [response (s3-list client bucket)]
-      (if (contains? response :cognitect.anomalies/category)
-        (throw (ex-info "AWS Error during S3Storage list-all" response))
-        (->> (:Contents response)
-             (map :Key)
-             (filter #(str/ends-with? % ".json"))
-             (map (fn [key-name]
-                    (let [get-response (s3-get client bucket key-name)]
-                      (when-not (contains? get-response :cognitect.anomalies/category)
-                        (json/read-value (:Body get-response))))))
-             (remove nil?)
-             (sort-by #(get % "id") #(compare %2 %1)))))))
+    (let [response (check-aws-response (s3-list client bucket) "S3Storage list-all")]
+      (->> (:Contents response)
+           (map :Key)
+           (filter #(str/ends-with? % ".json"))
+           (map (fn [key-name]
+                  (let [get-response (s3-get client bucket key-name)]
+                    (when-not (contains? get-response :cognitect.anomalies/category)
+                      (json/read-value (:Body get-response))))))
+           (remove nil?)
+           (sort-by #(get % "id") #(compare %2 %1))))))
 
 ;; ~~~~~~~~~~~~~~~~ IStorage Utils ~~~~~~~~~~~~~~~~
 
@@ -246,9 +244,17 @@
      (boost-metadata-row "App:" (get data "app_name"))
      (boost-metadata-row "Message:" (get data "message"))]))
 
+;; ~~~~~~~~~~~~~~~~~~~ Shared CSS ~~~~~~~~~~~~~~~~~~~
+(def base-boost-css
+  (str ".boost-field { display: grid; align-items: start; }"
+       ".boost-field:last-child { border-bottom: none; }"
+       ".boost-label { font-weight: 600; white-space: nowrap; }"
+       ".boost-value { word-break: break-word; }"))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Homepage ~~~~~~~~~~~~~~~~~~~
 (def homepage-css
-  (str "body { text-align: center; margin: 0; padding: 0; }"
+  (str base-boost-css
+       "body { text-align: center; margin: 0; padding: 0; background: #1a130d; }"
        "main { width: 100vw; height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; background-attachment: fixed; display: flex; flex-direction: column; align-items: center; overflow-y: auto; }"
        ".overlay-top { margin-top: 2rem; width: 100%; max-width: 600px; padding: 1.5rem; background: rgba(40,30,20,0.75); border-radius: 12px; flex-shrink: 0; }"
        ".overlay-top h1 { margin: 0; color: #fff; font-size: 3rem; }"
@@ -257,10 +263,9 @@
        ".boost-card-link { text-decoration: none; color: inherit; }"
        ".boost-card { background: rgba(40,30,20,0.92); border-radius: 12px; padding: 1rem 1.5rem; text-align: left; transition: background 0.2s; }"
        ".boost-card:hover { background: rgba(40,30,20,0.97); }"
-       ".boost-card .boost-field { display: grid; grid-template-columns: minmax(80px, max-content) 1fr; gap: 0.5rem; align-items: start; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.1); }"
-       ".boost-card .boost-field:last-child { border-bottom: none; }"
-       ".boost-card .boost-label { color: #aaa; font-weight: 600; white-space: nowrap; font-size: 0.85rem; }"
-       ".boost-card .boost-value { color: #fff; word-break: break-word; font-size: 0.85rem; }"
+       ".boost-card .boost-field { grid-template-columns: minmax(80px, max-content) 1fr; gap: 0.5rem; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.1); }"
+       ".boost-card .boost-label { color: #aaa; font-size: 0.85rem; }"
+       ".boost-card .boost-value { color: #fff; font-size: 0.85rem; }"
        ".empty-state { color: #aaa; font-size: 1.1rem; padding: 2rem; }"
        ".overlay-bottom { margin-bottom: 2rem; width: 100%; max-width: 600px; padding: 1rem; flex-shrink: 0; }"
        ".button-group { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }"
@@ -369,27 +374,22 @@
        [:link {:rel "stylesheet" :href "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css"}]
        [:link {:rel "stylesheet" :href "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/atom-one-dark.min.css"}]
        [:script {:src "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"}]
-       [:style "pre { background: var(--form-element-background-color);
-                      border: 1px solid var(--form-element-border-color);
-                      padding: 1rem;
-                      border-radius: 6px;
-                      overflow-x: auto; }
-                code { font-size: 0.9rem; }
-                .boost-card { border: 1px solid var(--form-element-border-color);
-                              padding: 1.5rem;
-                              border-radius: 6px;
-                              background: var(--card-background-color, transparent); }
-                .boost-field { display: grid;
-                               grid-template-columns: minmax(100px, max-content) 1fr;
-                               gap: 1rem;
-                               align-items: start;
-                               padding: 0.75rem 0;
-                               border-bottom: 1px solid var(--form-element-border-color); }
-                .boost-field:last-child { border-bottom: none; }
-                .boost-field strong { color: var(--muted-color); }
-                .boost-label { font-weight: 600;
-                               white-space: nowrap; }
-                .boost-value { word-break: break-word; }"]]
+       [:style (str base-boost-css
+                    "pre { background: var(--form-element-background-color);
+                           border: 1px solid var(--form-element-border-color);
+                           padding: 1rem;
+                           border-radius: 6px;
+                           overflow-x: auto; }
+                     code { font-size: 0.9rem; }
+                     .boost-card { border: 1px solid var(--form-element-border-color);
+                                   padding: 1.5rem;
+                                   border-radius: 6px;
+                                   background: var(--card-background-color, transparent); }
+                     .boost-field { grid-template-columns: minmax(100px, max-content) 1fr;
+                                    gap: 1rem;
+                                    padding: 0.75rem 0;
+                                    border-bottom: 1px solid var(--form-element-border-color); }
+                     .boost-field strong { color: var(--muted-color); }")]]
       [:body
        [:main
         [:h1 "Boost Viewer"]
@@ -591,7 +591,7 @@
   [handler]
   (fn [request]
     (let [existing (get-in request [:headers "x-correlation-id"])
-          correlation-id (if existing existing (gen-ulid))
+          correlation-id (or existing (gen-ulid))
           request (assoc request :correlation-id correlation-id)
           response (handler request)]
       (assoc-in response [:headers "x-correlation-id"] correlation-id))))
