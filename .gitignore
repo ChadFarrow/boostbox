@@ -1,13 +1,20 @@
 boosts
+.env
+*.tar*
+staging
+
+# Node/TypeScript
+node_modules
+dist
+*.tsbuildinfo
+
+# Clojure (legacy)
 .calva
 .clj-kondo
 .cpcache
 .devenv
-.env
-logs.test.txt
 .lsp
 .nrepl-port
 result
-*.tar*
 target
-staging
+logs.test.txt

@@ -1,24 +1,28 @@
-FROM clojure:temurin-21-tools-deps-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
 # Cache dependencies
-COPY deps.edn ./
-RUN clojure -P
+COPY package.json package-lock.json* ./
+RUN npm ci
 
-# Build uberjar
-COPY build.clj ./
+# Build
+COPY tsconfig.json ./
 COPY src/ src/
-COPY resources/ resources/
-RUN clojure -T:build uber
+RUN npm run build
 
 # ---
 
-FROM eclipse-temurin:21-jre-alpine
+FROM node:22-alpine
 
 WORKDIR /app
-COPY --from=builder /app/target/boostbox.jar boostbox.jar
+
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev
+
+COPY --from=builder /app/dist/ dist/
+COPY resources/ resources/
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "BB_PORT=${PORT:-8080} exec java -jar boostbox.jar"]
+CMD ["sh", "-c", "BB_PORT=${PORT:-8080} exec node dist/index.js"]

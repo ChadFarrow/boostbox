@@ -1,7 +1,0 @@
-#kaocha/v1
-{:tests [{:id :tests
-          :test-paths ["test"]
-          :ns-patterns ["-test$"]}]
- :plugins [:kaocha.plugin/cloverage]
- :reporter [kaocha.report/documentation]
- :color? true}
