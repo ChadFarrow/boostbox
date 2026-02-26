@@ -243,45 +243,91 @@
         (.format zdt fmt))
       (catch Exception _ ts))))
 
+(defn boost-sats-row
+  "Renders the amount row with special styling for sats"
+  [value-msat]
+  (when-let [sats (format-sats value-msat)]
+    [:div.boost-field
+     [:strong.boost-label "Amount:"]
+     [:span.boost-value.sats (str "⚡ " sats " sats")]]))
+
 (defn boost-detail-rows
   "Extracts common boost fields and renders metadata rows"
   [data]
-  (let [sats (format-sats (get data "value_msat_total"))]
-    [(boost-metadata-row "ID:" (get data "id"))
-     (boost-metadata-row "Time:" (format-timestamp (get data "timestamp")))
-     (boost-metadata-row "From:" (get data "sender_name"))
-     (boost-metadata-row "Amount:" (when sats (str sats " sats")))
-     (boost-metadata-row "Show:" (get data "feed_title"))
-     (boost-metadata-row "Episode:" (get data "item_title"))
-     (boost-metadata-row "App:" (get data "app_name"))
-     (boost-metadata-row "Message:" (get data "message"))]))
+  [(boost-metadata-row "ID:" (get data "id"))
+   (boost-metadata-row "Time:" (format-timestamp (get data "timestamp")))
+   (boost-metadata-row "From:" (get data "sender_name"))
+   (boost-sats-row (get data "value_msat_total"))
+   (boost-metadata-row "Show:" (get data "feed_title"))
+   (boost-metadata-row "Episode:" (get data "item_title"))
+   (boost-metadata-row "App:" (get data "app_name"))
+   (boost-metadata-row "Message:" (get data "message"))])
 
 ;; ~~~~~~~~~~~~~~~~~~~ Shared CSS ~~~~~~~~~~~~~~~~~~~
 (def base-boost-css
   (str ".boost-field { display: grid; align-items: start; }"
        ".boost-field:last-child { border-bottom: none; }"
-       ".boost-label { font-weight: 600; white-space: nowrap; }"
+       ".boost-label { font-weight: 600; white-space: nowrap; font-size: 0.8rem; letter-spacing: 0.04em; text-transform: uppercase; }"
        ".boost-value { word-break: break-word; }"))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Homepage ~~~~~~~~~~~~~~~~~~~
 (def homepage-css
   (str base-boost-css
-       "body { text-align: center; margin: 0; padding: 0; background: #1a130d; }"
-       "main { width: 100vw; height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; background-attachment: fixed; display: flex; flex-direction: column; align-items: center; overflow-y: auto; }"
-       ".overlay-top { margin-top: 2rem; width: 100%; max-width: 600px; padding: 1.5rem; background: rgba(40,30,20,0.75); border-radius: 12px; flex-shrink: 0; }"
-       ".overlay-top h1 { margin: 0; color: #fff; font-size: 3rem; }"
-       ".overlay-top p { font-size: 1.3rem; color: #ddd; margin: 0.5rem 0 0; }"
-       ".overlay-middle { width: 100%; max-width: 600px; padding: 1rem 0; display: flex; flex-direction: column; gap: 1rem; flex-shrink: 0; }"
-       ".boost-card-link { text-decoration: none; color: inherit; }"
-       ".boost-card { background: rgba(40,30,20,0.92); border-radius: 12px; padding: 1rem 1.5rem; text-align: left; transition: background 0.2s; }"
-       ".boost-card:hover { background: rgba(40,30,20,0.97); }"
-       ".boost-card .boost-field { grid-template-columns: minmax(80px, max-content) 1fr; gap: 0.5rem; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.1); }"
-       ".boost-card .boost-label { color: #aaa; font-size: 0.85rem; }"
-       ".boost-card .boost-value { color: #fff; font-size: 0.85rem; }"
-       ".empty-state { color: #aaa; font-size: 1.1rem; padding: 2rem; }"
-       ".overlay-bottom { margin-bottom: 2rem; width: 100%; max-width: 600px; padding: 1rem; flex-shrink: 0; }"
-       ".button-group { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }"
-       ".button-group a { margin: 0; }"))
+       "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
+       "body { font-family: 'Inter', system-ui, -apple-system, sans-serif; text-align: center; margin: 0; padding: 0; background: #0f0a07; color: #e5e5e5; }"
+       "main { width: 100vw; min-height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; background-attachment: fixed; display: flex; flex-direction: column; align-items: center; overflow-y: auto; padding: 0 1rem; }"
+
+       ;; Header / hero section
+       ".overlay-top { margin-top: 2.5rem; width: 100%; max-width: 640px; padding: 2.5rem 2rem; "
+       "background: rgba(15,10,7,0.6); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); "
+       "border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; flex-shrink: 0; }"
+       ".overlay-top h1 { margin: 0; color: #fff; font-size: 2.75rem; font-weight: 800; letter-spacing: -0.02em; }"
+       ".overlay-top h1 .accent { color: #f7931a; }"
+       ".overlay-top p { font-size: 1.05rem; color: rgba(255,255,255,0.6); margin: 0.75rem 0 0; font-weight: 400; letter-spacing: 0.01em; }"
+
+       ;; Boost count badge
+       ".boost-count { display: inline-block; margin-top: 1rem; padding: 0.3rem 0.9rem; background: rgba(247,147,26,0.15); border: 1px solid rgba(247,147,26,0.3); border-radius: 100px; color: #f7931a; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.03em; }"
+
+       ;; Cards section
+       ".overlay-middle { width: 100%; max-width: 640px; padding: 1.25rem 0; display: flex; flex-direction: column; gap: 0.75rem; flex-shrink: 0; }"
+       ".boost-card-link { text-decoration: none; color: inherit; display: block; }"
+       ".boost-card { background: rgba(20,15,10,0.65); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); "
+       "border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 1rem 1.25rem; text-align: left; "
+       "transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); }"
+       ".boost-card:hover { background: rgba(25,20,15,0.8); border-color: rgba(247,147,26,0.2); transform: translateY(-1px); "
+       "box-shadow: 0 8px 25px rgba(0,0,0,0.3), 0 0 0 1px rgba(247,147,26,0.1); }"
+       ".boost-card .boost-field { grid-template-columns: 5.5rem 1fr; gap: 0.5rem; padding: 0.35rem 0; border-bottom: 1px solid rgba(255,255,255,0.05); }"
+       ".boost-card .boost-label { color: rgba(255,255,255,0.4); font-size: 0.75rem; }"
+       ".boost-card .boost-value { color: rgba(255,255,255,0.9); font-size: 0.85rem; }"
+       ".boost-card .boost-value.sats { color: #f7931a; font-weight: 600; }"
+
+       ;; Empty state
+       ".empty-state { color: rgba(255,255,255,0.4); font-size: 1rem; padding: 3rem 2rem; "
+       "background: rgba(20,15,10,0.5); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); "
+       "border: 1px dashed rgba(255,255,255,0.1); border-radius: 12px; }"
+       ".empty-state-icon { font-size: 2.5rem; margin-bottom: 0.75rem; opacity: 0.5; }"
+       ".empty-state-text { font-size: 1rem; }"
+
+       ;; Footer
+       ".overlay-bottom { margin-bottom: 2.5rem; margin-top: 0.5rem; width: 100%; max-width: 640px; padding: 1rem; flex-shrink: 0; }"
+       ".button-group { display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap; }"
+       ".button-group a { margin: 0; display: inline-flex; align-items: center; gap: 0.5rem; "
+       "padding: 0.6rem 1.25rem; border-radius: 8px; font-size: 0.85rem; font-weight: 500; "
+       "text-decoration: none; transition: all 0.2s ease; }"
+       ".btn-primary { background: #f7931a; color: #fff; border: none; }"
+       ".btn-primary:hover { background: #e8850f; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(247,147,26,0.3); }"
+       ".btn-secondary { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.7); border: 1px solid rgba(255,255,255,0.1); }"
+       ".btn-secondary:hover { background: rgba(255,255,255,0.1); color: #fff; border-color: rgba(255,255,255,0.2); }"
+
+       ;; Responsive
+       "@media (max-width: 640px) { "
+       ".overlay-top { margin-top: 1.5rem; padding: 1.75rem 1.25rem; } "
+       ".overlay-top h1 { font-size: 2rem; } "
+       ".overlay-top p { font-size: 0.95rem; } "
+       ".boost-card { padding: 0.85rem 1rem; } "
+       ".boost-card .boost-field { grid-template-columns: 4.5rem 1fr; } "
+       "main { padding: 0 0.75rem; } "
+       "}"))
 
 (defn boost-card
   "Renders a single boost as a card for the homepage overlay"
@@ -294,26 +340,35 @@
    [:head
     [:meta {:charset "utf-8"}]
     [:meta {:name "viewport", :content "width=device-width, initial-scale=1"}]
-    [:meta {:name "color-scheme", :content "light dark"}]
+    [:meta {:name "color-scheme", :content "dark"}]
+    [:meta {:name "theme-color", :content "#0f0a07"}]
     [:title "TardBox"]
     [:link {:rel "icon" :type "image/png" :href (str "data:image/png;base64," images/favicon)}]
-    [:link {:rel "stylesheet" :href "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css"}]
+    [:link {:rel "preconnect" :href "https://fonts.googleapis.com"}]
+    [:link {:rel "preconnect" :href "https://fonts.gstatic.com" :crossorigin ""}]
+    [:link {:rel "stylesheet" :href "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"}]
     [:style homepage-css]]))
 
 (defn homepage-body [boosts]
-  (html/html
-   [:body
-    [:main {:style (str "background-image: url('data:image/png;base64," images/v4vbox "');")}
-     [:div.overlay-top
-      [:h1 "TardBox"]
-      [:p "Store and serve your boostagrams"]]
-     [:div.overlay-middle
-      (if (seq boosts)
-        (map boost-card boosts)
-        [:div.empty-state "No boosts yet"])]
-     [:div.overlay-bottom
-      [:div.button-group
-       [:a {:href "https://github.com/ChadFarrow/boostbox", :role "button"} "View on GitHub"]]]]]))
+  (let [boost-count (count boosts)]
+    (html/html
+     [:body
+      [:main {:style (str "background-image: url('data:image/png;base64," images/v4vbox "');")}
+       [:div.overlay-top
+        [:h1 "Tard" [:span.accent "Box"]]
+        [:p "Store and serve your boostagrams"]
+        (when (pos? boost-count)
+          [:div.boost-count (str boost-count (if (= 1 boost-count) " boost" " boosts"))])]
+       [:div.overlay-middle
+        (if (seq boosts)
+          (map boost-card boosts)
+          [:div.empty-state
+           [:div.empty-state-icon "⚡"]
+           [:div.empty-state-text "No boosts yet"]])]
+       [:div.overlay-bottom
+        [:div.button-group
+         [:a.btn-secondary {:href "/docs"} "API Docs"]
+         [:a.btn-secondary {:href "https://github.com/ChadFarrow/boostbox"} "GitHub"]]]]])))
 
 (defn homepage [storage]
   (fn [_]
@@ -370,6 +425,47 @@
         encoded (rcodec/url-encode json-str)]
     encoded))
 
+(def boost-view-css
+  (str base-boost-css
+       "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
+       "body { font-family: 'Inter', system-ui, -apple-system, sans-serif; margin: 0; padding: 0; background: #0f0a07; color: #e5e5e5; }"
+       "main { width: 100vw; min-height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; background-attachment: fixed; "
+       "display: flex; flex-direction: column; align-items: center; overflow-y: auto; padding: 0 1rem; }"
+
+       ;; Nav bar
+       ".nav-bar { width: 100%; max-width: 720px; padding: 1.25rem 0; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }"
+       ".nav-back { display: inline-flex; align-items: center; gap: 0.4rem; color: rgba(255,255,255,0.5); text-decoration: none; font-size: 0.85rem; font-weight: 500; transition: color 0.2s; }"
+       ".nav-back:hover { color: #f7931a; }"
+       ".nav-title { color: #fff; font-size: 1rem; font-weight: 700; }"
+       ".nav-title .accent { color: #f7931a; }"
+
+       ;; Boost detail card
+       ".boost-detail-card { width: 100%; max-width: 720px; "
+       "background: rgba(15,10,7,0.6); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); "
+       "border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 2rem; margin-bottom: 1rem; }"
+       ".boost-detail-card h2 { color: #fff; font-size: 1.25rem; font-weight: 700; margin: 0 0 1.25rem; padding-bottom: 0.75rem; border-bottom: 1px solid rgba(255,255,255,0.08); }"
+       ".boost-detail-card .boost-field { grid-template-columns: 6.5rem 1fr; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid rgba(255,255,255,0.05); }"
+       ".boost-detail-card .boost-label { color: rgba(255,255,255,0.4); }"
+       ".boost-detail-card .boost-value { color: rgba(255,255,255,0.9); font-size: 0.9rem; }"
+       ".boost-detail-card .boost-value.sats { color: #f7931a; font-weight: 600; }"
+
+       ;; JSON section
+       ".json-section { width: 100%; max-width: 720px; margin-bottom: 2.5rem; "
+       "background: rgba(15,10,7,0.6); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); "
+       "border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 2rem; overflow: hidden; }"
+       ".json-section h2 { color: #fff; font-size: 1.25rem; font-weight: 700; margin: 0 0 1rem; padding-bottom: 0.75rem; border-bottom: 1px solid rgba(255,255,255,0.08); }"
+       "pre { background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.06); padding: 1.25rem; border-radius: 10px; overflow-x: auto; margin: 0; }"
+       "code { font-size: 0.8rem; font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; line-height: 1.6; }"
+
+       ;; Responsive
+       "@media (max-width: 640px) { "
+       ".boost-detail-card { padding: 1.25rem; } "
+       ".boost-detail-card .boost-field { grid-template-columns: 5rem 1fr; } "
+       ".json-section { padding: 1.25rem; } "
+       "pre { padding: 1rem; } "
+       "main { padding: 0 0.75rem; } "
+       "}"))
+
 (defn boost-view
   "Renders RSS payment metadata in a simple HTML page with JSON display."
   [data]
@@ -380,35 +476,24 @@
       [:head
        [:meta {:charset "utf-8"}]
        [:meta {:name "viewport", :content "width=device-width, initial-scale=1"}]
-       [:meta {:name "color-scheme", :content "light dark"}]
-       [:title (str "BoostBox Boost " boost-id)]
+       [:meta {:name "color-scheme", :content "dark"}]
+       [:meta {:name "theme-color", :content "#0f0a07"}]
+       [:title (str "Boost " boost-id " | TardBox")]
        [:link {:rel "icon" :type "image/png" :href (str "data:image/png;base64," images/favicon)}]
-       [:link {:rel "stylesheet" :href "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.min.css"}]
+       [:link {:rel "preconnect" :href "https://fonts.googleapis.com"}]
+       [:link {:rel "preconnect" :href "https://fonts.gstatic.com" :crossorigin ""}]
+       [:link {:rel "stylesheet" :href "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"}]
        [:link {:rel "stylesheet" :href "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/atom-one-dark.min.css"}]
        [:script {:src "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"}]
-       [:style (str base-boost-css
-                    "pre { background: var(--form-element-background-color);
-                           border: 1px solid var(--form-element-border-color);
-                           padding: 1rem;
-                           border-radius: 6px;
-                           overflow-x: auto; }
-                     code { font-size: 0.9rem; }
-                     .boost-card { border: 1px solid var(--form-element-border-color);
-                                   padding: 1.5rem;
-                                   border-radius: 6px;
-                                   background: var(--card-background-color, transparent); }
-                     .boost-field { grid-template-columns: minmax(100px, max-content) 1fr;
-                                    gap: 1rem;
-                                    padding: 0.75rem 0;
-                                    border-bottom: 1px solid var(--form-element-border-color); }
-                     .boost-field strong { color: var(--muted-color); }")]]
+       [:style boost-view-css]]
       [:body
-       [:main
-        [:h1 "Boost Viewer"]
-        [:section
-         (into [:article.boost-card [:h3 "Boost Details"]] (boost-detail-rows data))]
-        [:section
-         [:h3 "Metadata"]
+       [:main {:style (str "background-image: url('data:image/png;base64," images/v4vbox "');")}
+        [:nav.nav-bar
+         [:a.nav-back {:href "/"} "\u2190 All Boosts"]
+         [:span.nav-title "Tard" [:span.accent "Box"]]]
+        (into [:div.boost-detail-card [:h2 "Boost Details"]] (boost-detail-rows data))
+        [:div.json-section
+         [:h2 "Raw Metadata"]
          [:pre [:code {:class "language-json"} json-pretty]]]]
        [:script "hljs.highlightAll();"]]]]))
 
