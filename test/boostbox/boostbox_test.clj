@@ -316,6 +316,33 @@
                (is (str/includes? (:body get-resp) "Test Boost 2")
                    "HTML should show the message")))))))))
 
+(deftest e2e-head-boost-returns-header
+  (run-with-storage
+   ["FS" "S3"]
+   (fn [data]
+     (testing (str "HEAD /boost/:id returns x-rss-payment header [" (:test-storage-impl data) "]")
+       (let [base-url (-> data :config :base-url)
+             api-key (-> data :config :allowed-keys first)
+             boost-payload (minimal-boost-payload)
+             post-resp (http/post (str base-url "/boost")
+                                  {:headers {"x-api-key" api-key
+                                             "Content-Type" "application/json"}
+                                   :body (json/write-value-as-string boost-payload)
+                                   :throw false})
+             post-body (json/read-value (:body post-resp))
+             boost-url (get post-body "url")
+
+             ;; HEAD request
+             head-resp (http/request {:method :head
+                                      :uri boost-url
+                                      :throw false})]
+
+         (is (= 200 (:status head-resp)) "HEAD should return 200")
+         (is (some? (get-in head-resp [:headers "x-rss-payment"]))
+             "HEAD should include x-rss-payment header")
+         (is (or (nil? (:body head-resp)) (= "" (:body head-resp)))
+             "HEAD should have empty body"))))))
+
 ;; --- Unhappy Path Smoke Tests ---
 
 (deftest smoke-test-413-payload-too-large

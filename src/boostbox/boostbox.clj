@@ -523,7 +523,11 @@
                         :responses {200 {:body :string}
                                     400 {:body [:map [:error :string] [:id :string]]}
                                     401 {:body [:map [:error :string] [:id :string]]}
-                                    404 {:body [:map [:error :string] [:id :string]]}}}}]])
+                                    404 {:body [:map [:error :string] [:id :string]]}}}
+                   :head {:handler (get-boost-by-id cfg storage)
+                          :no-doc true
+                          :parameters {:path {:id [:and :string
+                                                   [:fn {:error/message "must be valid ULID"} valid-ulid?]]}}}}]])
 
 (def cors-middleware
   {:name ::cors
@@ -532,7 +536,7 @@
              (if (= :options (:request-method request))
                {:status 204
                 :headers {"Access-Control-Allow-Origin" "*"
-                          "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
+                          "Access-Control-Allow-Methods" "GET, HEAD, POST, OPTIONS"
                           "Access-Control-Allow-Headers" "Content-Type, X-API-Key"
                           "Access-Control-Max-Age" "3600"}}
                (let [response (handler request)]
