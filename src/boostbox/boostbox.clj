@@ -263,6 +263,54 @@
    (boost-metadata-row "App:" (get data "app_name"))
    (boost-metadata-row "Message:" (get data "message"))])
 
+;; ~~~~~~~~~~~~~~~~~~~ Sorting & Grouping ~~~~~~~~~~~~~~~~~~~
+(defn boost-date-key
+  "Extract YYYY-MM-DD date string from boost timestamp"
+  [boost]
+  (when-let [ts (get boost "timestamp")]
+    (try
+      (let [inst (java.time.Instant/parse ts)
+            zdt (java.time.ZonedDateTime/ofInstant inst (java.time.ZoneId/of "UTC"))]
+        (.format zdt (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd")))
+      (catch Exception _ nil))))
+
+(defn format-date-header
+  "Format YYYY-MM-DD to readable date like 'Monday, Feb 24, 2026'"
+  [date-str]
+  (try
+    (let [ld (java.time.LocalDate/parse date-str)
+          fmt (java.time.format.DateTimeFormatter/ofPattern "EEEE, MMM d, yyyy")]
+      (.format ld fmt))
+    (catch Exception _ date-str)))
+
+(defn section-total-sats
+  "Sum value_msat_total for a group of boosts, return formatted sats string"
+  [boosts]
+  (let [total-msat (reduce (fn [acc b] (+ acc (or (get b "value_msat_total") 0))) 0 boosts)]
+    (format-sats total-msat)))
+
+(defn group-boosts-by-date
+  "Group boosts by date, returns seq of [header boosts] newest first"
+  [boosts]
+  (->> boosts
+       (group-by #(or (boost-date-key %) "Unknown"))
+       (sort-by first #(compare %2 %1))
+       (map (fn [[date-str bs]]
+              [(if (= date-str "Unknown") "Unknown Date" (format-date-header date-str))
+               bs]))))
+
+(defn sort-boosts-by-amount
+  "Sort boosts by value_msat_total descending"
+  [boosts]
+  (sort-by #(or (get % "value_msat_total") 0) #(compare %2 %1) boosts))
+
+(defn group-boosts-by-podcast
+  "Group boosts by feed_title, sorted by boost count descending"
+  [boosts]
+  (->> boosts
+       (group-by #(or (get % "feed_title") "Unknown Podcast"))
+       (sort-by (fn [[_ bs]] (- (count bs))))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Shared CSS ~~~~~~~~~~~~~~~~~~~
 (def base-boost-css
   (str ".boost-field { display: grid; align-items: start; }"
@@ -319,6 +367,21 @@
        ".btn-secondary { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.7); border: 1px solid rgba(255,255,255,0.1); }"
        ".btn-secondary:hover { background: rgba(255,255,255,0.1); color: #fff; border-color: rgba(255,255,255,0.2); }"
 
+       ;; Sort bar
+       ".sort-bar { display: flex; align-items: center; gap: 0.4rem; justify-content: center; margin-top: 1rem; flex-wrap: wrap; }"
+       ".sort-label { color: rgba(255,255,255,0.4); font-size: 0.8rem; font-weight: 500; }"
+       ".sort-option { color: rgba(255,255,255,0.5); font-size: 0.8rem; font-weight: 500; text-decoration: none; padding: 0.25rem 0.6rem; border-radius: 6px; border: 1px solid transparent; transition: all 0.2s; }"
+       ".sort-option:hover { color: rgba(255,255,255,0.8); background: rgba(255,255,255,0.06); }"
+       ".sort-option.active { color: #f7931a; background: rgba(247,147,26,0.12); border-color: rgba(247,147,26,0.25); }"
+       ".sort-divider { color: rgba(255,255,255,0.15); font-size: 0.75rem; }"
+
+       ;; Section headers
+       ".section { margin-bottom: 0.25rem; }"
+       ".section-header { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.25rem; }"
+       ".section-line { flex: 1; height: 1px; background: rgba(255,255,255,0.1); }"
+       ".section-title { color: rgba(255,255,255,0.7); font-size: 0.8rem; font-weight: 600; white-space: nowrap; }"
+       ".section-stats { color: rgba(255,255,255,0.35); font-size: 0.7rem; white-space: nowrap; }"
+
        ;; Responsive
        "@media (max-width: 640px) { "
        ".overlay-top { margin-top: 1.5rem; padding: 1.75rem 1.25rem; } "
@@ -349,7 +412,31 @@
     [:link {:rel "stylesheet" :href "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"}]
     [:style homepage-css]]))
 
-(defn homepage-body [boosts]
+(defn sort-bar
+  "Renders sort option links for the homepage"
+  [active-sort]
+  [:div.sort-bar
+   [:span.sort-label "Sort:"]
+   [:a {:href "/?sort=date" :class (str "sort-option" (when (= active-sort "date") " active"))} "By Date"]
+   [:span.sort-divider "|"]
+   [:a {:href "/?sort=amount" :class (str "sort-option" (when (= active-sort "amount") " active"))} "By Amount"]
+   [:span.sort-divider "|"]
+   [:a {:href "/?sort=podcast" :class (str "sort-option" (when (= active-sort "podcast") " active"))} "By Podcast"]])
+
+(defn section-block
+  "Renders a section with header (title + stats) and boost cards"
+  [title boosts]
+  (let [count-str (str (count boosts) (if (= 1 (count boosts)) " boost" " boosts"))
+        sats-str (section-total-sats boosts)]
+    (into [:div.section
+           [:div.section-header
+            [:div.section-line]
+            [:span.section-title title]
+            [:span.section-stats (str count-str (when sats-str (str " \u00b7 \u26a1 " sats-str " sats")))]
+            [:div.section-line]]]
+          (map boost-card boosts))))
+
+(defn homepage-body [boosts sort-param]
   (let [boost-count (count boosts)]
     (html/html
      [:body
@@ -358,10 +445,18 @@
         [:h1 "Tard" [:span.accent "Box"]]
         [:p "Store and serve your boostagrams"]
         (when (pos? boost-count)
-          [:div.boost-count (str boost-count (if (= 1 boost-count) " boost" " boosts"))])]
+          [:div.boost-count (str boost-count (if (= 1 boost-count) " boost" " boosts"))])
+        (when (pos? boost-count)
+          (sort-bar sort-param))]
        [:div.overlay-middle
         (if (seq boosts)
-          (map boost-card boosts)
+          (case sort-param
+            "amount" (map boost-card (sort-boosts-by-amount boosts))
+            "podcast" (map (fn [[title group-boosts]] (section-block title group-boosts))
+                          (group-boosts-by-podcast boosts))
+            ;; default: group by date
+            (map (fn [[title group-boosts]] (section-block title group-boosts))
+                 (group-boosts-by-date boosts)))
           [:div.empty-state
            [:div.empty-state-icon "⚡"]
            [:div.empty-state-text "No boosts yet"]])]
@@ -371,11 +466,12 @@
          [:a.btn-secondary {:href "https://github.com/ChadFarrow/boostbox"} "GitHub"]]]]])))
 
 (defn homepage [storage]
-  (fn [_]
-    (let [boosts (try (.list-all storage) (catch Exception _ []))]
+  (fn [request]
+    (let [boosts (try (.list-all storage) (catch Exception _ []))
+          sort-param (get (:query-params request) "sort" "date")]
       {:status 200
        :headers {"content-type" "text/html; charset=utf-8"}
-       :body (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts) "</html>")})))
+       :body (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts sort-param) "</html>")})))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Boost Schemas ~~~~~~~~~~~~~~~~~~~
 
