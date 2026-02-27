@@ -311,6 +311,13 @@
        (group-by #(or (get % "feed_title") "Unknown Podcast"))
        (sort-by (fn [[_ bs]] (- (count bs))))))
 
+(defn group-boosts-by-sender
+  "Group boosts by sender_name, sorted by boost count descending"
+  [boosts]
+  (->> boosts
+       (group-by #(or (get % "sender_name") "Unknown Sender"))
+       (sort-by (fn [[_ bs]] (- (count bs))))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Shared CSS ~~~~~~~~~~~~~~~~~~~
 (def base-boost-css
   (str ".boost-field { display: grid; align-items: start; }"
@@ -421,7 +428,9 @@
    [:span.sort-divider "|"]
    [:a {:href "/?sort=amount" :class (str "sort-option" (when (= active-sort "amount") " active"))} "By Amount"]
    [:span.sort-divider "|"]
-   [:a {:href "/?sort=podcast" :class (str "sort-option" (when (= active-sort "podcast") " active"))} "By Podcast"]])
+   [:a {:href "/?sort=podcast" :class (str "sort-option" (when (= active-sort "podcast") " active"))} "By Podcast"]
+   [:span.sort-divider "|"]
+   [:a {:href "/?sort=from" :class (str "sort-option" (when (= active-sort "from") " active"))} "By Sender"]])
 
 (defn section-block
   "Renders a section with header (title + stats) and boost cards"
@@ -454,6 +463,8 @@
             "amount" (map boost-card (sort-boosts-by-amount boosts))
             "podcast" (map (fn [[title group-boosts]] (section-block title group-boosts))
                           (group-boosts-by-podcast boosts))
+            "from" (map (fn [[title group-boosts]] (section-block title group-boosts))
+                        (group-boosts-by-sender boosts))
             ;; default: group by date
             (map (fn [[title group-boosts]] (section-block title group-boosts))
                  (group-boosts-by-date boosts)))
