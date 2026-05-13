@@ -323,7 +323,46 @@
   (str ".boost-field { display: grid; align-items: start; }"
        ".boost-field:last-child { border-bottom: none; }"
        ".boost-label { font-weight: 600; white-space: nowrap; font-size: 0.8rem; letter-spacing: 0.04em; text-transform: uppercase; }"
-       ".boost-value { word-break: break-word; }"))
+       ".boost-value { word-break: break-word; }"
+       ".npub-ref { color: #f7931a; cursor: help; }"))
+
+;; ~~~~~~~~~~~~~~~~~~~ Nostr npub resolution ~~~~~~~~~~~~~~~~~~~
+(def npub-resolve-js
+  "(function(){
+    var re=/(?:nostr:)?(npub1[a-z0-9]{58})/g;
+    var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);
+    var nodes=[],n;
+    while((n=tw.nextNode())){if(re.test(n.textContent))nodes.push(n);re.lastIndex=0;}
+    var seen={};
+    nodes.forEach(function(node){
+      var t=node.textContent,f=document.createDocumentFragment(),last=0,m;
+      re.lastIndex=0;
+      while((m=re.exec(t))!==null){
+        if(m.index>last)f.appendChild(document.createTextNode(t.slice(last,m.index)));
+        var s=document.createElement('span');
+        s.className='npub-ref';
+        s.dataset.npub=m[1];
+        s.title=m[1];
+        s.textContent=m[1].slice(0,10)+'...'+m[1].slice(-4);
+        f.appendChild(s);
+        seen[m[1]]=1;
+        last=m.index+m[0].length;
+      }
+      if(last<t.length)f.appendChild(document.createTextNode(t.slice(last)));
+      node.parentNode.replaceChild(f,node);
+    });
+    Object.keys(seen).forEach(function(npub){
+      fetch('https://api.nostr.band/v0/profiles/'+npub)
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(d){
+          if(!d)return;
+          var p=d.profiles&&d.profiles[0]&&d.profiles[0].profile;
+          var name=p&&(p.display_name||p.name);
+          if(!name)return;
+          document.querySelectorAll('[data-npub=\"'+npub+'\"]').forEach(function(el){el.textContent=name;});
+        }).catch(function(){});
+    });
+  })();")
 
 ;; ~~~~~~~~~~~~~~~~~~~ Homepage ~~~~~~~~~~~~~~~~~~~
 (def homepage-css
@@ -474,7 +513,9 @@
        [:div.overlay-bottom
         [:div.button-group
          [:a.btn-secondary {:href "/docs"} "API Docs"]
-         [:a.btn-secondary {:href "https://github.com/ChadFarrow/boostbox"} "GitHub"]]]]])))
+         [:a.btn-secondary {:href "https://github.com/ChadFarrow/boostbox"} "GitHub"]]]]
+      [:script npub-resolve-js]])))
+
 
 (defn homepage [storage]
   (fn [request]
@@ -602,7 +643,8 @@
         [:div.json-section
          [:h2 "Raw Metadata"]
          [:pre [:code {:class "language-json"} json-pretty]]]]
-       [:script "hljs.highlightAll();"]]]]))
+       [:script "hljs.highlightAll();"]
+       [:script npub-resolve-js]]]]))
 
 (defn get-boost-by-id [cfg storage]
   (fn [{{:keys [:id]} :path-params :as request}]
