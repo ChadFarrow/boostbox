@@ -550,7 +550,7 @@
         [:div.button-group
          [:a.btn-secondary {:href "/docs"} "API Docs"]
          [:a.btn-secondary {:href "https://github.com/ChadFarrow/boostbox"} "GitHub"]]]]
-      [:script npub-resolve-js]])))
+      [:script (html/raw npub-resolve-js)]])))
 
 
 (defn homepage [storage]
@@ -680,7 +680,7 @@
          [:h2 "Raw Metadata"]
          [:pre [:code {:class "language-json"} json-pretty]]]]
        [:script "hljs.highlightAll();"]
-       [:script npub-resolve-js]]]]))
+       [:script (html/raw npub-resolve-js)]]]]))
 
 (defn get-boost-by-id [cfg storage]
   (fn [{{:keys [:id]} :path-params :as request}]
