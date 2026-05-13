@@ -351,15 +351,25 @@
       if(last<t.length)f.appendChild(document.createTextNode(t.slice(last)));
       node.parentNode.replaceChild(f,node);
     });
+    function updateSpans(npub,name){
+      document.querySelectorAll('[data-npub=\"'+npub+'\"]').forEach(function(el){el.textContent=name;});
+    }
     Object.keys(seen).forEach(function(npub){
       fetch('https://api.nostr.band/v0/profiles/'+npub)
         .then(function(r){return r.ok?r.json():null;})
         .then(function(d){
           if(!d)return;
-          var p=d.profiles&&d.profiles[0]&&d.profiles[0].profile;
-          var name=p&&(p.display_name||p.name);
+          var profs=d.profiles;
+          if(!profs)return;
+          var entry=profs[0];
+          if(!entry)return;
+          var p=entry.profile;
+          if(!p)return;
+          var meta=p;
+          if(typeof p.content==='string'){try{meta=JSON.parse(p.content);}catch(e){return;}}
+          var name=meta.display_name||meta.name;
           if(!name)return;
-          document.querySelectorAll('[data-npub=\"'+npub+'\"]').forEach(function(el){el.textContent=name;});
+          updateSpans(npub,name);
         }).catch(function(){});
     });
   })();")
