@@ -329,6 +329,19 @@
 ;; ~~~~~~~~~~~~~~~~~~~ Nostr npub resolution ~~~~~~~~~~~~~~~~~~~
 (def npub-resolve-js
   "(function(){
+    function npubToHex(npub){
+      var cs='qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+      var data=npub.slice(5,-6);
+      var bits=0,val=0,out=[];
+      for(var i=0;i<data.length;i++){
+        var b=cs.indexOf(data[i]);
+        if(b<0)return null;
+        val=(val<<5)|b;
+        bits+=5;
+        if(bits>=8){bits-=8;out.push((val>>bits)&0xff);}
+      }
+      return out.map(function(b){return('0'+b.toString(16)).slice(-2);}).join('');
+    }
     var re=/(?:nostr:)?(npub1[a-z0-9]{58})/g;
     var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);
     var nodes=[],n;
@@ -355,22 +368,29 @@
       document.querySelectorAll('[data-npub=\"'+npub+'\"]').forEach(function(el){el.textContent=name;});
     }
     Object.keys(seen).forEach(function(npub){
-      fetch('https://api.nostr.band/v0/profiles/'+npub)
-        .then(function(r){return r.ok?r.json():null;})
-        .then(function(d){
-          if(!d)return;
-          var profs=d.profiles;
-          if(!profs)return;
-          var entry=profs[0];
-          if(!entry)return;
-          var p=entry.profile;
-          if(!p)return;
-          var meta=p;
-          if(typeof p.content==='string'){try{meta=JSON.parse(p.content);}catch(e){return;}}
-          var name=meta.display_name||meta.name;
-          if(!name)return;
-          updateSpans(npub,name);
-        }).catch(function(){});
+      var hex=npubToHex(npub);
+      if(!hex)return;
+      try{
+        var ws=new WebSocket('wss://relay.nostr.band');
+        var sub='bb'+Math.random().toString(36).slice(2,8);
+        var done=false;
+        ws.onopen=function(){
+          ws.send(JSON.stringify(['REQ',sub,{'kinds':[0],'authors':[hex],'limit':1}]));
+        };
+        ws.onmessage=function(e){
+          if(done)return;
+          try{
+            var msg=JSON.parse(e.data);
+            if(msg[0]==='EVENT'){
+              var meta=JSON.parse(msg[2].content);
+              var name=meta.display_name||meta.name;
+              if(name){done=true;updateSpans(npub,name);ws.close();}
+            }else if(msg[0]==='EOSE'){ws.close();}
+          }catch(err){ws.close();}
+        };
+        ws.onerror=function(){ws.close();};
+        setTimeout(function(){if(!done)try{ws.close();}catch(e){}},8000);
+      }catch(e){}
     });
   })();")
 
