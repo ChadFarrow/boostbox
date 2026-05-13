@@ -367,30 +367,36 @@
     function updateSpans(npub,name){
       document.querySelectorAll('[data-npub=\"'+npub+'\"]').forEach(function(el){el.textContent=name;});
     }
+    var RELAYS=['wss://relay.damus.io','wss://nos.lol','wss://relay.primal.net'];
     Object.keys(seen).forEach(function(npub){
       var hex=npubToHex(npub);
       if(!hex)return;
-      try{
-        var ws=new WebSocket('wss://relay.nostr.band');
-        var sub='bb'+Math.random().toString(36).slice(2,8);
-        var done=false;
-        ws.onopen=function(){
-          ws.send(JSON.stringify(['REQ',sub,{'kinds':[0],'authors':[hex],'limit':1}]));
-        };
-        ws.onmessage=function(e){
-          if(done)return;
-          try{
-            var msg=JSON.parse(e.data);
-            if(msg[0]==='EVENT'){
-              var meta=JSON.parse(msg[2].content);
-              var name=meta.display_name||meta.name;
-              if(name){done=true;updateSpans(npub,name);ws.close();}
-            }else if(msg[0]==='EOSE'){ws.close();}
-          }catch(err){ws.close();}
-        };
-        ws.onerror=function(){ws.close();};
-        setTimeout(function(){if(!done)try{ws.close();}catch(e){}},8000);
-      }catch(e){}
+      var resolved=false;
+      var sockets=[];
+      function closeAll(){sockets.forEach(function(s){try{s.close();}catch(e){}});}
+      RELAYS.forEach(function(url){
+        try{
+          var ws=new WebSocket(url);
+          sockets.push(ws);
+          var sub='bb'+Math.random().toString(36).slice(2,8);
+          ws.onopen=function(){
+            try{ws.send(JSON.stringify(['REQ',sub,{'kinds':[0],'authors':[hex],'limit':1}]));}catch(e){}
+          };
+          ws.onmessage=function(e){
+            if(resolved)return;
+            try{
+              var msg=JSON.parse(e.data);
+              if(msg[0]==='EVENT'){
+                var meta=JSON.parse(msg[2].content);
+                var name=meta.display_name||meta.name;
+                if(name){resolved=true;updateSpans(npub,name);closeAll();}
+              }else if(msg[0]==='EOSE'){try{ws.close();}catch(e){}}
+            }catch(err){try{ws.close();}catch(e){}}
+          };
+          ws.onerror=function(){try{ws.close();}catch(e){}};
+          setTimeout(function(){if(!resolved)try{ws.close();}catch(e){}},8000);
+        }catch(e){}
+      });
     });
   })();")
 
