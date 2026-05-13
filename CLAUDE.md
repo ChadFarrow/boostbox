@@ -70,6 +70,10 @@ nix flake check              # Runs treefmt formatting check
 
 **HTML rendering:** Chassis (hiccup-like DSL) for homepage and boost viewer pages. The homepage displays all stored boosts as clickable cards overlaid on a fixed background image. Shared helpers (`boost-detail-rows`, `boost-metadata-row`, `format-sats`) are used by both the homepage cards and the individual boost viewer page.
 
+**Chassis text escaping (footgun):** Chassis HTML-escapes string children by default, including inside `<script>` and `<style>`. Any inline JS containing `<`, `>`, or `&` (e.g. `i<n`, `a<<5`, `x&0xff`) becomes a syntax error when rendered as `[:script some-js-string]`. Wrap inline script/style payloads in `(html/raw ...)` — see how `npub-resolve-js` is injected at both call sites.
+
+**Client-side npub resolution:** `npub-resolve-js` is an inline JS blob injected on both homepage and boost-view. It walks text nodes for `npub1…` (optionally `nostr:`-prefixed), replaces them with a truncated `<span class="npub-ref" data-npub="…">`, then fans out a `kind:0` REQ in parallel across `wss://relay.damus.io`, `wss://nos.lol`, and `wss://relay.primal.net`. First relay to return a profile with `display_name`/`name` wins and closes the other sockets. No server-side Nostr code — all resolution is client-side. If you add another spot that renders an npub, no extra work is needed as long as it ends up in a text node within `document.body`.
+
 **Image assets:** Base64 image data is stored in `resources/*.b64` files (not inline in source) to avoid exceeding JVM's 65535-byte constant pool limit during AOT compilation. The `build.clj` copies both `src/` and `resources/` into the uberjar.
 
 **BOLT11 description:** `rss::payment::{action} {url} {message}` format, truncated to 639-char limit.
