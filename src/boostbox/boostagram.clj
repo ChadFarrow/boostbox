@@ -83,7 +83,7 @@
      :message (->str (get* m "message"))
      :sender-name (->str (get* m "sender_name"))
      :sender-id (->str (get* m "sender_id"))
-     :recipient-name (->str (get* m "name"))
+     :recipient-name (->str (get* m "name" "recipient_name"))
      ;; blip-10 names these "podcast" and "episode", but senders that model
      ;; their payload on BoostBox's own schema (BoostMeBitch, for one) send
      ;; "feed_title" and "item_title" instead. Accept both, exactly as the guid
@@ -101,7 +101,10 @@
      :remote-item-guid (->str (get* m "remote_item_guid"))
      ;; "ts" is seconds into the episode, NOT a wall clock. "time" is a
      ;; human "HH:MM:SS" of the same thing. Neither is when the boost happened.
-     :position (or (->int (get* m "ts")) (->int (get* m "time_seconds")))
+     ;; BoostBox's own schema calls the same thing "position".
+     :position (or (->int (get* m "ts"))
+                   (->int (get* m "time_seconds"))
+                   (->int (get* m "position")))
      :value-msat (->int (get* m "value_msat"))
      :value-msat-total (->int (get* m "value_msat_total"))}))
 
@@ -110,6 +113,50 @@
    flood the relays with near-empty notes."
   [b]
   (= "boost" (:action b)))
+
+;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
+;;
+;; A keysend can carry the boostagram in TLV 7629169, but an LNURL payment has
+;; nowhere to put one -- so podcast apps put a BoostBox permalink in the BOLT11
+;; description instead, and the metadata is fetched back from that URL. Most
+;; Podcasting 2.0 apps take this route for lightning addresses, which makes it
+;; the common case, not the fallback.
+
+(defn- origin-of
+  "scheme://host[:port], or nil if this is not an http(s) URL."
+  [^String u]
+  (try
+    (let [uri (java.net.URI. (str/trim u))
+          scheme (some-> (.getScheme uri) str/lower-case)
+          host (some-> (.getHost uri) str/lower-case)
+          port (.getPort uri)
+          default (case scheme "https" 443 "http" 80 -1)]
+      (when (and host (#{"http" "https"} scheme))
+        (str scheme "://" host
+             (when (and (not= -1 port) (not= port default)) (str ":" port)))))
+    (catch Exception _ nil)))
+
+(defn boost-link
+  "The first URL in a payment description whose origin is one we trust.
+
+   The description is written by whoever paid us, so this is the security
+   boundary: without the allowlist the bot would issue an HTTP GET to any
+   address a payer chose to name, turning its poll loop into a probe of
+   whatever the bot can reach. Match on origin rather than on a `rss::payment::`
+   prefix, so apps that format the description differently still work."
+  [description allowed-origins]
+  (when (and (string? description) (seq allowed-origins))
+    (let [allowed (into #{} (keep origin-of) allowed-origins)]
+      (some (fn [u]
+              (let [u (str/replace u #"[.,;:!?)\]]+$" "")]
+                (when (contains? allowed (origin-of u)) u)))
+            (re-seq #"https?://[^\s\"'<>\\]+" description)))))
+
+(defn boost-id-from-url
+  "The ULID at the end of a BoostBox permalink."
+  [^String url]
+  (when (string? url)
+    (last (remove str/blank? (str/split url #"/")))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ BoostMetadata payload ~~~~~~~~~~~~~~~~~~~
 

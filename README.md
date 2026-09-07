@@ -269,6 +269,7 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_DRY_RUN`           |    No    | `false`                                                    | Build and log events without publishing. Use this for the first run.                              |
 | `BBN_STATE_KEY`         |    No    | `nostrbot/state.json`                                      | Storage key for the cursor and de-duplication state.                                              |
 | `BBN_ALLOW_EPHEMERAL_STATE` | No   | `false`                                                    | Permit `BB_STORAGE=FS` outside `ENV=DEV`. Only set this if the filesystem is a persistent volume.  |
+| `BBN_BOOST_LINK_ORIGINS` | No      | (just `BBN_BOOSTBOX_URL`)                                  | Extra origins the bot will fetch a boost link from, comma separated. See "Where the metadata comes from". |
 | `BBN_PUBLISH_PROFILE`   |    No    | `false`                                                    | One-shot: publish the bot's `kind:0` profile on startup.                                          |
 | `BBN_PROFILE_NAME`      |    No    | N/A                                                        | Profile name / display name.                                                                      |
 | `BBN_PROFILE_ABOUT`     |    No    | N/A                                                        | Profile description.                                                                              |
@@ -283,6 +284,28 @@ The bot logs its own `npub` on startup, so you can find and follow it.
 Per-minute `stream` payments are skipped. Only `action: boost` is published,
 with or without a message. A payment that carries no boostagram at all is
 ignored.
+
+### Where the metadata comes from
+
+A keysend can carry the boostagram in TLV record `7629169`, but an LNURL
+payment has nowhere to put one -- so Podcasting 2.0 apps POST the metadata to a
+BoostBox first and put the resulting permalink in the BOLT11 description
+instead. Most apps take this route for lightning addresses, so for a bot paid
+at one it is the common case rather than the fallback.
+
+The bot reads, in order:
+
+1. the raw TLV record `7629169`,
+2. the wallet's own pre-parsed `boostagram` object,
+3. a boost link in the payment description, fetched back through its
+   `x-rss-payment` header.
+
+A payment description is written by whoever paid you, so (3) is
+origin-restricted: the bot fetches a link only if its origin matches
+`BBN_BOOSTBOX_URL` or one of `BBN_BOOST_LINK_ORIGINS`. Without that an
+arbitrary payer could point the bot at any address it can reach. When the
+metadata arrives this way the record already exists, so the bot republishes
+that permalink rather than storing a second copy.
 
 ### A note on metadata
 

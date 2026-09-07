@@ -207,9 +207,57 @@
           (is (= "LNURL Testing Podcast" (get p "feed_title")))
           (is (= "LNURL Test Episode 3" (get p "item_title")))))))
 
+  (testing "every BoostMetadata field name round-trips, not just the titles"
+    (let [b (bg/normalize {"action" "boost"
+                           "recipient_name" "boostr"
+                           "position" 42
+                           "feed_title" "Show" "item_title" "Ep"
+                           "feed_guid" "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf"
+                           "value_msat_total" 100000})
+          p (bg/->boost-payload b {:received-msat 10000 :settled-at 1757288117})]
+      (is (= "boostr" (get p "recipient_name")))
+      (is (= 42 (get p "position")))
+      (is (= "Show" (get p "feed_title")))
+      (is (= "Ep" (get p "item_title")))))
+
   (testing "the blip-10 names still win when both are present"
     (let [b (bg/normalize {"action" "boost"
                            "podcast" "canonical" "feed_title" "fallback"
                            "episode" "canonical-ep" "item_title" "fallback-ep"})]
       (is (= "canonical" (:podcast b)))
       (is (= "canonical-ep" (:episode b))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
+
+(deftest boost-link-is-origin-restricted
+  (let [trusted ["https://tardbox.com"]]
+    (testing "a BoostBox permalink is found however the description frames it"
+      (is (= "https://tardbox.com/boost/01ABC"
+             (bg/boost-link "rss::payment::boost https://tardbox.com/boost/01ABC hi" trusted)))
+      (is (= "https://tardbox.com/boost/01ABC"
+             (bg/boost-link "https://tardbox.com/boost/01ABC" trusted))
+          "apps that do not use the rss::payment:: prefix still work")
+      (is (= "https://tardbox.com/boost/01ABC"
+             (bg/boost-link "see https://tardbox.com/boost/01ABC." trusted))
+          "trailing sentence punctuation is not part of the URL"))
+
+    (testing "the description is written by whoever paid us, so anything we do
+              not trust is ignored"
+      (is (nil? (bg/boost-link "rss::payment::boost https://evil.example/x hi" trusted)))
+      (is (nil? (bg/boost-link "http://169.254.169.254/latest/meta-data/" trusted))
+          "no fetching link-local addresses on a payer's say-so")
+      (is (nil? (bg/boost-link "http://localhost:8080/admin" trusted)))
+      (is (nil? (bg/boost-link "https://tardbox.com.evil.example/x" trusted))
+          "a lookalike host is a different origin")
+      (is (nil? (bg/boost-link "just a message" trusted)))
+      (is (nil? (bg/boost-link "https://tardbox.com/boost/01ABC" []))
+          "no trusted origins configured means no fetching at all"))
+
+    (testing "http and https are different origins"
+      (is (nil? (bg/boost-link "http://tardbox.com/boost/01ABC" trusted))))))
+
+(deftest boost-id-comes-off-the-end-of-the-url
+  (is (= "01M1Z3KRQ0E27RZ2T0CT1B2NEE"
+         (bg/boost-id-from-url "https://tardbox.com/boost/01M1Z3KRQ0E27RZ2T0CT1B2NEE")))
+  (is (= "01ABC" (bg/boost-id-from-url "https://tardbox.com/boost/01ABC/")))
+  (is (nil? (bg/boost-id-from-url nil))))
