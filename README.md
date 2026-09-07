@@ -219,6 +219,85 @@ export BB_S3_BUCKET=boostbox
 
 The included `flake.nix` dev environment provides MinIO. Run `devenv up` to start it for manual testing. This is done automatically for `./tests.sh`.
 
+## Boost Bot (Nostr)
+
+BoostBox ships a second, optional process: a bot that watches a Lightning
+wallet over [NWC](https://nwc.dev) (Nostr Wallet Connect), stores every
+incoming boostagram in BoostBox, and republishes it to Nostr as a `kind:1`
+note tagged with [NIP-73](https://github.com/nostr-protocol/nips/blob/master/73.md)
+external content ids.
+
+The intended setup is to add the bot's Lightning address as a small (say 1%)
+recipient in a podcast's `<podcast:value>` block. Podcast apps send the
+boostagram TLV to *every* recipient in a split, so a 1% share is enough to
+receive the full metadata for the whole boost.
+
+It runs from the same uberjar as the web app, as its own process:
+
+```sh
+java -cp boostbox.jar boostbox.nostrbot
+```
+
+It is deliberately not part of the web server: it holds a Nostr signing key and
+a wallet credential, and it is a long-lived loop with at-least-once delivery.
+Deploy it as a separate service (on Railway, a second service from this same
+repo with the start command above and no healthcheck).
+
+### Bot Configuration
+
+All bot variables are `BBN_`-prefixed. Storage (`BB_STORAGE` and its
+filesystem or S3 settings) is shared with the web app and used for the bot's
+cursor and de-duplication state.
+
+**The bot needs durable storage.** The cursor is its only memory of what it has
+already seen; if it is lost, the bot restarts from a `now` watermark and every
+boost that arrived while it was down is silently dropped, unpublished. A second
+Railway service gets a fresh filesystem on every deploy, so `BB_STORAGE=FS` is
+refused outside `ENV=DEV` unless you set `BBN_ALLOW_EPHEMERAL_STATE=1` to say
+the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
+
+| Variable                | Required | Default                                                    | Description                                                                                     |
+| ----------------------- | :------: | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `BBN_NWC_URI`           |   Yes    | N/A                                                        | `nostr+walletconnect://...` connection string for the wallet (e.g. an Alby Hub sub-wallet).       |
+| `BBN_NOSTR_SECKEY`      |   Yes    | N/A                                                        | The bot's Nostr signing key, as 64-char hex or `nsec1...`.                                        |
+| `BBN_BOOSTBOX_API_KEY`  |   Yes    | N/A                                                        | API key for `POST /boost`; must be one of the server's `BB_ALLOWED_KEYS`.                         |
+| `BBN_BOOSTBOX_URL`      |    No    | `https://tardbox.com`                                      | BoostBox instance to store boosts in.                                                             |
+| `BBN_RELAYS`            |    No    | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net` | Comma-separated relays to publish to. One acceptance counts as success.                           |
+| `BBN_POLL_INTERVAL_SEC` |    No    | `60`                                                       | How often to poll the wallet. Notifications short-circuit the wait; polling guarantees delivery.  |
+| `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
+| `BBN_BACKFILL_SEC`      |    No    | `0`                                                        | On the *first* run only, how far back to reach. `0` starts from now instead of replaying history. |
+| `BBN_DRY_RUN`           |    No    | `false`                                                    | Build and log events without publishing. Use this for the first run.                              |
+| `BBN_STATE_KEY`         |    No    | `nostrbot/state.json`                                      | Storage key for the cursor and de-duplication state.                                              |
+| `BBN_ALLOW_EPHEMERAL_STATE` | No   | `false`                                                    | Permit `BB_STORAGE=FS` outside `ENV=DEV`. Only set this if the filesystem is a persistent volume.  |
+| `BBN_PUBLISH_PROFILE`   |    No    | `false`                                                    | One-shot: publish the bot's `kind:0` profile on startup.                                          |
+| `BBN_PROFILE_NAME`      |    No    | N/A                                                        | Profile name / display name.                                                                      |
+| `BBN_PROFILE_ABOUT`     |    No    | N/A                                                        | Profile description.                                                                              |
+| `BBN_PROFILE_PICTURE`   |    No    | N/A                                                        | Profile picture URL.                                                                              |
+| `BBN_PROFILE_NIP05`     |    No    | N/A                                                        | NIP-05 identifier. Only set this if you actually serve `/.well-known/nostr.json`.                 |
+| `BBN_PROFILE_LUD16`     |    No    | the NWC URI's `lud16`                                      | Lightning address for the profile, so the bot itself can be boosted back.                         |
+
+The bot logs its own `npub` on startup, so you can find and follow it.
+
+### Only boosts are republished
+
+Per-minute `stream` payments are skipped. Only `action: boost` is published,
+with or without a message. A payment that carries no boostagram at all is
+ignored.
+
+### A note on metadata
+
+The boostagram lives in Lightning TLV record `7629169`. The bot reads that raw
+record in preference to any pre-parsed copy the wallet offers, because Alby
+Hub's parsed `boostagram` object keeps only the numeric `feedID`/`itemID` and
+drops every GUID -- and without the feed GUID a note cannot carry NIP-73 tags.
+When no valid GUID is available the note is still published, just untagged.
+
+The two GUIDs are validated differently, on purpose. A `<podcast:guid>` is
+defined as a UUID, so anything else is dropped rather than emitted as a
+malformed NIP-73 `podcast:guid`. An episode guid is the RSS `<item><guid>`,
+which the RSS spec leaves as an arbitrary string -- usually a URL -- so it is
+passed through verbatim, case intact.
+
 ## API Quick Reference
 
 ### `POST /boost`

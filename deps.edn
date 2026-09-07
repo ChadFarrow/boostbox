@@ -19,6 +19,9 @@
          metosin/jsonista {:mvn/version "0.3.13"}
          ;; UUIDs
          danlentz/clj-uuid {:mvn/version "0.2.0"}
+         ;; crypto (secp256k1 for BIP-340 schnorr + NIP-04 ECDH; pure Java, no
+         ;; native libs, so it works unchanged on the alpine runtime image)
+         org.bouncycastle/bcprov-jdk18on {:mvn/version "1.81"}
          ;; S3
          com.cognitect.aws/api {:mvn/version "0.8.774"}
          com.cognitect.aws/endpoints {:mvn/version "871.2.38.3"}
@@ -31,12 +34,12 @@
                                lambdaisland/kaocha-cloverage {:mvn/version "1.1.89"}
                                org.clojure/test.check {:mvn/version "1.1.1"}}
                   :jvm-opts ["-Djdk.attach.allowAttachSelf" "-XX:+EnableDynamicAgentLoading"]}
-           :test {:extra-paths ["test"]
+           :test {:extra-paths ["test" "test/resources"]
                   :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
                                lambdaisland/kaocha-cloverage {:mvn/version "1.1.89"}
                                org.clojure/test.check {:mvn/version "1.1.1"}}
                   :main-opts ["-m" "kaocha.runner"]}
-           :test/watch {:extra-paths ["test"]
+           :test/watch {:extra-paths ["test" "test/resources"]
                         :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
                                      lambdaisland/kaocha-cloverage {:mvn/version "1.1.89"}
                                      org.clojure/test.check {:mvn/version "1.1.1"}}

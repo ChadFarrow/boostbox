@@ -1,0 +1,248 @@
+(ns boostbox.nostrbot-test
+  (:require [clojure.test :refer [deftest testing is]]
+            [boostbox.boostagram :as bg]
+            [boostbox.nostrbot :as bot]
+            [boostbox.nostr :as nostr]
+            [boostbox.nwc :as nwc]
+            [boostbox.relay :as relay]))
+
+(def seckey (nostr/hex->bytes (apply str (repeat 64 "9"))))
+
+(defn- mem-state-io
+  "An in-memory stand-in for the FS/S3 state store."
+  [a]
+  {:read #(deref a) :write #(reset! a %)})
+
+(defn- ctx [a & {:as overrides}]
+  (merge {:state-io (mem-state-io a)
+          :seckey seckey
+          :relays ["wss://relay.example"]
+          :dry-run? false
+          :min-sats 0
+          :boostbox-url "https://tardbox.com"
+          :boostbox-api-key "test-key"}
+         overrides))
+
+(defn- boost [hash settled-at]
+  {:payment-hash hash
+   :settled-at settled-at
+   :received-msat 21000
+   :boostagram (bg/normalize
+                {"action" "boost"
+                 "podcast" "Podcasting 2.0"
+                 "guid" "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"
+                 "message" "hi"
+                 "value_msat_total" 2100000})})
+
+;; ~~~~~~~~~~~~~~~~~~~ State bookkeeping ~~~~~~~~~~~~~~~~~~~
+
+(deftest remembering-is-bounded-and-deduplicated
+  (let [remember #'bot/remember
+        seen-index #'bot/seen-index]
+    (testing "re-remembering a hash replaces rather than duplicates it"
+      (let [s (-> {"recent" []}
+                  (remember {"payment_hash" "a" "boost_id" "1"})
+                  (remember {"payment_hash" "a" "boost_id" "1" "event_id" "e"}))]
+        (is (= 1 (count (get s "recent"))))
+        (is (= "e" (get (get (seen-index s) "a") "event_id")))))
+    (testing "the recent list is capped so state cannot grow without bound"
+      (let [s (reduce (fn [s i] (remember s {"payment_hash" (str i)}))
+                      {"recent" []}
+                      (range (+ 50 bot/max-recent)))]
+        (is (= bot/max-recent (count (get s "recent"))))
+        (is (nil? (get (seen-index s) "0")) "oldest entries are dropped")
+        (is (some? (get (seen-index s) (str (dec (+ 50 bot/max-recent)))))
+            "newest are kept")))))
+
+;; ~~~~~~~~~~~~~~~~~~~ The poll loop ~~~~~~~~~~~~~~~~~~~
+
+(deftest poll-publishes-and-advances-the-cursor
+  (let [a (atom {"cursor" nil "recent" []})
+        posted (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1 ::tx2])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100) ::tx2 (boost "h2" 200)}
+                  bot/store-boost! (fn [_ payload]
+                                     (swap! posted conj payload)
+                                     {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ event]
+                                             (swap! published conj event)
+                                             {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (= 2 (count @posted)) "both boosts stored in BoostBox")
+      (is (= 2 (count @published)) "both notes published")
+      (is (= 200 (get @a "cursor")) "cursor advances to the newest processed boost")
+      (testing "the published note is a valid, tagged kind:1 event"
+        (let [e (first @published)]
+          (is (= 1 (:kind e)))
+          (is (nostr/verify-event? e))
+          (is (some #(= ["k" "podcast:guid"] %) (:tags e)))
+          (is (some #(= ["r" "https://tardbox.com/boost/01K9"] %) (:tags e))))))))
+
+(deftest a-failed-publish-holds-the-cursor-back
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1 ::tx2])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100) ::tx2 (boost "h2" 200)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _]
+                                             (swap! published conj :attempt)
+                                             {:ok? false :results [{:ok? false}]})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (= 50 (get @a "cursor"))
+          "cursor must not advance past a boost that was never published")
+      (is (= 1 (count @published))
+          "processing stops at the first failure instead of racing ahead")
+      (testing "the BoostBox record is remembered so a retry does not create a second one"
+        (let [entry (first (get @a "recent"))]
+          (is (= "01K9" (get entry "boost_id")))
+          (is (nil? (get entry "event_id"))))))))
+
+(deftest a-retry-reuses-the-existing-boostbox-record
+  (let [a (atom {"cursor" 50
+                 "recent" [{"payment_hash" "h1"
+                            "boost_id" "01K9"
+                            "url" "https://tardbox.com/boost/01K9"}]})
+        posted (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ p] (swap! posted conj p) {:id "NEW" :url "new"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (empty? @posted) "no second POST /boost for a payment already stored")
+      (is (= 100 (get @a "cursor"))))))
+
+(deftest an-already-published-boost-is-skipped
+  (let [a (atom {"cursor" 50
+                 "recent" [{"payment_hash" "h1" "boost_id" "01K9"
+                            "url" "u" "event_id" "abc"}]})
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] (throw (AssertionError. "must not store again")))
+                  relay/publish-to-relays! (fn [_ _] (swap! published conj :x) {:ok? true})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (empty? @published) "de-duplicated by payment hash"))))
+
+(deftest dry-run-publishes-nothing
+  (let [a (atom {"cursor" nil "recent" []})
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ _] (swap! published conj :x) {:ok? true})]
+      (bot/poll-once! (ctx a :dry-run? true) ::session)
+      (is (empty? @published) "dry run must not touch the relays"))))
+
+(deftest below-threshold-boosts-are-skipped-but-remembered
+  (let [a (atom {"cursor" nil "recent" []})
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ _] (swap! published conj :x) {:ok? true})]
+      ;; the boost is 2100 sats
+      (bot/poll-once! (ctx a :min-sats 5000) ::session)
+      (is (empty? @published))
+      (is (= "below-threshold" (get (first (get @a "recent")) "skipped"))
+          "remembered so it is not re-examined every poll"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Profile ~~~~~~~~~~~~~~~~~~~
+
+(deftest profile-event-is-kind-0-json-content
+  (with-redefs [relay/publish-to-relays! (fn [_ _] {:ok? true :results []})]
+    (let [e (bot/publish-profile!
+             {:seckey seckey
+              :relays ["wss://relay.example"]
+              :dry-run? false
+              :profile {:name "boostbot" :display_name "BoostBot"
+                        :about nil :lud16 "boostbot@getalby.com"}})]
+      (is (= 0 (:kind e)))
+      (is (nostr/verify-event? e))
+      (testing "content is a JSON string, with blank fields omitted"
+        (is (= "{\"name\":\"boostbot\",\"display_name\":\"BoostBot\",\"lud16\":\"boostbot@getalby.com\"}"
+               (:content e)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ First-run safety ~~~~~~~~~~~~~~~~~~~
+
+(deftest first-run-sets-a-watermark-instead-of-replaying-history
+  (let [a (atom {"cursor" nil "recent" []})
+        asked (atom nil)
+        now (quot (System/currentTimeMillis) 1000)]
+    (with-redefs [nwc/list-transactions! (fn [_ opts] (reset! asked opts) [])
+                  bot/store-boost! (fn [_ _] (throw (AssertionError. "should not run")))
+                  relay/publish-to-relays! (fn [_ _] (throw (AssertionError. "should not run")))]
+      (bot/poll-once! (ctx a) ::session)
+      (is (>= (:from @asked) now)
+          "the first poll starts from now, not from the beginning of wallet history")
+      (is (some? (get @a "cursor")) "the watermark is persisted immediately")))
+
+  (testing "BBN_BACKFILL_SEC deliberately reaches back"
+    (let [a (atom {"cursor" nil "recent" []})
+          asked (atom nil)
+          now (quot (System/currentTimeMillis) 1000)]
+      (with-redefs [nwc/list-transactions! (fn [_ opts] (reset! asked opts) [])]
+        (bot/poll-once! (ctx a :backfill-sec 3600) ::session)
+        (is (<= (:from @asked) (- now 3599)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Regressions ~~~~~~~~~~~~~~~~~~~
+
+(deftest a-published-note-is-not-republished-after-a-later-boost-fails
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        stores (atom 0)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1 ::tx2])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100) ::tx2 (boost "h2" 200)}
+                  ;; h1 stores fine; BoostBox is down by the time h2 is tried,
+                  ;; so h2 throws *before* it can persist anything
+                  bot/store-boost! (fn [_ _]
+                                     (when (pos? @stores)
+                                       (throw (ex-info "BoostBox is down" {})))
+                                     (swap! stores inc)
+                                     {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e]
+                                             (swap! published conj (:id e))
+                                             {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (= 1 (count @published)) "h1 published, h2 never got as far as a note")
+      (is (some? (get (first (get @a "recent")) "event_id"))
+          "h1's event_id is persisted, not just returned in memory")
+
+      (testing "the next poll must not mint a second note for h1"
+        (bot/poll-once! (ctx a) ::session)
+        (is (= 1 (count @published))
+            "h1 is recognised as already published rather than republished")))))
+
+(deftest a-full-transaction-page-is-followed-by-the-next
+  (let [a (atom {"cursor" 50 "recent" []})
+        offsets (atom [])]
+    (with-redefs [nwc/list-transactions!
+                  (fn [_ {:keys [offset limit]}]
+                    (swap! offsets conj offset)
+                    (if (zero? offset)
+                      (vec (repeat limit {"settled_at" 100}))
+                      [{"settled_at" 300}]))
+                  nwc/transaction->boost (constantly nil)]
+      (bot/poll-once! (ctx a) ::session)
+      (is (= [0 50] @offsets)
+          "a page that came back full may have older transactions behind it")
+      (is (= 300 (get @a "cursor"))
+          "a window of ordinary payments still advances the cursor, or it would
+           pin forever and the paging walk would grow on every poll"))))
+
+(deftest min-sats-is-measured-against-what-actually-arrived
+  (let [a (atom {"cursor" nil "recent" []})
+        published (atom [])
+        b (-> (boost "h1" 100)
+              (update :boostagram dissoc :value-msat-total)
+              (assoc :received-msat 50000000))]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 b}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ _]
+                                             (swap! published conj :x)
+                                             {:ok? true :results []})]
+      (bot/poll-once! (ctx a :min-sats 1000) ::session)
+      (is (= 1 (count @published))
+          "a 50,000 sat boost whose TLV omits value_msat_total is not below a
+           1,000 sat threshold"))))
