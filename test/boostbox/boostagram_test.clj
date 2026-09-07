@@ -182,3 +182,34 @@
   (let [json "{\"action\":\"boost\",\"message\":\"héllo 🚀\"}"
         hex (nostr/bytes->hex (.getBytes json "UTF-8"))]
     (is (= json (bg/tlv-hex->string hex)) "round trips through hex as UTF-8")))
+
+;; ~~~~~~~~~~~~~~~~~~~ Sender field-naming ~~~~~~~~~~~~~~~~~~~
+
+(deftest titles-accept-boostbox-style-field-names
+  (testing "blip-10 says podcast/episode, but senders modelled on BoostBox's own
+            schema send feed_title/item_title -- a real BoostMeBitch payload"
+    (let [b (bg/normalize {"action" "boost"
+                           "feed_title" "LNURL Testing Podcast"
+                           "item_title" "LNURL Test Episode 3"
+                           "feed_guid" "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf"
+                           "item_guid" "c4dac22d-173f-4442-9b3b-5d89b20b26e6"
+                           "sender_name" "ChadF"
+                           "value_msat" 10000
+                           "value_msat_total" 100000})]
+      (is (= "LNURL Testing Podcast" (:podcast b)))
+      (is (= "LNURL Test Episode 3" (:episode b)))
+      (testing "so the note names the show instead of trailing off after the amount"
+        (let [c (bg/->note-content b {})]
+          (is (str/includes? c "to LNURL Testing Podcast"))
+          (is (str/includes? c "LNURL Test Episode 3"))))
+      (testing "and the stored boost keeps both titles"
+        (let [p (bg/->boost-payload b {:received-msat 10000 :settled-at 1757288117})]
+          (is (= "LNURL Testing Podcast" (get p "feed_title")))
+          (is (= "LNURL Test Episode 3" (get p "item_title")))))))
+
+  (testing "the blip-10 names still win when both are present"
+    (let [b (bg/normalize {"action" "boost"
+                           "podcast" "canonical" "feed_title" "fallback"
+                           "episode" "canonical-ep" "item_title" "fallback-ep"})]
+      (is (= "canonical" (:podcast b)))
+      (is (= "canonical-ep" (:episode b))))))
