@@ -1463,6 +1463,16 @@
       "hash": "sha256-okEYnRt0BkSjJEQ4t8aH5+QQetWg3MLNAP2M0QJ0h7E="
     },
     {
+      "mvn-path": "org/bouncycastle/bcprov-jdk18on/1.81/bcprov-jdk18on-1.81.jar",
+      "mvn-repo": "https://repo1.maven.org/maven2/",
+      "hash": "sha256-JJ85ZBKwwM5n8lyBl9p1eyQbi+PsQZk4bABwSiRXRZs="
+    },
+    {
+      "mvn-path": "org/bouncycastle/bcprov-jdk18on/1.81/bcprov-jdk18on-1.81.pom",
+      "mvn-repo": "https://repo1.maven.org/maven2/",
+      "hash": "sha256-IDmQEivg/dNL8S0LeIwGVRYThqjoWLpD8G43CcLMdMw="
+    },
+    {
       "mvn-path": "org/clj-commons/byte-streams/0.3.4/byte-streams-0.3.4.jar",
       "mvn-repo": "https://repo.clojars.org/",
       "hash": "sha256-jRznhd4mGeaS5C640wJjnZpAdxccabNnX8i7yKJR95k="

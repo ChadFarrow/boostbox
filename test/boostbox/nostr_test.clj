@@ -143,3 +143,32 @@
     (is (= (seq bs) (seq (nostr/hex->bytes (nostr/bytes->hex bs)))))
     (is (thrown? Exception (nostr/hex->bytes "abc")))
     (is (thrown? Exception (nostr/hex->bytes "zz")))))
+
+;; ~~~~~~~~~~~~~~~~~~~ NIP-04 ~~~~~~~~~~~~~~~~~~~
+
+(deftest nip04-round-trip
+  (let [alice (nostr/hex->bytes (apply str (repeat 64 "1")))
+        bob (nostr/hex->bytes (apply str (repeat 64 "2")))
+        alice-pub (nostr/x-only-pubkey alice)
+        bob-pub (nostr/x-only-pubkey bob)
+        msg "{\"method\":\"list_transactions\",\"params\":{\"type\":\"incoming\"}}"]
+    (testing "ECDH agrees in both directions"
+      (is (= (nostr/bytes->hex (nostr/ecdh-x alice bob-pub))
+             (nostr/bytes->hex (nostr/ecdh-x bob alice-pub)))))
+    (testing "either side can decrypt the other's ciphertext"
+      (is (= msg (nostr/nip04-decrypt bob alice-pub
+                                      (nostr/nip04-encrypt alice bob-pub msg)))))
+    (testing "unicode survives"
+      (let [u "boost 🚀 ünïcode"]
+        (is (= u (nostr/nip04-decrypt bob alice-pub
+                                      (nostr/nip04-encrypt alice bob-pub u))))))
+    (testing "a fresh IV is used each time"
+      (is (not= (nostr/nip04-encrypt alice bob-pub msg)
+                (nostr/nip04-encrypt alice bob-pub msg))))
+    (testing "a third party cannot decrypt"
+      (let [eve (nostr/hex->bytes (apply str (repeat 64 "4")))]
+        (is (thrown? Exception
+                     (nostr/nip04-decrypt eve alice-pub
+                                          (nostr/nip04-encrypt alice bob-pub msg))))))
+    (testing "malformed payloads are rejected"
+      (is (thrown? Exception (nostr/nip04-decrypt bob alice-pub "no-iv-section"))))))

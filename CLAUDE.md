@@ -56,6 +56,15 @@ nix flake check              # Runs treefmt formatting check
 - `resources/favicon.b64` — Base64-encoded favicon
 - `test/boostbox/boostbox_test.clj` — All tests (unit + integration, both storage backends)
 
+Boost bot (separate process, same uberjar — see "Boost Bot" below):
+
+- `src/boostbox/nostr.clj` — BIP-340 schnorr, NIP-01 canonical events, NIP-04, NIP-19 bech32. Zero third-party deps beyond BouncyCastle
+- `src/boostbox/relay.clj` — Nostr relay websocket client over aleph
+- `src/boostbox/nwc.clj` — Nostr Wallet Connect (NIP-47) client and boostagram extraction
+- `src/boostbox/boostagram.clj` — blip-10 → BoostMetadata mapping, NIP-73 tags, note text (all pure)
+- `src/boostbox/nostrbot.clj` — `(:gen-class)` entry point: config, cursor/dedupe state, poll loop
+- `test/resources/bip340-vectors.csv` — unmodified official BIP-340 vectors from bitcoin/bips
+
 ### Key Patterns
 
 **Storage protocol:** `IStorage` protocol with two implementations:
@@ -78,6 +87,16 @@ nix flake check              # Runs treefmt formatting check
 
 **BOLT11 description:** `rss::payment::{action} {url} {message}` format, truncated to 639-char limit.
 
+**Boost Bot:** A second process — `java -cp boostbox.jar boostbox.nostrbot` — that watches a Lightning wallet over NWC, stores incoming boostagrams via `POST /boost`, and republishes them to Nostr as `kind:1` notes with NIP-73 `i`/`k` tags. It is deliberately NOT a route on the web app: it holds an nsec and a wallet credential, and it is a long-lived loop with at-least-once delivery. `build.clj` compiles everything under `src/`, so its `(:gen-class)` lands in the same uberjar automatically — no build changes needed to add an entry point.
+
+**Nostr crypto (do not hand-edit casually):** `boostbox.nostr` implements BIP-340 signing on BouncyCastle's curve math. It is verified against the official BIP-340 vectors in `test/resources/bip340-vectors.csv`, including the 10 failure cases. Any change to the signing, `lift-x`, or tagged-hash code MUST keep those green — a subtly wrong signature is silently accepted by nothing and rejected by every relay.
+
+**NIP-01 serialization is hand-written on purpose:** NIP-01 escapes exactly seven characters and emits everything else — forward slashes, non-ASCII — verbatim. jsonista escapes a different set, which yields a different event id and therefore an invalid signature. Never swap `boostbox.nostr/canonical-event` for a general JSON encoder.
+
+**Boostagram GUIDs:** the blip-10 payload lives in TLV record `7629169`. Read the *raw* record, not a wallet's pre-parsed copy: Alby Hub's `Boostagram` struct keeps `feedID`/`itemID` but drops every GUID, and NIP-73 needs the feed GUID (a UUID). `boostbox.nwc/extract-boostagram` encodes this preference.
+
+**blip-10 field traps:** `guid` is the *feed* guid and `episode_guid` the item guid (not `feed_guid`/`item_guid`). `ts` is **seconds into the episode**, which maps to BoostBox's `position`, not its `timestamp` — the wall-clock time comes from the payment's `settled_at`. `value_msat` is only this split's share; `value_msat_total` is the whole boost.
+
 **Configuration:** All via environment variables (see README for full table). Key vars: `ENV`, `BB_PORT`, `BB_BASE_URL`, `BB_STORAGE`, `BB_ALLOWED_KEYS`.
 
 ### Testing
@@ -93,6 +112,8 @@ Tests use Kaocha with cloverage for code coverage. The `run-with-storage` helper
 
 ### Dependencies (deps.edn)
 
-HTTP: aleph (server), babashka.http-client (test client). Routing: reitit + swagger. Validation: malli. JSON: jsonista. HTML: chassis. AWS: cognitect.aws. Logging: mulog. IDs: clj-uuid.
+HTTP: aleph (server + relay websocket client), babashka.http-client (test client, and the bot's BoostBox client). Routing: reitit + swagger. Validation: malli. JSON: jsonista. HTML: chassis. AWS: cognitect.aws. Logging: mulog. IDs: clj-uuid. Crypto: bouncycastle (`bcprov-jdk18on`, secp256k1 for BIP-340 and NIP-04 ECDH — pure Java, so no native libs and it works unchanged on the alpine runtime image).
+
+**Adding a dependency requires regenerating `deps-lock.json`** (`scripts lock`, i.e. `nix flake lock && nix run .#deps-lock`). `nix build` pins every artifact by sha256 and will fail against a stale lock.
 
 Aliases: `:repl` (NREPL + CIDER), `:test` (kaocha), `:test/watch`, `:build` (tools.build uberjar), `:outdated` (antq).

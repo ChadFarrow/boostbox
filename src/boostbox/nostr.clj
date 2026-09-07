@@ -375,3 +375,48 @@
         bs))))
 
 (defn ->npub ^String [^bytes pubkey] (encode-bech32 "npub" pubkey))
+
+;; ~~~~~~~~~~~~~~~~~~~ NIP-04 ~~~~~~~~~~~~~~~~~~~
+;;
+;; NWC (NIP-47) encrypts its request and response payloads with NIP-04. NIP-44
+;; is the better scheme and the one to prefer for anything new, but Alby Hub
+;; speaks NIP-04 and the events we publish are plaintext, so NIP-04 is all this
+;; bot needs. Do not reach for these functions for anything else.
+
+(defn ecdh-x
+  "The x-coordinate of seckey * pubkey. NIP-04 uses this raw, unhashed."
+  ^bytes [^bytes seckey ^bytes pubkey]
+  (let [pt (lift-x (bytes->bi pubkey))]
+    (when-not pt
+      (throw (ex-info "counterparty public key is not on the curve" {})))
+    (bi->32 (.toBigInteger
+             (.getAffineXCoord
+              (.normalize (.multiply pt (bytes->bi seckey))))))))
+
+(defn nip04-encrypt
+  "Returns \"<base64 ciphertext>?iv=<base64 iv>\"."
+  ^String [^bytes seckey ^bytes pubkey ^String plaintext]
+  (let [iv (byte-array 16)
+        _ (.nextBytes (SecureRandom.) iv)
+        cipher (javax.crypto.Cipher/getInstance "AES/CBC/PKCS5Padding")
+        key (javax.crypto.spec.SecretKeySpec. (ecdh-x seckey pubkey) "AES")]
+    (.init cipher javax.crypto.Cipher/ENCRYPT_MODE key
+           (javax.crypto.spec.IvParameterSpec. iv))
+    (let [enc (java.util.Base64/getEncoder)]
+      (str (.encodeToString enc (.doFinal cipher (utf8 plaintext)))
+           "?iv="
+           (.encodeToString enc iv)))))
+
+(defn nip04-decrypt
+  ^String [^bytes seckey ^bytes pubkey ^String payload]
+  (let [idx (str/index-of payload "?iv=")]
+    (when-not idx
+      (throw (ex-info "NIP-04 payload is missing its ?iv= section" {})))
+    (let [dec (java.util.Base64/getDecoder)
+          ct (.decode dec ^String (subs payload 0 idx))
+          iv (.decode dec ^String (subs payload (+ idx 4)))
+          cipher (javax.crypto.Cipher/getInstance "AES/CBC/PKCS5Padding")
+          key (javax.crypto.spec.SecretKeySpec. (ecdh-x seckey pubkey) "AES")]
+      (.init cipher javax.crypto.Cipher/DECRYPT_MODE key
+             (javax.crypto.spec.IvParameterSpec. iv))
+      (String. (.doFinal cipher ct) StandardCharsets/UTF_8))))

@@ -21,7 +21,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: build-cache
-          key: build2-${{ runner.os }}-${{ hashFiles('flake.lock', 'deps.lock') }}
+          key: build2-${{ runner.os }}-${{ hashFiles('flake.lock', 'deps-lock.json') }}
           restore-keys: |
             build2-${{ runner.os }}-
 
@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build-cache
-          key: build2-${{ runner.os }}-${{ hashFiles('flake.lock', 'deps.lock') }}
+          key: build2-${{ runner.os }}-${{ hashFiles('flake.lock', 'deps-lock.json') }}
 
       - name: Copy cached files
         if: steps.cache-restore.outputs.cache-hit == 'true'
