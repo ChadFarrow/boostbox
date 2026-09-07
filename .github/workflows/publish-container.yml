@@ -58,20 +58,20 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
 
+      # `latest` comes from the metadata step above rather than being appended
+      # by hand here: github.repository keeps the owner's capitalisation
+      # (ChadFarrow/boostbox), and docker rejects an uppercase repository name.
+      # metadata-action lowercases the image for every tag it emits, so letting
+      # it own `latest` too keeps the whole set consistent.
       - name: Tag + Push
         run: |
           IMAGE=${{ steps.load.outputs.image }}
-          TARGET=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # read tags safely (handles spaces/newlines)
           echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | while read -r tag; do
+            [ -n "$tag" ] || continue
             echo "Tagging $IMAGE as $tag"
             docker tag "$IMAGE" "$tag"
             docker push "$tag"
           done
-          # Optionally tag as 'latest' for main branch
-          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
-            echo "Tagging $IMAGE as $TARGET:latest"
-            docker tag "$IMAGE" "$TARGET:latest"
-            docker push "$TARGET:latest"
-          fi
