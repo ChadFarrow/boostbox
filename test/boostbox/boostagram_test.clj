@@ -117,20 +117,39 @@
   (testing "no guids -- still publishable, just untagged"
     (is (= [["t" "boostagram"]]
            (bg/->nip73-tags (bg/normalize alby-parsed) {}))))
-  (testing "malformed guids are dropped rather than emitted"
+  (testing "a malformed feed guid is dropped rather than emitted"
     (is (= [["t" "boostagram"]]
            (bg/->nip73-tags (bg/normalize (assoc fountain-tlv
                                                  "guid" "920666"
-                                                 "episode_guid" "not-a-uuid"))
-                            {})))))
+                                                 "episode_guid" ""))
+                            {}))))
+  (testing "a non-UUID item guid is still tagged: RSS <item><guid> is an
+            arbitrary string, and requiring a UUID would drop episode tags for
+            almost every real feed"
+    (let [tags (bg/->nip73-tags
+                (bg/normalize (assoc fountain-tlv
+                                     "episode_guid" "https://example.com/ep/42?a=B"))
+                {})]
+      (is (some #(= ["i" "podcast:item:guid:https://example.com/ep/42?a=B"] %) tags)
+          "and not lower-cased -- an item guid may be a case-sensitive URL")
+      (is (some #(= ["k" "podcast:item:guid"] %) tags)))))
 
 (deftest guid-validation
-  (is (bg/valid-guid? "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"))
-  (is (bg/valid-guid? "C90E609A-DF1E-596A-BD5E-57BCC8AAD6CC"))
-  (is (not (bg/valid-guid? "920666")))
-  (is (not (bg/valid-guid? "")))
-  (is (not (bg/valid-guid? nil)))
-  (is (not (bg/valid-guid? "c90e609a-df1e-596a-bd5e-57bcc8aad6c"))))
+  (testing "a feed guid must be a UUID"
+    (is (bg/valid-feed-guid? "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"))
+    (is (bg/valid-feed-guid? "C90E609A-DF1E-596A-BD5E-57BCC8AAD6CC"))
+    (is (not (bg/valid-feed-guid? "920666")))
+    (is (not (bg/valid-feed-guid? "")))
+    (is (not (bg/valid-feed-guid? nil)))
+    (is (not (bg/valid-feed-guid? "c90e609a-df1e-596a-bd5e-57bcc8aad6c"))))
+  (testing "an item guid is any non-blank string of sane length"
+    (is (bg/valid-item-guid? "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"))
+    (is (bg/valid-item-guid? "https://example.com/episodes/42"))
+    (is (bg/valid-item-guid? "PC20-0042"))
+    (is (not (bg/valid-item-guid? "")))
+    (is (not (bg/valid-item-guid? "   ")))
+    (is (not (bg/valid-item-guid? nil)))
+    (is (not (bg/valid-item-guid? (apply str (repeat 257 "x")))))))
 
 (deftest note-content
   (let [c (bg/->note-content (bg/normalize fountain-tlv)
@@ -142,7 +161,16 @@
     (is (str/includes? c "https://tardbox.com/boost/01K9")))
   (testing "a boost with no message, show or sender still reads sensibly"
     (let [c (bg/->note-content (bg/normalize {"action" "boost" "value_msat_total" 1000}) {})]
-      (is (= "⚡ 1 sat boost" c)))))
+      (is (= "⚡ 1 sat boost" c))))
+  (testing "the headline falls back to what actually arrived when the
+            boostagram omits value_msat_total, rather than reading 0 sats"
+    (is (= "⚡ 21 sats boost"
+           (bg/->note-content (bg/normalize {"action" "boost"})
+                              {:received-msat 21000})))
+    (is (= "⚡ 5 sats boost"
+           (bg/->note-content (bg/normalize {"action" "boost" "value_msat" 5000})
+                              {}))
+        "and to the boostagram's own share if even that is missing")))
 
 (deftest sats-formatting-is-locale-independent
   (is (= "1 sat" (bg/format-sats 1000)))

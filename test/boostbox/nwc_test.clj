@@ -49,7 +49,10 @@
 (deftest decode-tlv-value-accepts-hex-and-base64
   (is (= blip10-json (nwc/decode-tlv-value (hex-tlv blip10-json))))
   (is (= blip10-json (nwc/decode-tlv-value (b64-tlv blip10-json)))
-      "the NWC transaction extension does not pin the encoding, so both are accepted"))
+      "the NWC transaction extension does not pin the encoding, so both are accepted")
+  (testing "a decode only counts if it yields JSON"
+    (is (nil? (nwc/decode-tlv-value (hex-tlv "not json at all"))))
+    (is (nil? (nwc/decode-tlv-value "zzzz")) "neither hex nor base64")))
 
 (deftest extract-boostagram-prefers-raw-tlv
   (testing "raw TLV carries the GUIDs"

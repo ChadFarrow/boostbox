@@ -44,7 +44,7 @@
   (let [bb-cfg (bb/config)
         nwc-uri (bb/get-env "BBN_NWC_URI")
         nwc (nwc/parse-uri nwc-uri)
-        seckey (nostr/decode-key (bb/get-env "BBN_NOSTR_SECKEY"))]
+        seckey (nostr/decode-key (bb/get-env "BBN_NOSTR_SECKEY") "nsec")]
     {:bb-cfg bb-cfg
      :nwc nwc
      :seckey seckey
@@ -76,6 +76,26 @@
 ;; IStorage cannot hold that -- its keys are derived from a ULID -- so this
 ;; uses the same underlying FS/S3 config directly and leaves the web app's
 ;; storage path untouched.
+
+(defn check-state-durability!
+  "The cursor and de-duplication set are the bot's only memory. On FS storage
+   they live on the container's own filesystem, and the deployment the README
+   describes -- a second Railway service -- gets a fresh one on every restart.
+   Losing them is silent and lossy: poll-once! takes its first-run branch, sets
+   the watermark to `now`, and every boost that arrived while the bot was down
+   is dropped, unpublished, with nothing in the logs to say so.
+
+   Set BBN_ALLOW_EPHEMERAL_STATE=1 if the filesystem really is a mounted
+   volume."
+  [{:keys [bb-cfg]}]
+  (when (and (= "FS" (:storage bb-cfg))
+             (not= "DEV" (:env bb-cfg))
+             (not (truthy? (bb/get-env "BBN_ALLOW_EPHEMERAL_STATE" "false"))))
+    (throw (ex-info (str "BB_STORAGE=FS gives the bot no durable cursor: on a restart the "
+                         "watermark resets to now and every boost received while the bot "
+                         "was down is dropped. Set BB_STORAGE=S3, or set "
+                         "BBN_ALLOW_EPHEMERAL_STATE=1 if this really is a persistent volume.")
+                    {:storage "FS" :root-path (:root-path bb-cfg)}))))
 
 (defn- state-io [{:keys [bb-cfg state-key]}]
   (case (:storage bb-cfg)
@@ -127,11 +147,15 @@
 ;; ~~~~~~~~~~~~~~~~~~~ Publishing ~~~~~~~~~~~~~~~~~~~
 
 (defn build-note
-  "The signed kind:1 event for a boost."
-  [{:keys [seckey]} boostagram boost-url]
+  "The signed kind:1 event for a boost.
+
+   `received-msat` is passed through because plenty of boostagrams omit
+   value_msat_total; without it the note headline reads \"0 sats\"."
+  [{:keys [seckey]} boostagram {:keys [boost-url received-msat]}]
   (nostr/sign-event seckey
                     {:kind 1
-                     :content (bg/->note-content boostagram {:boost-url boost-url})
+                     :content (bg/->note-content boostagram {:boost-url boost-url
+                                                             :received-msat received-msat})
                      :tags (bg/->nip73-tags boostagram {:boost-url boost-url})}))
 
 (defn publish-profile!
@@ -156,7 +180,14 @@
   [{:keys [relays dry-run? min-sats] :as ctx} state
    {:keys [payment-hash boostagram received-msat settled-at]}]
   (let [seen (get (seen-index state) payment-hash)
-        sats (quot (or (:value-msat-total boostagram) 0) 1000)]
+        ;; value_msat_total is frequently absent -- Alby's parsed struct drops
+        ;; it, and single-recipient splits never set it. Falling back to what
+        ;; actually arrived is what ->boost-payload already does; without the
+        ;; same fallback here a missing field reads as 0 sats and any non-zero
+        ;; BBN_MIN_SATS drops the boost permanently.
+        sats (quot (or (:value-msat-total boostagram) received-msat
+                       (:value-msat boostagram) 0)
+                   1000)]
     (cond
       (get seen "event_id")
       (do (u/log ::boost-already-published :payment-hash payment-hash) state)
@@ -176,7 +207,8 @@
                                    "boost_id" (:id stored)
                                    "url" (:url stored)})
             _ (save-state! (:state-io ctx) state)
-            event (build-note ctx boostagram (:url stored))]
+            event (build-note ctx boostagram {:boost-url (:url stored)
+                                              :received-msat received-msat})]
         (if dry-run?
           (do (u/log ::dry-run-note :boost-url (:url stored)
                      :event (nostr/event->json event))
@@ -187,12 +219,57 @@
                               {:payment-hash payment-hash :results results})))
             (u/log ::boost-published :payment-hash payment-hash
                    :boost-url (:url stored) :event-id (:id event))
-            (remember state {"payment_hash" payment-hash
-                             "boost_id" (:id stored)
-                             "url" (:url stored)
-                             "event_id" (:id event)})))))))
+            ;; Persist the event_id right here rather than leaving it to the
+            ;; caller's end-of-loop save. If a *later* boost in the same window
+            ;; fails before its own save-state!, poll-once! reloads from disk to
+            ;; recover -- and an unpersisted event_id would make this boost look
+            ;; stored-but-unpublished, so the next poll would mint a second note
+            ;; for it on the relays.
+            (let [state (remember state {"payment_hash" payment-hash
+                                         "boost_id" (:id stored)
+                                         "url" (:url stored)
+                                         "event_id" (:id event)})]
+              (save-state! (:state-io ctx) state)
+              state)))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Poll ~~~~~~~~~~~~~~~~~~~
+
+(def transactions-page-size 50)
+
+(def max-transactions-per-poll
+  "A runaway guard, not a limit. Pages come back newest-first, so *truncating*
+   the walk would keep the newest transactions and drop the oldest -- exactly
+   the data loss the paging exists to prevent. Blowing up instead is loud,
+   leaves the cursor untouched, and points at the only realistic cause: a
+   wallet that ignores `offset` and keeps returning the same page."
+  10000)
+
+(defn- tx-settled-at [tx]
+  (let [v (get tx "settled_at")]
+    (when (number? v) (long v))))
+
+(defn fetch-transactions!
+  "Every incoming transaction since the cursor, paged to exhaustion.
+
+   list_transactions caps a response at `limit` and returns newest first, so a
+   single call after an outage -- or on any BBN_BACKFILL_SEC backfill -- hands
+   back only the newest page. Advancing the cursor past that page would strand
+   everything older permanently, unread. Once the cursor is current a poll
+   interval rarely holds even one full page; the long walk only happens on a
+   deliberate backfill, and it is a one-time cost."
+  [session from]
+  (loop [offset 0
+         acc []]
+    (let [page (nwc/list-transactions! session {:from from
+                                                :limit transactions-page-size
+                                                :offset offset})
+          acc (into acc page)]
+      (when (> (count acc) max-transactions-per-poll)
+        (throw (ex-info "list_transactions paging did not terminate; is the wallet ignoring offset?"
+                        {:from from :fetched (count acc)})))
+      (if (< (count page) transactions-page-size)
+        acc
+        (recur (+ offset transactions-page-size) acc)))))
 
 (defn poll-once!
   "Fetch transactions since the cursor and publish any new boosts.
@@ -201,7 +278,12 @@
    fully published. On the first failure it stops and leaves the cursor where
    it is, so the next pass retries from exactly that point rather than skipping
    the boost. Already-published payments are caught by the de-duplication index
-   on the way back through."
+   on the way back through.
+
+   Once the whole window is published the cursor jumps to the newest
+   *transaction* seen, not the newest boost: a wallet taking ordinary payments
+   would otherwise pin the cursor forever while the paging walk got longer on
+   every poll."
   [ctx session]
   (let [state0 (load-state (:state-io ctx))
         ;; First run: start from now rather than from the beginning of the
@@ -216,13 +298,18 @@
             (u/log ::first-run-watermark :cursor c :backfill-sec (:backfill-sec ctx 0))
             (save-state! (:state-io ctx) s)
             [s c]))
-        txs (nwc/list-transactions! session {:from cursor})
-        boosts (->> txs (keep nwc/transaction->boost) (sort-by #(or (:settled-at %) 0)))]
+        txs (fetch-transactions! session cursor)
+        boosts (->> txs (keep nwc/transaction->boost) (sort-by #(or (:settled-at %) 0)))
+        high-water (reduce max 0 (keep tx-settled-at txs))]
     (u/log ::poll :transactions (count txs) :boosts (count boosts) :cursor cursor)
     (loop [state state
            [b & more] boosts]
       (if-not b
-        (do (save-state! (:state-io ctx) state) state)
+        (let [state (cond-> state
+                      (> high-water (or (get state "cursor") 0))
+                      (assoc "cursor" high-water))]
+          (save-state! (:state-io ctx) state)
+          state)
         (let [next-state (try
                            (publish-boost! ctx state b)
                            (catch Exception e
@@ -245,6 +332,7 @@
 
 (defn -main [& _]
   (let [cfg (config)
+        _ (check-state-durability! cfg)
         logger (u/start-publisher! {:type :console
                                     :pretty? (= "DEV" (:env (:bb-cfg cfg)))})
         ctx (assoc cfg :state-io (state-io cfg))]

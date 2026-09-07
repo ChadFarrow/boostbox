@@ -101,6 +101,18 @@
       (= 7 (uuid/get-version as-uuid)))
     (catch Exception _ false)))
 
+(defn boost-key?
+  "True only for keys this app wrote: `.../<26-char ULID>.json`.
+
+   The storage root is shared -- the nostrbot keeps its cursor and
+   de-duplication state alongside the boosts -- so a listing that took every
+   `.json` file would render sidecar state as a phantom boost."
+  [^String path]
+  (let [file-name (peek (str/split path #"/"))]
+    (boolean (and file-name
+                  (str/ends-with? file-name ".json")
+                  (valid-ulid? (subs file-name 0 (- (count file-name) 5)))))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Storage ~~~~~~~~~~~~~~~~~~~
 (defprotocol IStorage
   (store [this id data])
@@ -141,7 +153,7 @@
   (list-all [_]
     (let [root (io/file root-path)
           json-files (->> (file-seq root)
-                          (filter #(str/ends-with? (.getName %) ".json")))]
+                          (filter #(boost-key? (.getName ^java.io.File %))))]
       (->> json-files
            (map #(try (json/read-value %) (catch Exception _ nil)))
            (remove nil?)
@@ -198,7 +210,7 @@
     (let [response (check-aws-response (s3-list client bucket) "S3Storage list-all")]
       (->> (:Contents response)
            (map :Key)
-           (filter #(str/ends-with? % ".json"))
+           (filter boost-key?)
            (map (fn [key-name]
                   (let [get-response (s3-get client bucket key-name)]
                     (when-not (contains? get-response :cognitect.anomalies/category)

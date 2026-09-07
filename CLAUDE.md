@@ -95,7 +95,11 @@ Boost bot (separate process, same uberjar — see "Boost Bot" below):
 
 **Boostagram GUIDs:** the blip-10 payload lives in TLV record `7629169`. Read the *raw* record, not a wallet's pre-parsed copy: Alby Hub's `Boostagram` struct keeps `feedID`/`itemID` but drops every GUID, and NIP-73 needs the feed GUID (a UUID). `boostbox.nwc/extract-boostagram` encodes this preference.
 
-**blip-10 field traps:** `guid` is the *feed* guid and `episode_guid` the item guid (not `feed_guid`/`item_guid`). `ts` is **seconds into the episode**, which maps to BoostBox's `position`, not its `timestamp` — the wall-clock time comes from the payment's `settled_at`. `value_msat` is only this split's share; `value_msat_total` is the whole boost.
+**blip-10 field traps:** `guid` is the *feed* guid and `episode_guid` the item guid (not `feed_guid`/`item_guid`). `ts` is **seconds into the episode**, which maps to BoostBox's `position`, not its `timestamp` — the wall-clock time comes from the payment's `settled_at`. `value_msat` is only this split's share; `value_msat_total` is the whole boost, and it is **frequently absent** (Alby's parsed struct drops it, single-recipient splits never set it) — every use of it needs a `received-msat` fallback or the note headline reads "0 sats" and `BBN_MIN_SATS` drops real boosts.
+
+**Feed guid vs item guid (`boostbox.boostagram`):** they are validated differently and must stay that way. `<podcast:guid>` is defined as a UUID, so `valid-feed-guid?` rejects everything else — a malformed `i` tag pollutes the global NIP-73 index forever. An episode guid is the RSS `<item><guid>`, an arbitrary string (usually a URL), so `valid-item-guid?` only rejects blanks and absurd lengths and the value is **not** lower-cased. Tightening the item check to UUIDs drops episode tags for almost every real feed.
+
+**Storage root is shared (`boost-key?`):** the nostrbot keeps its cursor at `nostrbot/state.json` under the same FS root / S3 bucket the web app reads. Both `list-all` implementations filter through `bb/boost-key?`, which matches only `.../<26-char ULID>.json`. Any sidecar file added to the storage root must not be listable as a boost — a plain `*.json` filter renders it as a phantom boost card on the homepage.
 
 **Configuration:** All via environment variables (see README for full table). Key vars: `ENV`, `BB_PORT`, `BB_BASE_URL`, `BB_STORAGE`, `BB_ALLOWED_KEYS`.
 

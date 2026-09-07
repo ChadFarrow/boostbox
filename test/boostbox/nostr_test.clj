@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.string :as str]
             [clojure.java.io :as io]
+            [jsonista.core]
             [boostbox.nostr :as nostr]))
 
 ;; ~~~~~~~~~~~~~~~~~~~ BIP-340 official vectors ~~~~~~~~~~~~~~~~~~~
@@ -136,7 +137,28 @@
     (is (= (nostr/bytes->hex pk) (nostr/bytes->hex (:data (nostr/decode-bech32 npub)))))
     (testing "decode-key accepts both hex and bech32"
       (is (= (nostr/bytes->hex pk) (nostr/bytes->hex (nostr/decode-key npub))))
-      (is (= (nostr/bytes->hex pk) (nostr/bytes->hex (nostr/decode-key (nostr/bytes->hex pk))))))))
+      (is (= (nostr/bytes->hex pk) (nostr/bytes->hex (nostr/decode-key (nostr/bytes->hex pk))))))
+
+    (testing "an npub pasted where an nsec belongs is rejected"
+      ;; it is 32 bytes and signs perfectly well, so without the hrp check the
+      ;; bot would run happily under an identity nobody holds the key to
+      (is (thrown? Exception (nostr/decode-key npub "nsec")))
+      (is (= (nostr/bytes->hex pk) (nostr/bytes->hex (nostr/decode-key npub "npub"))))
+      (is (= (nostr/bytes->hex pk)
+             (nostr/bytes->hex (nostr/decode-key (nostr/bytes->hex pk) "nsec")))
+          "bare hex carries no hrp, so there is nothing to check"))))
+
+(deftest wire-json-escapes-control-characters-the-canonical-form-does-not
+  (let [content (str "ctrl" (char 1) "char")
+        event (nostr/sign-event (nostr/hex->bytes (apply str (repeat 64 "7")))
+                                {:kind 1 :content content :tags []})]
+    (testing "canonical-event stays byte-exact per NIP-01, so the id is unchanged"
+      (is (str/includes? (nostr/canonical-event event) (str (char 1)))))
+    (testing "the wire form is valid JSON that round-trips to the same string"
+      (is (not (str/includes? (nostr/event->json event) (str (char 1)))))
+      (is (str/includes? (nostr/event->json event) "\\u0001"))
+      (is (= content
+             (get (jsonista.core/read-value (nostr/event->json event)) "content"))))))
 
 (deftest hex-round-trip
   (let [bs (byte-array (map unchecked-byte (range -128 128)))]

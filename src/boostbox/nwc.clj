@@ -57,14 +57,25 @@
 ;; ~~~~~~~~~~~~~~~~~~~ Session ~~~~~~~~~~~~~~~~~~~
 
 (defn open!
-  "Connect to the wallet's relay. The caller owns the session and must close!
-   it. Kept explicit rather than per-call so the notification subscription can
-   live on the same socket."
+  "Connect to the wallet, trying each relay the URI listed in turn. The caller
+   owns the session and must close! it. Kept explicit rather than per-call so
+   the notification subscription can live on the same socket.
+
+   A connection URI may name several relays precisely because any one of them
+   can be down; stopping at the first would leave the bot retrying a dead relay
+   forever while a working one sat unused."
   [{:keys [relays] :as nwc}]
-  (let [url (first relays)]
-    {:nwc nwc
-     :relay url
-     :conn (relay/connect! url)}))
+  (loop [[url & more] relays
+         failures []]
+    (if-not url
+      (throw (ex-info "no NWC relay accepted a connection"
+                      {:relays relays :failures failures}))
+      (if-let [conn (try (relay/connect! url)
+                         (catch Exception e
+                           (u/log ::nwc-relay-unreachable :relay url :error (ex-message e))
+                           nil))]
+        {:nwc nwc :relay url :conn conn}
+        (recur more (conj failures url))))))
 
 (defn close! [{:keys [conn]}]
   (when conn (s/close! conn)))
@@ -116,10 +127,14 @@
   (call! session "get_info" {}))
 
 (defn list-transactions!
-  "Incoming transactions, newest first. `from` is epoch seconds (exclusive-ish;
-   the wallet decides) and is the cursor that keeps this cheap."
-  [session {:keys [from limit] :or {limit 50}}]
-  (let [params (cond-> {:type "incoming" :limit limit :unpaid false}
+  "One page of incoming transactions, newest first. `from` is epoch seconds
+   (exclusive-ish; the wallet decides) and is the cursor that keeps this cheap.
+
+   A response is capped at `limit`, so a caller that needs everything since the
+   cursor must page with `offset` until a short page comes back -- see
+   boostbox.nostrbot/fetch-transactions!."
+  [session {:keys [from limit offset] :or {limit 50 offset 0}}]
+  (let [params (cond-> {:type "incoming" :limit limit :offset offset :unpaid false}
                  from (assoc :from from))]
     (get (call! session "list_transactions" params) "transactions")))
 
@@ -165,14 +180,26 @@
         (string? v) (try (Long/parseLong (str/trim v)) (catch Exception _ nil))
         :else nil))
 
+(def ^:private tlv-decoders
+  [bg/tlv-hex->string
+   (fn [^String v] (String. (.decode (java.util.Base64/getDecoder) v) "UTF-8"))])
+
 (defn decode-tlv-value
   "TLV record values are hex in every implementation checked, but the NWC
    transaction extension is not part of core NIP-47 and the encoding is not
-   pinned by a spec, so fall back to base64 rather than dropping a boost."
+   pinned by a spec, so fall back to base64 rather than dropping a boost.
+
+   Only the *first decoding that yields a JSON object* is accepted. Trying hex
+   first and keeping whatever it returns is not enough: a base64 payload that
+   happens to be an even number of hex digits decodes as hex too, just into
+   garbage, and the base64 branch would never be reached."
   [^String v]
-  (or (try (bg/tlv-hex->string v) (catch Exception _ nil))
-      (try (String. (.decode (java.util.Base64/getDecoder) v) "UTF-8")
-           (catch Exception _ nil))))
+  (some (fn [decode]
+          (try
+            (let [s (decode v)]
+              (when (map? (json/read-value s)) s))
+            (catch Exception _ nil)))
+        tlv-decoders))
 
 (defn extract-boostagram
   "Pull the blip-10 boostagram out of a transaction's metadata.

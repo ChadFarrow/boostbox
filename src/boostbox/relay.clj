@@ -8,7 +8,6 @@
             [manifold.stream :as s]
             [manifold.deferred :as d]
             [jsonista.core :as json]
-            [clojure.string :as str]
             [com.brunobonacci.mulog :as u]
             [boostbox.nostr :as nostr]))
 
@@ -18,8 +17,18 @@
   "Open a websocket to a relay. Throws on failure."
   ([url] (connect! url default-timeout-ms))
   ([url timeout-ms]
-   (let [conn @(d/timeout! (http/websocket-client url {:max-frame-payload 1048576})
-                           timeout-ms)]
+   ;; The timeout goes on a derived deferred, not on `pending` itself: erroring
+   ;; the handshake deferred would leave nobody holding the socket if it lands
+   ;; a moment late. publish-to-relays! opens one per relay per note, so a slow
+   ;; relay would otherwise leak a connection on every boost.
+   (let [pending (http/websocket-client url {:max-frame-payload 1048576})
+         conn (try
+                @(d/timeout! (d/chain pending) timeout-ms)
+                (catch Exception e
+                  (d/on-realized pending
+                                 (fn [late] (when late (s/close! late)))
+                                 (fn [_] nil))
+                  (throw e)))]
      (u/log ::relay-connected :relay url)
      conn)))
 
@@ -78,26 +87,32 @@
           (u/log ::relay-publish-no-reply :relay relay-url :event-id id)
           {:relay relay-url :ok? false :message "no OK received before timeout"})))))
 
+(defn- publish-to-relay!
+  "One relay, one socket, opened and closed here. Never throws."
+  [url event]
+  (let [conn (try (connect! url)
+                  (catch Exception e
+                    (u/log ::relay-connect-failed :relay url :error (ex-message e))
+                    nil))]
+    (if-not conn
+      {:relay url :ok? false :message "connect failed"}
+      (try
+        (publish! conn url event)
+        (catch Exception e
+          {:relay url :ok? false :message (ex-message e)})
+        (finally (s/close! conn))))))
+
 (defn publish-to-relays!
-  "Publish to every relay, opening and closing a socket per relay.
+  "Publish to every relay in parallel, opening and closing a socket per relay.
 
    One acceptance is enough: the event is public and relays gossip, so
    demanding unanimity would mean a single rate-limiting relay could block a
-   boost from ever being posted. Returns {:ok? :results}."
+   boost from ever being posted. For the same reason the relays are not tried
+   in sequence -- three unreachable ones would stall the bot's poll loop for
+   the sum of their timeouts on every note. Returns {:ok? :results}."
   [relay-urls event]
-  (let [results
-        (doall
-         (for [url relay-urls]
-           (let [conn (try (connect! url) (catch Exception e
-                                            (u/log ::relay-connect-failed
-                                                   :relay url :error (ex-message e))
-                                            nil))]
-             (if-not conn
-               {:relay url :ok? false :message "connect failed"}
-               (try
-                 (publish! conn url event)
-                 (catch Exception e
-                   {:relay url :ok? false :message (ex-message e)})
-                 (finally (s/close! conn)))))))]
+  (let [results (->> relay-urls
+                     (mapv (fn [url] (future (publish-to-relay! url event))))
+                     (mapv deref))]
     {:ok? (boolean (some :ok? results))
      :results results}))

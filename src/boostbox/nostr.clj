@@ -196,8 +196,36 @@
           (.append sb c))))
     (.toString sb)))
 
+(defn wire-escape
+  "Escape a string for the JSON actually sent to a relay.
+
+   Identical to json-escape plus the rest of the C0 range as \\u00XX. NIP-01
+   names only seven escapes, and canonical-event must emit exactly those or the
+   event id changes -- but a boostagram message carrying a stray control
+   character would then produce wire JSON that is not valid JSON at all, and
+   every relay would reject the event. Only the wire form gets this."
+  ^String [^String s]
+  (let [sb (StringBuilder. (+ 2 (.length s)))]
+    (dotimes [i (.length s)]
+      (let [c (.charAt s i)]
+        (case c
+          \newline (.append sb "\\n")
+          \" (.append sb "\\\"")
+          \\ (.append sb "\\\\")
+          \return (.append sb "\\r")
+          \tab (.append sb "\\t")
+          \backspace (.append sb "\\b")
+          \formfeed (.append sb "\\f")
+          (if (< (int c) 0x20)
+            (.append sb (format "\\u%04x" (int c)))
+            (.append sb c)))))
+    (.toString sb)))
+
 (defn- json-string ^String [^String s]
   (str "\"" (json-escape s) "\""))
+
+(defn- wire-string ^String [^String s]
+  (str "\"" (wire-escape s) "\""))
 
 (defn- json-string-array ^String [xs]
   (str "[" (str/join "," (map json-string xs)) "]"))
@@ -247,16 +275,21 @@
            :sig (bytes->hex (sign seckey (hex->bytes id))))))
 
 (defn event->json
-  "Serialize a signed event as the wire JSON object."
+  "Serialize a signed event as the wire JSON object.
+
+   This uses wire-escape, not the NIP-01 escape set: the id was already fixed
+   by canonical-event, and what goes on the wire only has to be valid JSON that
+   parses back to the same string."
   ^String [{:keys [id pubkey created-at kind tags content sig]}]
   (str "{"
-       "\"id\":" (json-string id) ","
-       "\"pubkey\":" (json-string pubkey) ","
+       "\"id\":" (wire-string id) ","
+       "\"pubkey\":" (wire-string pubkey) ","
        "\"created_at\":" (long created-at) ","
        "\"kind\":" (long kind) ","
-       "\"tags\":[" (str/join "," (map json-string-array tags)) "],"
-       "\"content\":" (json-string (or content "")) ","
-       "\"sig\":" (json-string sig)
+       "\"tags\":[" (str/join "," (map (fn [xs] (str "[" (str/join "," (map wire-string xs)) "]"))
+                                         tags)) "],"
+       "\"content\":" (wire-string (or content "")) ","
+       "\"sig\":" (wire-string sig)
        "}"))
 
 (defn verify-event?
@@ -360,19 +393,29 @@
 
 (defn decode-key
   "Accept either 64-char hex or a bech32 nsec/npub and return 32 raw bytes, so
-   operators can paste whichever form their tooling handed them."
-  ^bytes [^String s]
-  (let [s (str/trim s)]
-    (if (or (str/starts-with? s "nsec1") (str/starts-with? s "npub1"))
-      (let [{:keys [data]} (decode-bech32 s)]
-        (when-not (= 32 (alength ^bytes data))
-          (throw (ex-info "bech32 key payload must be 32 bytes"
-                          {:length (alength ^bytes data)})))
-        data)
-      (let [bs (hex->bytes s)]
-        (when-not (= 32 (alength bs))
-          (throw (ex-info "key must be 32 bytes" {:length (alength bs)})))
-        bs))))
+   operators can paste whichever form their tooling handed them.
+
+   `expected-hrp` (\"nsec\" or \"npub\") is checked when the input is bech32.
+   Pass it wherever the key's role is fixed: an npub is 32 bytes and decodes
+   perfectly well as a signing scalar, so without this check an operator who
+   pastes their public key gets a working bot under an identity nobody holds
+   the key to. Bare hex carries no hrp and cannot be checked."
+  (^bytes [^String s] (decode-key s nil))
+  (^bytes [^String s expected-hrp]
+   (let [s (str/trim s)]
+     (if (or (str/starts-with? s "nsec1") (str/starts-with? s "npub1"))
+       (let [{:keys [hrp data]} (decode-bech32 s)]
+         (when (and expected-hrp (not= expected-hrp hrp))
+           (throw (ex-info (str "expected an " expected-hrp " key but got an " hrp)
+                           {:expected expected-hrp :actual hrp})))
+         (when-not (= 32 (alength ^bytes data))
+           (throw (ex-info "bech32 key payload must be 32 bytes"
+                           {:length (alength ^bytes data)})))
+         data)
+       (let [bs (hex->bytes s)]
+         (when-not (= 32 (alength bs))
+           (throw (ex-info "key must be 32 bytes" {:length (alength bs)})))
+         bs)))))
 
 (defn ->npub ^String [^bytes pubkey] (encode-bech32 "npub" pubkey))
 

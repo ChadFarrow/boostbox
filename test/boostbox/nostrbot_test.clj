@@ -1,5 +1,6 @@
 (ns boostbox.nostrbot-test
   (:require [clojure.test :refer [deftest testing is]]
+            [boostbox.boostagram :as bg]
             [boostbox.nostrbot :as bot]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
@@ -26,14 +27,12 @@
   {:payment-hash hash
    :settled-at settled-at
    :received-msat 21000
-   :boostagram (boostbox.boostagram/normalize
+   :boostagram (bg/normalize
                 {"action" "boost"
                  "podcast" "Podcasting 2.0"
                  "guid" "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"
                  "message" "hi"
                  "value_msat_total" 2100000})})
-
-(require 'boostbox.boostagram)
 
 ;; ~~~~~~~~~~~~~~~~~~~ State bookkeeping ~~~~~~~~~~~~~~~~~~~
 
@@ -185,3 +184,65 @@
       (with-redefs [nwc/list-transactions! (fn [_ opts] (reset! asked opts) [])]
         (bot/poll-once! (ctx a :backfill-sec 3600) ::session)
         (is (<= (:from @asked) (- now 3599)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Regressions ~~~~~~~~~~~~~~~~~~~
+
+(deftest a-published-note-is-not-republished-after-a-later-boost-fails
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        stores (atom 0)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1 ::tx2])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100) ::tx2 (boost "h2" 200)}
+                  ;; h1 stores fine; BoostBox is down by the time h2 is tried,
+                  ;; so h2 throws *before* it can persist anything
+                  bot/store-boost! (fn [_ _]
+                                     (when (pos? @stores)
+                                       (throw (ex-info "BoostBox is down" {})))
+                                     (swap! stores inc)
+                                     {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e]
+                                             (swap! published conj (:id e))
+                                             {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (= 1 (count @published)) "h1 published, h2 never got as far as a note")
+      (is (some? (get (first (get @a "recent")) "event_id"))
+          "h1's event_id is persisted, not just returned in memory")
+
+      (testing "the next poll must not mint a second note for h1"
+        (bot/poll-once! (ctx a) ::session)
+        (is (= 1 (count @published))
+            "h1 is recognised as already published rather than republished")))))
+
+(deftest a-full-transaction-page-is-followed-by-the-next
+  (let [a (atom {"cursor" 50 "recent" []})
+        offsets (atom [])]
+    (with-redefs [nwc/list-transactions!
+                  (fn [_ {:keys [offset limit]}]
+                    (swap! offsets conj offset)
+                    (if (zero? offset)
+                      (vec (repeat limit {"settled_at" 100}))
+                      [{"settled_at" 300}]))
+                  nwc/transaction->boost (constantly nil)]
+      (bot/poll-once! (ctx a) ::session)
+      (is (= [0 50] @offsets)
+          "a page that came back full may have older transactions behind it")
+      (is (= 300 (get @a "cursor"))
+          "a window of ordinary payments still advances the cursor, or it would
+           pin forever and the paging walk would grow on every poll"))))
+
+(deftest min-sats-is-measured-against-what-actually-arrived
+  (let [a (atom {"cursor" nil "recent" []})
+        published (atom [])
+        b (-> (boost "h1" 100)
+              (update :boostagram dissoc :value-msat-total)
+              (assoc :received-msat 50000000))]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 b}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ _]
+                                             (swap! published conj :x)
+                                             {:ok? true :results []})]
+      (bot/poll-once! (ctx a :min-sats 1000) ::session)
+      (is (= 1 (count @published))
+          "a 50,000 sat boost whose TLV omits value_msat_total is not below a
+           1,000 sat threshold"))))

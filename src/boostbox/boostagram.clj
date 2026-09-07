@@ -45,12 +45,25 @@
 (def ^:private uuid-re
   #"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
-(defn valid-guid?
-  "Podcast GUIDs in the podcast namespace are UUIDs. Anything else must not be
-   emitted as a NIP-73 id -- a malformed `i` tag is worse than no tag, because
-   it pollutes the global index and can never be matched."
+(defn valid-feed-guid?
+  "A `<podcast:guid>` is defined as a UUIDv5, so anything else must not be
+   emitted as a NIP-73 `podcast:guid` -- a malformed `i` tag is worse than no
+   tag, because it pollutes the global index and can never be matched."
   [s]
   (boolean (and (string? s) (re-matches uuid-re (str/trim s)))))
+
+(defn valid-item-guid?
+  "An episode guid is the RSS `<item><guid>`, which the RSS spec leaves as an
+   arbitrary string -- in practice a URL or a host-specific id far more often
+   than a UUID. NIP-73's `podcast:item:guid` takes it verbatim, so the only
+   things to reject are blanks and values too long to be a real guid.
+
+   Do not tighten this to valid-feed-guid?: episode-level tags would then be
+   dropped for almost every real feed."
+  [s]
+  (boolean (and (string? s)
+                (not (str/blank? s))
+                (<= (count (str/trim s)) 256))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Normalization ~~~~~~~~~~~~~~~~~~~
 
@@ -111,8 +124,10 @@
   [b {:keys [received-msat settled-at]}]
   (let [value-msat (or received-msat (:value-msat b) 1)
         total (or (:value-msat-total b) value-msat)
-        total (max (long total) 1)
-        value-msat (max (long value-msat) 1)]
+        value-msat (max (long value-msat) 1)
+        ;; a wallet that received more than the boostagram's claimed total
+        ;; would otherwise yield a split above 100%
+        total (max (long total) value-msat 1)]
     (into {}
           (remove (comp nil? val))
           {"action" (or (:action b) "boost")
@@ -148,12 +163,14 @@
   (let [feed (:feed-guid b)
         item (:item-guid b)]
     (cond-> []
-      (valid-guid? feed)
+      (valid-feed-guid? feed)
       (into [["i" (str "podcast:guid:" (str/lower-case (str/trim feed)))]
              ["k" "podcast:guid"]])
 
-      (valid-guid? item)
-      (into [["i" (str "podcast:item:guid:" (str/lower-case (str/trim item)))]
+      (valid-item-guid? item)
+      ;; not lower-cased: an item guid is an opaque string and may well be a
+      ;; case-sensitive URL, unlike the feed guid's UUID
+      (into [["i" (str "podcast:item:guid:" (str/trim item))]
              ["k" "podcast:item:guid"]])
 
       boost-url
@@ -173,8 +190,11 @@
 
    Everything except the amount is conditional: plenty of real boosts arrive
    with no message, no episode, or no sender name."
-  [b {:keys [boost-url]}]
-  (let [total (:value-msat-total b)
+  [b {:keys [boost-url received-msat]}]
+  (let [;; value_msat_total is absent often enough -- Alby's parsed struct
+        ;; drops it, single-recipient splits never set it -- that using it
+        ;; alone puts "0 sats" in the headline of a real boost.
+        total (or (:value-msat-total b) received-msat (:value-msat b))
         show (:podcast b)
         episode (:episode b)
         sender (:sender-name b)

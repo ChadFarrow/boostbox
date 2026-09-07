@@ -417,3 +417,33 @@
 (comment
   (remove-ns 'boostbox.boostbox-test)
   (smoke-test))
+
+;; ~~~~~~~~~~~~~~~~~~~ Storage listing ~~~~~~~~~~~~~~~~~~~
+
+(deftest boost-key-only-matches-keys-we-wrote
+  (let [id (bb/gen-ulid)]
+    (is (bb/boost-key? (bb/id->storage-key id)))
+    (is (bb/boost-key? (str id ".json")) "FS listing sees only the file name")
+    (testing "sidecar state sharing the root is not a boost"
+      (is (not (bb/boost-key? "nostrbot/state.json")))
+      (is (not (bb/boost-key? "state.json")))
+      (is (not (bb/boost-key? "2026/09/07/notaulid.json")))
+      (is (not (bb/boost-key? (str id ".txt")))))))
+
+(deftest list-all-ignores-sidecar-json
+  (testing "the nostrbot cursor lives in the same root and must not list as a boost"
+    (let [root (str (System/getProperty "java.io.tmpdir")
+                    "/boostbox-listing-test-" (bb/gen-ulid))
+          storage (bb/make-storage {:storage "FS" :root-path root})
+          id (bb/gen-ulid)]
+      (try
+        (bb/store storage id {"id" id "action" "boost" "value_msat_total" 1000})
+        (let [sidecar (io/file root "nostrbot" "state.json")]
+          (-> sidecar .getParentFile .mkdirs)
+          (spit sidecar "{\"cursor\":1757275200,\"recent\":[]}"))
+        (let [listed (bb/list-all storage)]
+          (is (= 1 (count listed)))
+          (is (= id (get (first listed) "id"))))
+        (finally
+          (doseq [f (reverse (file-seq (io/file root)))]
+            (.delete f)))))))

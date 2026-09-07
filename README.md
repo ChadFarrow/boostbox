@@ -249,6 +249,13 @@ All bot variables are `BBN_`-prefixed. Storage (`BB_STORAGE` and its
 filesystem or S3 settings) is shared with the web app and used for the bot's
 cursor and de-duplication state.
 
+**The bot needs durable storage.** The cursor is its only memory of what it has
+already seen; if it is lost, the bot restarts from a `now` watermark and every
+boost that arrived while it was down is silently dropped, unpublished. A second
+Railway service gets a fresh filesystem on every deploy, so `BB_STORAGE=FS` is
+refused outside `ENV=DEV` unless you set `BBN_ALLOW_EPHEMERAL_STATE=1` to say
+the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
+
 | Variable                | Required | Default                                                    | Description                                                                                     |
 | ----------------------- | :------: | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | `BBN_NWC_URI`           |   Yes    | N/A                                                        | `nostr+walletconnect://...` connection string for the wallet (e.g. an Alby Hub sub-wallet).       |
@@ -261,6 +268,7 @@ cursor and de-duplication state.
 | `BBN_BACKFILL_SEC`      |    No    | `0`                                                        | On the *first* run only, how far back to reach. `0` starts from now instead of replaying history. |
 | `BBN_DRY_RUN`           |    No    | `false`                                                    | Build and log events without publishing. Use this for the first run.                              |
 | `BBN_STATE_KEY`         |    No    | `nostrbot/state.json`                                      | Storage key for the cursor and de-duplication state.                                              |
+| `BBN_ALLOW_EPHEMERAL_STATE` | No   | `false`                                                    | Permit `BB_STORAGE=FS` outside `ENV=DEV`. Only set this if the filesystem is a persistent volume.  |
 | `BBN_PUBLISH_PROFILE`   |    No    | `false`                                                    | One-shot: publish the bot's `kind:0` profile on startup.                                          |
 | `BBN_PROFILE_NAME`      |    No    | N/A                                                        | Profile name / display name.                                                                      |
 | `BBN_PROFILE_ABOUT`     |    No    | N/A                                                        | Profile description.                                                                              |
@@ -283,6 +291,12 @@ record in preference to any pre-parsed copy the wallet offers, because Alby
 Hub's parsed `boostagram` object keeps only the numeric `feedID`/`itemID` and
 drops every GUID -- and without the feed GUID a note cannot carry NIP-73 tags.
 When no valid GUID is available the note is still published, just untagged.
+
+The two GUIDs are validated differently, on purpose. A `<podcast:guid>` is
+defined as a UUID, so anything else is dropped rather than emitted as a
+malformed NIP-73 `podcast:guid`. An episode guid is the RSS `<item><guid>`,
+which the RSS spec leaves as an arbitrary string -- usually a URL -- so it is
+passed through verbatim, case intact.
 
 ## API Quick Reference
 
