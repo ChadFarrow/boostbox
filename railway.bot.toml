@@ -1,0 +1,29 @@
+# Railway config for the boost bot service.
+#
+# Point the bot service's "Config-as-code file path" at this file instead of
+# railway.toml. Same repo, same Dockerfile, same boostbox.jar -- only the
+# entry point differs.
+#
+# It must not share railway.toml: that sets healthcheckPath = "/health", and
+# the bot serves no HTTP at all. Railway would probe a port that does not
+# exist, mark the deploy unhealthy, and restart it forever.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# The Dockerfile CMD starts the web app; the bot is a second -main in the same
+# uberjar.
+startCommand = "java -cp boostbox.jar boostbox.nostrbot"
+
+# No healthcheckPath on purpose -- see above.
+
+# The bot is a long-lived poll loop. If it exits it has lost its wallet
+# connection, and the cursor in S3 means a restart resumes rather than
+# replaying.
+restartPolicyType = "ALWAYS"
+
+# One process, one wallet cursor. Two replicas would both poll the same wallet
+# and race on the same state file, publishing duplicate notes.
+numReplicas = 1
