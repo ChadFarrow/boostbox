@@ -84,8 +84,13 @@
      :sender-name (->str (get* m "sender_name"))
      :sender-id (->str (get* m "sender_id"))
      :recipient-name (->str (get* m "name"))
-     :podcast (->str (get* m "podcast"))
-     :episode (->str (get* m "episode"))
+     ;; blip-10 names these "podcast" and "episode", but senders that model
+     ;; their payload on BoostBox's own schema (BoostMeBitch, for one) send
+     ;; "feed_title" and "item_title" instead. Accept both, exactly as the guid
+     ;; fields below already do -- otherwise the note loses the show and
+     ;; episode name and the stored boost loses both titles.
+     :podcast (->str (get* m "podcast" "feed_title"))
+     :episode (->str (get* m "episode" "item_title"))
      :url (->str (get* m "url"))
      :feed-id (->str (get* m "feedID" "feedId"))
      :item-id (->str (get* m "itemID" "itemId"))
