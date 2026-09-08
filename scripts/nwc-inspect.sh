@@ -15,6 +15,8 @@
 
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
 JAR="${JAR:-target/boostbox.jar}"
 HOURS="${HOURS:-24}"
 
@@ -49,10 +51,12 @@ exec java -cp "$JAR" clojure.main -e '
          (quote [boostbox.boostagram :as bg])
          (quote [clojure.string :as str]))
 
-(let [hours (Long/parseLong (or (System/getenv "HOURS") "24"))
+(let [origins [(str/replace (or (System/getenv "BBN_BOOSTBOX_URL") "https://tardbox.com") #"/+$" "")]
+      hours (Long/parseLong (or (System/getenv "HOURS") "24"))
       from  (- (quot (System/currentTimeMillis) 1000) (* 3600 hours))
       nwc   (nwc/parse-uri (System/getenv "BBN_NWC_URI"))
-      _     (println "relay :" (first (:relays nwc)))
+      _     (println "relay   :" (first (:relays nwc)))
+      _     (println "origins :" origins)
       sess  (nwc/open! nwc)]
   (try
     (let [txs (nwc/list-transactions! sess {:from from :limit 50})]
@@ -70,6 +74,10 @@ exec java -cp "$JAR" clojure.main -e '
           (println "---")
           (println "  settled_at   :" (get tx "settled_at"))
           (println "  amount msat  :" (get tx "amount"))
+          (println "  tx keys      :" (vec (sort (keys tx))))
+          (println "  description  :" (pr-str (get tx "description")))
+          (println "  desc_hash    :" (pr-str (get tx "description_hash")))
+          (println "  boost link   :" (pr-str (bg/boost-link (get tx "description") origins)))
           (println "  metadata?    :" (some? md)
                    (if md (str "keys=" (vec (sort (keys md)))) ""))
           (println "  tlv types    :" (if (seq types) types "(none)"))

@@ -241,20 +241,50 @@
              (bg/boost-link "see https://tardbox.com/boost/01ABC." trusted))
           "trailing sentence punctuation is not part of the URL"))
 
-    (testing "the description is written by whoever paid us, so anything we do
-              not trust is ignored"
+    (testing "naming origins locks the bot down to exactly those"
       (is (nil? (bg/boost-link "rss::payment::boost https://evil.example/x hi" trusted)))
-      (is (nil? (bg/boost-link "http://169.254.169.254/latest/meta-data/" trusted))
-          "no fetching link-local addresses on a payer's say-so")
-      (is (nil? (bg/boost-link "http://localhost:8080/admin" trusted)))
       (is (nil? (bg/boost-link "https://tardbox.com.evil.example/x" trusted))
           "a lookalike host is a different origin")
       (is (nil? (bg/boost-link "just a message" trusted)))
-      (is (nil? (bg/boost-link "https://tardbox.com/boost/01ABC" []))
-          "no trusted origins configured means no fetching at all"))
+      (is (nil? (bg/boost-link "http://tardbox.com/boost/01ABC" trusted))
+          "http and https are different origins"))
 
-    (testing "http and https are different origins"
-      (is (nil? (bg/boost-link "http://tardbox.com/boost/01ABC" trusted))))))
+    (testing "with no origins named, any https link is in scope -- apps POST to
+              whichever BoostBox they run, and a podcaster cannot enumerate
+              those in advance"
+      (is (= "https://boostbox.someapp.com/boost/01X"
+             (bg/boost-link "rss::payment::boost https://boostbox.someapp.com/boost/01X hi" [])))
+      (testing "but plaintext http never is, and the address itself is checked
+                separately at fetch time -- see nostrbot/fetchable-url?"
+        (is (nil? (bg/boost-link "http://169.254.169.254/latest/meta-data/" [])))
+        (is (nil? (bg/boost-link "http://localhost:8080/admin" [])))))))
+
+(deftest payer-written-text-is-bounded
+  (testing "every one of these is written by whoever paid us and ends up signed
+            under the bot's own key"
+    (let [b (bg/normalize {"action" "boost"
+                           "message" (apply str (repeat 900 "x"))
+                           "feed_title" (apply str (repeat 400 "t"))
+                           "sender_name" (apply str (repeat 300 "n"))})]
+      (is (= (inc bg/max-message-length) (count (:message b))) "capped, plus the ellipsis")
+      (is (= (inc bg/max-title-length) (count (:podcast b))))
+      (is (= (inc bg/max-name-length) (count (:sender-name b))))
+      (is (str/ends-with? (:message b) "…"))))
+
+  (testing "control characters are stripped so a payer cannot forge structure"
+    (let [b (bg/normalize {"action" "boost"
+                           "feed_title" (str "Ti" (char 7) "tle" (char 13) "X")
+                           "message" (str "line1" (char 13) "overwrite")})]
+      (is (= "TitleX" (:podcast b)))
+      (is (= "line1overwrite" (:message b)))))
+
+  (testing "a newline is ordinary in a message and not in a title"
+    (let [b (bg/normalize {"action" "boost" "message" "a\nb" "feed_title" "a\nb"})]
+      (is (= "a\nb" (:message b)))
+      (is (= "ab" (:podcast b)))))
+
+  (testing "short text is untouched"
+    (is (= "row of ducks" (:message (bg/normalize {"action" "boost" "message" "row of ducks"}))))))
 
 (deftest boost-id-comes-off-the-end-of-the-url
   (is (= "01M1Z3KRQ0E27RZ2T0CT1B2NEE"
