@@ -286,14 +286,40 @@
         (is (some #(= ["r" "https://tardbox.com/boost/01LINKED"] %) (:tags (first @published)))))
       (is (= "01LINKED" (get (first (get @a "recent")) "boost_id"))))))
 
-(deftest an-untrusted-link-is-not-fetched
+(deftest an-unlisted-origin-is-not-fetched-when-origins-are-named
   (let [fetched (atom [])]
     (with-redefs [bot/fetch-boost-metadata! (fn [u] (swap! fetched conj u) nil)]
       (is (nil? (bot/tx->boost! (ctx (atom {}))
                                 {"payment_hash" "x" "amount" 1000
                                  "description" "rss::payment::boost https://evil.example/y hi"})))
       (is (empty? @fetched)
-          "a payer controls the description, so an untrusted origin is never even requested"))))
+          "the fixture names tardbox explicitly, so nothing else is requested"))))
+
+(deftest with-no-origins-named-another-boostbox-still-works
+  (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+    (let [c (assoc (ctx (atom {})) :boost-link-origins nil)
+          b (bot/tx->boost! c {"payment_hash" "y" "amount" 10000 "settled_at" 5
+                               "description" "rss::payment::boost https://boostbox.someapp.com/boost/01Z hi"})]
+      (is (some? b) "a podcaster cannot enumerate every app's BoostBox in advance")
+      (is (= "https://boostbox.someapp.com/boost/01Z" (:boost-url b))))))
+
+(deftest the-address-behind-a-link-is-what-is-actually-checked
+  (testing "public names resolve and are allowed"
+    (is (bot/fetchable-url? "https://tardbox.com/boost/01ABC")))
+  (testing "anything that resolves into private space is refused, however it is spelled"
+    (doseq [u ["https://localhost/x"
+               "https://127.0.0.1/x"
+               "https://169.254.169.254/latest/meta-data/"
+               "https://10.0.0.5/x"
+               "https://192.168.1.1/x"
+               "https://172.16.0.1/x"
+               "https://[::1]/x"
+               "https://0.0.0.0/x"]]
+      (is (not (bot/fetchable-url? u)) u)))
+  (testing "plaintext and unresolvable hosts are refused"
+    (is (not (bot/fetchable-url? "http://tardbox.com/x")))
+    (is (not (bot/fetchable-url? "https://no-such-host.invalid/x")))
+    (is (not (bot/fetchable-url? "not-a-url")))))
 
 (deftest a-tlv-boostagram-still-wins-and-costs-no-round-trip
   (let [fetched (atom 0)

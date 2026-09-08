@@ -57,9 +57,15 @@
      ;; Origins the bot will fetch a boost link from. Defaults to just our own
      ;; BoostBox; BBN_BOOST_LINK_ORIGINS adds others for feeds whose apps post
      ;; to a different instance.
-     :boost-link-origins (into [(str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
-                                             #"/+$" "")]
-                               (csv (bb/get-env "BBN_BOOST_LINK_ORIGINS" "")))
+     ;; Empty means "any https origin, subject to the address check at fetch
+     ;; time" -- the default, because apps POST to whichever BoostBox they run
+     ;; and a podcaster cannot enumerate those in advance. Naming origins here
+     ;; locks the bot down to those plus our own.
+     :boost-link-origins (let [named (csv (bb/get-env "BBN_BOOST_LINK_ORIGINS" ""))]
+                           (when (seq named)
+                             (into [(str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
+                                                 #"/+$" "")]
+                                   named)))
      :poll-interval-ms (* 1000 (Long/parseLong (bb/get-env "BBN_POLL_INTERVAL_SEC" "60")))
      :min-sats (Long/parseLong (bb/get-env "BBN_MIN_SATS" "0"))
      ;; how far back to reach on the very first run; 0 means "start from now"
@@ -154,23 +160,73 @@
 
 (def boost-link-timeout-ms 10000)
 
+(defn- reserved-address?
+  "Addresses the bot must never be talked into contacting."
+  [^java.net.InetAddress a]
+  (let [bs (map #(bit-and % 0xff) (.getAddress a))
+        [b0 b1] bs]
+    (or (.isAnyLocalAddress a)                 ; 0.0.0.0, ::
+        (.isLoopbackAddress a)                 ; 127/8, ::1
+        (.isLinkLocalAddress a)                ; 169.254/16, fe80::/10
+        (.isSiteLocalAddress a)                ; 10/8, 172.16/12, 192.168/16
+        (.isMulticastAddress a)
+        (and (= 4 (count bs))
+             (or (and (= 100 b0) (<= 64 b1 127))   ; CGNAT 100.64/10
+                 (>= b0 240)))                     ; reserved 240/4
+        (and (= 16 (count bs))
+             (= 0xfc (bit-and b0 0xfe))))))        ; IPv6 ULA fc00::/7
+
+(defn fetchable-url?
+  "Whether a boost link is safe to request.
+
+   bg/boost-link decides the shape of a URL; this decides its destination, and
+   it is the half that matters. The link comes out of a payment description
+   written by whoever paid us, so an unguarded fetch would let any payer aim
+   the bot's poll loop at whatever it can reach -- a cloud metadata endpoint,
+   something on the deploy's private network. Resolve the host first and refuse
+   anything that is not a public address.
+
+   This does not close a DNS rebind: a name that resolves publicly here could
+   resolve elsewhere a moment later, when the request actually goes out.
+   Pinning the address through the connection would be the fix. The exposure is
+   small -- the bot reads one response header and never the body, and an
+   attacker has to pay to try -- but it is a real gap, not an oversight."
+  [^String url]
+  (try
+    (let [uri (java.net.URI. url)
+          host (.getHost uri)]
+      (and host
+           (= "https" (str/lower-case (str (.getScheme uri))))
+           (let [addrs (seq (java.net.InetAddress/getAllByName host))]
+             (and addrs (not-any? reserved-address? addrs)))))
+    (catch Exception _ false)))
+
 (defn fetch-boost-metadata!
   "Read a boost back out of a BoostBox permalink's x-rss-payment header.
 
    This is how an LNURL payment carries its boostagram: there is no TLV to put
    one in, so the app POSTs the metadata to BoostBox first and puts the
    resulting permalink in the BOLT11 description. Returns the decoded map, or
-   nil if the URL does not answer like a BoostBox."
+   nil if the URL does not answer like a BoostBox.
+
+   HEAD, not GET: the header is the whole payload, so there is no reason to
+   pull a body of unknown size from a server we do not control. Redirects are
+   refused outright rather than followed and re-checked -- a public host that
+   answers 302 with a private address is the standard way around an address
+   check, and nothing legitimate needs one here."
   [url]
-  (try
-    (let [resp (http/get url {:throw false :timeout boost-link-timeout-ms})
-          hdr (or (get-in resp [:headers "x-rss-payment"])
-                  (get-in resp [:headers "X-Rss-Payment"]))]
-      (when (and (= 200 (:status resp)) (not (str/blank? hdr)))
-        (json/read-value (java.net.URLDecoder/decode ^String hdr "UTF-8"))))
-    (catch Exception e
-      (u/log ::boost-link-fetch-failed :url url :error (ex-message e))
-      nil)))
+  (when (fetchable-url? url)
+    (try
+      (let [resp (http/head url {:throw false
+                                 :timeout boost-link-timeout-ms
+                                 :follow-redirects :never})
+            hdr (or (get-in resp [:headers "x-rss-payment"])
+                    (get-in resp [:headers "X-Rss-Payment"]))]
+        (when (and (= 200 (:status resp)) (not (str/blank? hdr)))
+          (json/read-value (java.net.URLDecoder/decode ^String hdr "UTF-8"))))
+      (catch Exception e
+        (u/log ::boost-link-fetch-failed :url url :error (ex-message e))
+        nil))))
 
 (defn tx->boost!
   "A transaction turned into something publishable, from whichever source

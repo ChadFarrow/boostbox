@@ -269,7 +269,7 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_DRY_RUN`           |    No    | `false`                                                    | Build and log events without publishing. Use this for the first run.                              |
 | `BBN_STATE_KEY`         |    No    | `nostrbot/state.json`                                      | Storage key for the cursor and de-duplication state.                                              |
 | `BBN_ALLOW_EPHEMERAL_STATE` | No   | `false`                                                    | Permit `BB_STORAGE=FS` outside `ENV=DEV`. Only set this if the filesystem is a persistent volume.  |
-| `BBN_BOOST_LINK_ORIGINS` | No      | (just `BBN_BOOSTBOX_URL`)                                  | Extra origins the bot will fetch a boost link from, comma separated. See "Where the metadata comes from". |
+| `BBN_BOOST_LINK_ORIGINS` | No      | (any public https host)                                    | Lock boost-link fetching to these origins, comma separated. See "Where the metadata comes from". |
 | `BBN_PUBLISH_PROFILE`   |    No    | `false`                                                    | One-shot: publish the bot's `kind:0` profile on startup.                                          |
 | `BBN_PROFILE_NAME`      |    No    | N/A                                                        | Profile name / display name.                                                                      |
 | `BBN_PROFILE_ABOUT`     |    No    | N/A                                                        | Profile description.                                                                              |
@@ -300,12 +300,30 @@ The bot reads, in order:
 3. a boost link in the payment description, fetched back through its
    `x-rss-payment` header.
 
-A payment description is written by whoever paid you, so (3) is
-origin-restricted: the bot fetches a link only if its origin matches
-`BBN_BOOSTBOX_URL` or one of `BBN_BOOST_LINK_ORIGINS`. Without that an
-arbitrary payer could point the bot at any address it can reach. When the
-metadata arrives this way the record already exists, so the bot republishes
-that permalink rather than storing a second copy.
+Apps POST to whichever BoostBox *they* run, so a podcaster adding this bot as a
+split cannot know in advance which instances their listeners' apps will name.
+By default (3) therefore accepts any `https` link.
+
+A payment description is written by whoever paid you, so what makes that safe
+is not a list of names but a check on the address behind them. Before fetching,
+the bot resolves the host and refuses anything that is not public -- loopback,
+link-local (including `169.254.169.254`), RFC1918, CGNAT, IPv6 ULA. It sends a
+`HEAD`, never follows a redirect, and reads only the `x-rss-payment` header,
+never a body. Plaintext `http` is refused outright.
+
+Set `BBN_BOOST_LINK_ORIGINS` to lock this down to named origins instead.
+
+One gap worth knowing: the address is checked at resolution, not pinned through
+the connection, so a name that resolves publicly and then re-resolves privately
+would not be caught. The bot reads one header and never a body, and an attacker
+has to pay to try, but it is a real limit rather than an oversight.
+
+When the metadata arrives this way the record already exists, so the bot
+republishes that permalink rather than storing a second copy.
+
+Text a payer writes -- the message, the show and episode titles, sender and
+recipient names -- is stripped of control characters and length-capped before
+anything is signed.
 
 ### A note on metadata
 

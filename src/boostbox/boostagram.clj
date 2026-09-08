@@ -31,6 +31,35 @@
     (string? v) (let [s (str/trim v)] (when-not (str/blank? s) s))
     :else (str v)))
 
+;; ~~~~~~~~~~~~~~~~~~~ Bounds on payer-written text ~~~~~~~~~~~~~~~~~~~
+;;
+;; Everything downstream of normalize is signed and published under the bot's
+;; own key, and every one of these fields is written by whoever paid us. The
+;; amount buys the boost, not unlimited space in the bot's feed.
+
+(def max-message-length 500)
+(def max-title-length 200)
+(def max-name-length 100)
+
+(defn- clean
+  "Trim, strip control characters, and bound the length.
+
+   Control characters go because they let a payer forge structure in a rendered
+   note -- a lone \\r overwriting a line, say. Newlines survive in a message,
+   where they are ordinary, and not in a title, where they are not."
+  ([v] (clean v max-message-length true))
+  ([v max-len] (clean v max-len false))
+  ([v max-len multiline?]
+   (when (some? v)
+     (let [s (str/replace (str v)
+                          (if multiline? #"[\p{Cntrl}&&[^\n]]" #"\p{Cntrl}")
+                          "")
+           s (str/trim s)]
+       (when-not (str/blank? s)
+         (if (> (count s) max-len)
+           (str (str/trimr (subs s 0 max-len)) "…")
+           s))))))
+
 (defn- ->int [v]
   (cond
     (nil? v) nil
@@ -78,19 +107,19 @@
   [m]
   (when (map? m)
     {:action (some-> (get* m "action") ->str str/lower-case)
-     :app-name (->str (get* m "app_name"))
-     :app-version (->str (get* m "app_version"))
-     :message (->str (get* m "message"))
-     :sender-name (->str (get* m "sender_name"))
+     :app-name (clean (get* m "app_name") max-name-length)
+     :app-version (clean (get* m "app_version") max-name-length)
+     :message (clean (get* m "message"))
+     :sender-name (clean (get* m "sender_name") max-name-length)
      :sender-id (->str (get* m "sender_id"))
-     :recipient-name (->str (get* m "name" "recipient_name"))
+     :recipient-name (clean (get* m "name" "recipient_name") max-name-length)
      ;; blip-10 names these "podcast" and "episode", but senders that model
      ;; their payload on BoostBox's own schema (BoostMeBitch, for one) send
      ;; "feed_title" and "item_title" instead. Accept both, exactly as the guid
      ;; fields below already do -- otherwise the note loses the show and
      ;; episode name and the stored boost loses both titles.
-     :podcast (->str (get* m "podcast" "feed_title"))
-     :episode (->str (get* m "episode" "item_title"))
+     :podcast (clean (get* m "podcast" "feed_title") max-title-length)
+     :episode (clean (get* m "episode" "item_title") max-title-length)
      :url (->str (get* m "url"))
      :feed-id (->str (get* m "feedID" "feedId"))
      :item-id (->str (get* m "itemID" "itemId"))
@@ -137,19 +166,29 @@
     (catch Exception _ nil)))
 
 (defn boost-link
-  "The first URL in a payment description whose origin is one we trust.
+  "The first URL in a payment description that is worth fetching.
 
-   The description is written by whoever paid us, so this is the security
-   boundary: without the allowlist the bot would issue an HTTP GET to any
-   address a payer chose to name, turning its poll loop into a probe of
-   whatever the bot can reach. Match on origin rather than on a `rss::payment::`
-   prefix, so apps that format the description differently still work."
+   With `allowed-origins` empty this accepts any https URL, which it has to:
+   podcast apps POST to a BoostBox *they* control, so a podcaster who adds this
+   bot as a split cannot know in advance which instances their listeners' apps
+   will name. An allowlist would silently skip almost every real boost.
+
+   That makes this only half the check. It decides the *shape* of a link, not
+   whether the address behind it is safe to contact -- that needs the host
+   resolved, so it lives at the fetch, in nostrbot/fetchable-url?. Plaintext
+   http is accepted only for an origin someone explicitly allowlisted.
+
+   Match on origin rather than on a `rss::payment::` prefix, so apps that format
+   the description differently still work."
   [description allowed-origins]
-  (when (and (string? description) (seq allowed-origins))
-    (let [allowed (into #{} (keep origin-of) allowed-origins)]
+  (when (string? description)
+    (let [allowed (into #{} (keep origin-of) allowed-origins)
+          ok? (if (seq allowed)
+                (fn [u] (contains? allowed (origin-of u)))
+                (fn [u] (some-> (origin-of u) (str/starts-with? "https://"))))]
       (some (fn [u]
               (let [u (str/replace u #"[.,;:!?)\]]+$" "")]
-                (when (contains? allowed (origin-of u)) u)))
+                (when (ok? u) u)))
             (re-seq #"https?://[^\s\"'<>\\]+" description)))))
 
 (defn boost-id-from-url
