@@ -54,13 +54,11 @@
      :boostbox-url (str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
                                 #"/+$" "")
      :boostbox-api-key (bb/get-env "BBN_BOOSTBOX_API_KEY")
-     ;; Origins the bot will fetch a boost link from. Defaults to just our own
-     ;; BoostBox; BBN_BOOST_LINK_ORIGINS adds others for feeds whose apps post
-     ;; to a different instance.
-     ;; Empty means "any https origin, subject to the address check at fetch
-     ;; time" -- the default, because apps POST to whichever BoostBox they run
-     ;; and a podcaster cannot enumerate those in advance. Naming origins here
-     ;; locks the bot down to those plus our own.
+     ;; Origins the bot will fetch a boost link from. Empty means "any https
+     ;; origin, subject to the address check at fetch time" -- the default,
+     ;; because apps POST to whichever BoostBox they run and a podcaster cannot
+     ;; enumerate those in advance. Naming origins here locks the bot down to
+     ;; those plus our own.
      :boost-link-origins (let [named (csv (bb/get-env "BBN_BOOST_LINK_ORIGINS" ""))]
                            (when (seq named)
                              (into [(str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
@@ -176,6 +174,18 @@
         (and (= 16 (count bs))
              (= 0xfc (bit-and b0 0xfe))))))        ; IPv6 ULA fc00::/7
 
+(defn- public-addresses
+  "Every address `host` resolves to, or nil if any one of them is an address
+   the bot must not contact.
+
+   All-or-nothing on purpose: a name answering with both a public and a private
+   address is not a misconfiguration to be worked around, it is the shape of an
+   attack."
+  [^String host]
+  (let [addrs (seq (java.net.InetAddress/getAllByName host))]
+    (when (and addrs (not-any? reserved-address? addrs))
+      addrs)))
+
 (defn fetchable-url?
   "Whether a boost link is safe to request.
 
@@ -183,23 +193,78 @@
    it is the half that matters. The link comes out of a payment description
    written by whoever paid us, so an unguarded fetch would let any payer aim
    the bot's poll loop at whatever it can reach -- a cloud metadata endpoint,
-   something on the deploy's private network. Resolve the host first and refuse
-   anything that is not a public address.
-
-   This does not close a DNS rebind: a name that resolves publicly here could
-   resolve elsewhere a moment later, when the request actually goes out.
-   Pinning the address through the connection would be the fix. The exposure is
-   small -- the bot reads one response header and never the body, and an
-   attacker has to pay to try -- but it is a real gap, not an oversight."
+   something on the deploy's private network."
   [^String url]
   (try
     (let [uri (java.net.URI. url)
           host (.getHost uri)]
-      (and host
-           (= "https" (str/lower-case (str (.getScheme uri))))
-           (let [addrs (seq (java.net.InetAddress/getAllByName host))]
-             (and addrs (not-any? reserved-address? addrs)))))
+      (boolean (and host
+                    (= "https" (str/lower-case (str (.getScheme uri))))
+                    (public-addresses host))))
     (catch Exception _ false)))
+
+(def ^:private max-header-bytes
+  "A HEAD has no body, so the only thing a hostile server can send us is
+   headers. Stop reading rather than let it send them forever."
+  65536)
+
+(defn- head-pinned!
+  "HEAD `url` over a socket opened directly to `addr` -- the address already
+   checked by public-addresses.
+
+   Connecting to a verified address rather than a name is the whole point.
+   An ordinary client resolves the host itself, so checking a name and then
+   handing it to the client leaves a window in which DNS can answer differently
+   the second time, and the request lands inside the network the check existed
+   to keep it out of. One lookup, one address, no window.
+
+   Pinning the address does not weaken TLS: SNI is set explicitly and endpoint
+   identification stays on, so the certificate is still validated against the
+   hostname. Only the status line and headers are read."
+  [^String url ^java.net.InetAddress addr timeout-ms]
+  (let [uri (java.net.URI. url)
+        host (.getHost uri)
+        port (if (pos? (.getPort uri)) (.getPort uri) 443)
+        path (let [p (.getRawPath uri)
+                   q (.getRawQuery uri)]
+               (str (if (str/blank? p) "/" p) (when q (str "?" q))))
+        ^javax.net.ssl.SSLSocketFactory factory (javax.net.ssl.SSLSocketFactory/getDefault)
+        ^javax.net.ssl.SSLSocket sock (.createSocket factory)]
+    (try
+      (.connect sock (java.net.InetSocketAddress. addr (int port)) (int timeout-ms))
+      (.setSoTimeout sock (int timeout-ms))
+      (let [params (.getSSLParameters sock)]
+        (.setServerNames params [(javax.net.ssl.SNIHostName. host)])
+        (.setEndpointIdentificationAlgorithm params "HTTPS")
+        (.setSSLParameters sock params))
+      (.startHandshake sock)
+      (doto (.getOutputStream sock)
+        (.write (.getBytes (str "HEAD " path " HTTP/1.1\r\n"
+                                "Host: " host "\r\n"
+                                "User-Agent: boostbox-bot\r\n"
+                                "Accept: */*\r\n"
+                                "Connection: close\r\n\r\n")
+                           "UTF-8"))
+        (.flush))
+      (let [rdr (java.io.BufferedReader.
+                 (java.io.InputStreamReader. (.getInputStream sock) "ISO-8859-1"))
+            status (some-> (.readLine rdr)
+                           (str/split #"\s+")
+                           second
+                           (as-> s (try (Long/parseLong s) (catch Exception _ nil))))]
+        (loop [headers {} budget max-header-bytes]
+          (let [line (.readLine rdr)]
+            (if (or (nil? line) (str/blank? line) (neg? budget))
+              {:status status :headers headers}
+              (let [i (str/index-of line ":")]
+                (recur (if i
+                         (assoc headers
+                                (str/lower-case (str/trim (subs line 0 i)))
+                                (str/trim (subs line (inc i))))
+                         headers)
+                       (- budget (count line))))))))
+      (finally
+        (try (.close sock) (catch Exception _ nil))))))
 
 (defn fetch-boost-metadata!
   "Read a boost back out of a BoostBox permalink's x-rss-payment header.
@@ -213,20 +278,24 @@
    pull a body of unknown size from a server we do not control. Redirects are
    refused outright rather than followed and re-checked -- a public host that
    answers 302 with a private address is the standard way around an address
-   check, and nothing legitimate needs one here."
+   check, and nothing legitimate needs one here. Anything that is not a 200 is
+   simply not a boost.
+
+   The host is resolved once and the connection made to that address, so there
+   is no second lookup for DNS to answer differently."
   [url]
-  (when (fetchable-url? url)
-    (try
-      (let [resp (http/head url {:throw false
-                                 :timeout boost-link-timeout-ms
-                                 :follow-redirects :never})
-            hdr (or (get-in resp [:headers "x-rss-payment"])
-                    (get-in resp [:headers "X-Rss-Payment"]))]
-        (when (and (= 200 (:status resp)) (not (str/blank? hdr)))
-          (json/read-value (java.net.URLDecoder/decode ^String hdr "UTF-8"))))
-      (catch Exception e
-        (u/log ::boost-link-fetch-failed :url url :error (ex-message e))
-        nil))))
+  (try
+    (let [uri (java.net.URI. (str url))
+          host (.getHost uri)]
+      (when (and host (= "https" (str/lower-case (str (.getScheme uri)))))
+        (when-let [addrs (public-addresses host)]
+          (let [{:keys [status headers]} (head-pinned! url (first addrs) boost-link-timeout-ms)
+                hdr (get headers "x-rss-payment")]
+            (when (and (= 200 status) (not (str/blank? hdr)))
+              (json/read-value (java.net.URLDecoder/decode ^String hdr "UTF-8")))))))
+    (catch Exception e
+      (u/log ::boost-link-fetch-failed :url (str url) :error (ex-message e))
+      nil)))
 
 (defn tx->boost!
   "A transaction turned into something publishable, from whichever source

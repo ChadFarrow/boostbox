@@ -321,10 +321,10 @@ never a body. Plaintext `http` is refused outright.
 
 Set `BBN_BOOST_LINK_ORIGINS` to lock this down to named origins instead.
 
-One gap worth knowing: the address is checked at resolution, not pinned through
-the connection, so a name that resolves publicly and then re-resolves privately
-would not be caught. The bot reads one header and never a body, and an attacker
-has to pay to try, but it is a real limit rather than an oversight.
+The host is resolved once and the connection is made to that exact address, so
+there is no second lookup for DNS to answer differently. Pinning the address
+does not weaken TLS: SNI is set explicitly and the certificate is still
+validated against the hostname.
 
 When the metadata arrives this way the record already exists, so the bot
 republishes that permalink rather than storing a second copy.
