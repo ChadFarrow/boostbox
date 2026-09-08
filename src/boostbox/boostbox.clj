@@ -24,6 +24,7 @@
             [com.brunobonacci.mulog :as u]
             [boostbox.images :as images]
             [boostbox.banner :as banner]
+            [boostbox.boostagram :as bg]
             [clojure.string :as str]
             [malli.core :as m]
             [malli.util :as mu]))
@@ -73,10 +74,13 @@
                                                  (str/split #","))))
         _ (assert (seq allowed-keys) "must specify at least one key in BB_ALLOWED_KEYS (comma separated)")
         max-body-size (Long/parseLong (get-env "BB_MAX_BODY" "102400"))
-        ;; What the boost banner signs itself with. Defaults to the host in
-        ;; BB_BASE_URL, because that is who serves the picture; set it when the
-        ;; bot publishing the notes goes by a different name.
-        banner-wordmark (get-env "BB_BANNER_WORDMARK" nil)
+        ;; What the boost banner signs itself with. The banner is served by
+        ;; this app but only ever appears on the bot's notes, so it carries the
+        ;; bot's name rather than this host's -- the same name BBN_CLIENT_NAME
+        ;; defaults to, and the two should not disagree on one note. Set the
+        ;; variable to override it; set it to empty to fall back to the host in
+        ;; BB_BASE_URL.
+        banner-wordmark (get-env "BB_BANNER_WORDMARK" bg/default-client-name)
         base-config {:env env :storage storage :port port :base-url base-url
                      :banner-wordmark banner-wordmark
                      :allowed-keys allowed-keys :max-body-size max-body-size}

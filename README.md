@@ -172,7 +172,7 @@ Configuration is handled via environment variables.
 | `BB_BASE_URL`     |    No    | `http://localhost:8080` | The public base URL of the service (e.g., `https://my-boostbox.com`). Used to construct response URLs.             |
 | `BB_ALLOWED_KEYS` |    No    | `v4v4me`                | Comma-separated list of API keys clients must provide in the `X-Api-Key` header to use the `POST /boost` endpoint. |
 | `BB_MAX_BODY`     |    No    | `102400`                | Maximum allowed size for request bodies in bytes (approximately 100KB by default).                                 |
-| `BB_BANNER_WORDMARK` |  No   | the host in `BB_BASE_URL` | What the boost banner (`/og/boost.png`) signs itself with. Set it when the bot publishing the notes goes by a different name. |
+| `BB_BANNER_WORDMARK` |  No   | `Boostr`                | What the boost banner (`/og/boost.png`) signs itself with. The banner only ever appears on the bot's notes, so it carries the bot's name, not this host's. Set it to empty to fall back to the host in `BB_BASE_URL`. |
 | `BB_STORAGE`      |    No    | `FS`                    | The backend for storing metadata: `FS` (filesystem) or `S3`.                                                       |
 
 ### Filesystem Storage Configuration
