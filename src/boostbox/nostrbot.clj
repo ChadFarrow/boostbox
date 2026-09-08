@@ -278,6 +278,30 @@
         (u/log ::profile-published :accepted ok? :results results)))
     event))
 
+(defn publish-relay-list!
+  "Publish the bot's NIP-65 relay list (kind:10002).
+
+   Without one, a client that finds the bot's npub has no idea where its notes
+   live and can only guess from its own relay set -- so a boost published to
+   damus and nos.lol is invisible to anyone whose client looks elsewhere. A
+   kind:0 alone does not fix that; the relay list is the part that makes an
+   npub followable.
+
+   Every relay is marked `write`, which is the honest answer: the bot publishes
+   to these and reads nothing from them. Its only inbound channel is the
+   wallet's own relay, which is a wallet credential and has no business in a
+   public list."
+  [{:keys [seckey relays dry-run?]}]
+  (let [event (nostr/sign-event seckey
+                                {:kind 10002
+                                 :content ""
+                                 :tags (mapv (fn [r] ["r" r "write"]) relays)})]
+    (if dry-run?
+      (u/log ::dry-run-relay-list :event (nostr/event->json event))
+      (let [{:keys [ok? results]} (relay/publish-to-relays! relays event)]
+        (u/log ::relay-list-published :accepted ok? :results results)))
+    event))
+
 (defn publish-boost!
   "Store, then publish, then record. Returns the updated state.
 
@@ -467,7 +491,10 @@
                                  (Thread/sleep 250)
                                  (logger))))
     (when (:publish-profile? cfg)
-      (publish-profile! ctx))
+      (publish-profile! ctx)
+      ;; the relay list goes with the profile: a name without one leaves
+      ;; clients unable to find anything the bot has published
+      (publish-relay-list! ctx))
     (loop [backoff 1000]
       (let [started (System/currentTimeMillis)
             failed?

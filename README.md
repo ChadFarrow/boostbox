@@ -270,7 +270,7 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_STATE_KEY`         |    No    | `nostrbot/state.json`                                      | Storage key for the cursor and de-duplication state.                                              |
 | `BBN_ALLOW_EPHEMERAL_STATE` | No   | `false`                                                    | Permit `BB_STORAGE=FS` outside `ENV=DEV`. Only set this if the filesystem is a persistent volume.  |
 | `BBN_BOOST_LINK_ORIGINS` | No      | (any public https host)                                    | Lock boost-link fetching to these origins, comma separated. See "Where the metadata comes from". |
-| `BBN_PUBLISH_PROFILE`   |    No    | `false`                                                    | One-shot: publish the bot's `kind:0` profile on startup.                                          |
+| `BBN_PUBLISH_PROFILE`   |    No    | `false`                                                    | One-shot: publish the bot's `kind:0` profile and NIP-65 `kind:10002` relay list on startup.        |
 | `BBN_PROFILE_NAME`      |    No    | N/A                                                        | Profile name / display name.                                                                      |
 | `BBN_PROFILE_ABOUT`     |    No    | N/A                                                        | Profile description.                                                                              |
 | `BBN_PROFILE_PICTURE`   |    No    | N/A                                                        | Profile picture URL.                                                                              |
@@ -278,6 +278,14 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_PROFILE_LUD16`     |    No    | the NWC URI's `lud16`                                      | Lightning address for the profile, so the bot itself can be boosted back.                         |
 
 The bot logs its own `npub` on startup, so you can find and follow it.
+
+Set `BBN_PUBLISH_PROFILE=true` once and restart, then unset it -- every restart
+would otherwise republish. That publishes two events: the `kind:0` profile, so
+clients show a name instead of a bare hex pubkey, and a NIP-65 `kind:10002`
+relay list naming `BBN_RELAYS`. The relay list is the part that makes the npub
+followable: without it a client has no idea where the bot's notes live and can
+only guess from its own relay set. The wallet's relay is deliberately absent --
+it is reachable only with the NWC credential and has no place in a public list.
 
 ### Only boosts are republished
 

@@ -151,6 +151,21 @@
 
 ;; ~~~~~~~~~~~~~~~~~~~ Profile ~~~~~~~~~~~~~~~~~~~
 
+(deftest relay-list-is-nip65-kind-10002
+  (with-redefs [relay/publish-to-relays! (fn [_ _] {:ok? true :results []})]
+    (let [e (bot/publish-relay-list! {:seckey seckey
+                                      :relays ["wss://relay.damus.io" "wss://nos.lol"]
+                                      :dry-run? false})]
+      (is (= 10002 (:kind e)))
+      (is (= "" (:content e)) "NIP-65 carries everything in tags")
+      (is (nostr/verify-event? e))
+      (testing "each relay is declared write-only, which is what the bot does"
+        (is (= [["r" "wss://relay.damus.io" "write"]
+                ["r" "wss://nos.lol" "write"]]
+               (:tags e))))
+      (testing "the wallet relay is never in the list -- it is a credential"
+        (is (not (some #(clojure.string/includes? (str %) "getalby") (:tags e))))))))
+
 (deftest profile-event-is-kind-0-json-content
   (with-redefs [relay/publish-to-relays! (fn [_ _] {:ok? true :results []})]
     (let [e (bot/publish-profile!
