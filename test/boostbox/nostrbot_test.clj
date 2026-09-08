@@ -336,6 +336,16 @@
     (is (not (bot/fetchable-url? "https://no-such-host.invalid/x")))
     (is (not (bot/fetchable-url? "not-a-url")))))
 
+(deftest a-refused-address-is-never-contacted
+  (testing "the check and the connection use one resolution, so there is no
+            window for DNS to answer differently the second time"
+    (doseq [u ["https://169.254.169.254/latest/meta-data/"
+               "https://127.0.0.1/x"
+               "https://10.0.0.5/x"
+               "http://tardbox.com/boost/01ABC"
+               "https://no-such-host.invalid/x"]]
+      (is (nil? (bot/fetch-boost-metadata! u)) u))))
+
 (deftest a-tlv-boostagram-still-wins-and-costs-no-round-trip
   (let [fetched (atom 0)
         tlv (nostr/bytes->hex (.getBytes (json/write-value-as-string
