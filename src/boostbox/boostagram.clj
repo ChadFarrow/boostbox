@@ -243,16 +243,41 @@
 
 ;; ~~~~~~~~~~~~~~~~~~~ NIP-73 tags ~~~~~~~~~~~~~~~~~~~
 
+(def default-client-name
+  "What NIP-89's `client` tag says when nothing overrides it.
+
+   The name of the bot as readers meet it, not the name of this repo: a client
+   renders this as \"via ...\" under the note. Override with BBN_CLIENT_NAME."
+  "Boostr")
+
+(def max-tag-item-length
+  "The longest one item of one tag may be. Mirrors boostmebitch's
+   MAX_TAG_ITEM_LEN, and the banner URL is the only thing here that can
+   approach it -- it carries an artwork address and both titles."
+  512)
+
+(def banner-dimensions
+  "The banner is one fixed size, so a client can reserve the space before the
+   bytes arrive. Must agree with boostbox.banner."
+  "1200x300")
+
 (defn ->nip73-tags
-  "NIP-73 external content id tags for the podcast and episode this boost was
-   sent to, plus a link to the BoostBox permalink.
+  "Every tag on the boost note, in the order boostmebitch emits them.
 
    Each `i` tag is paired with a `k` tag naming its kind, so clients can query
-   every event for a kind. Tags are emitted only for GUIDs that are actually
-   UUIDs."
-  [b {:keys [boost-url]}]
+   every event for a kind. Tags are emitted only for GUIDs that pass their own
+   validator -- and the two validators differ on purpose, see valid-feed-guid?.
+
+   Two attribution tags, and they answer different questions. `client` is
+   NIP-89: the app that CREATED AND SIGNED this event, which is always this bot
+   -- a client renders it as \"via ...\", so naming the paying app there would
+   attribute the bot's own note to software that never signed it. `app` is the
+   app that SENT the boost, the convention boostmebitch uses on its kind:3369
+   receipts. It is payer-written text, so it is a claim, not a fact."
+  [b {:keys [boost-url npubs banner-url client-name total-msat]}]
   (let [feed (:feed-guid b)
-        item (:item-guid b)]
+        item (:item-guid b)
+        banner-item (when banner-url (str "url " banner-url))]
     (cond-> []
       (valid-feed-guid? feed)
       (into [["i" (str "podcast:guid:" (str/lower-case (str/trim feed)))]
@@ -267,8 +292,30 @@
       boost-url
       (conj ["r" boost-url])
 
+      ;; The people the feed names. Capped upstream in boostbox.feed: a p tag
+      ;; notifies a stranger under this bot's identity, permanently.
+      (seq npubs)
+      (into (for [n npubs] ["p" (:pubkey n)]))
+
+      ;; NIP-92, so a client that renders from tags shows the same picture as
+      ;; one that scans the text. Dropped rather than truncated when it is too
+      ;; long: the body still names the banner, so every text-scanning client
+      ;; still renders it, and an over-long tag item is refused by relays that
+      ;; bound them.
+      (and banner-item (<= (count banner-item) max-tag-item-length))
+      (conj ["imeta" banner-item "m image/png" (str "dim " banner-dimensions)])
+
+      (and total-msat (pos? (long total-msat)))
+      (conj ["amount" (str (long total-msat))])
+
       :always
-      (conj ["t" "boostagram"]))))
+      (conj ["client" (or (not-empty (str client-name)) default-client-name)])
+
+      (:app-name b)
+      (conj ["app" (:app-name b)])
+
+      :always
+      (into [["t" "boostagram"] ["t" "value4value"]]))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Note content ~~~~~~~~~~~~~~~~~~~
 
@@ -276,26 +323,73 @@
   (let [sats (quot (long (or msat 0)) 1000)]
     (str (String/format java.util.Locale/US "%,d" (object-array [sats])) (if (= 1 sats) " sat" " sats"))))
 
+(defn note-sats
+  "The sats figure the note says, formatted as boostmebitch formats it: plain,
+   always plural, no group separator.
+
+   Deliberately not `format-sats`. That one groups thousands and says \"1 sat\",
+   and it reads better -- but it renders the HTML pages, and a boost note and a
+   boost card showing different strings for one payment is worse than either
+   choice on its own. Keep the two apart, and change both or neither."
+  [msat]
+  (str (quot (long (or msat 0)) 1000) " sats"))
+
+(defn note-total-msat
+  "What the note calls the boost.
+
+   value_msat_total is absent often enough -- Alby's parsed struct drops it,
+   single-recipient splits never set it -- that using it alone puts \"0 sats\"
+   in the headline of a real boost."
+  [b received-msat]
+  (or (:value-msat-total b) received-msat (:value-msat b)))
+
+(defn banner-url
+  "The picture the note carries: the boost banner on the BoostBox web app.
+
+   The parameter names are boostmebitch's, and they are a PERMANENT PUBLIC
+   CONTRACT -- every note ever published writes this URL into a signed kind:1,
+   which cannot be edited, so renaming one blanks the picture on all of them at
+   once. They must keep agreeing with boostbox.banner, which serves them. Add
+   parameters; never repurpose one.
+
+   Returns nil with no base URL, so a bot with nowhere to serve a picture from
+   publishes a note with no picture rather than a broken link."
+  [base-url b art total-msat]
+  (when-not (str/blank? (str base-url))
+    (let [enc #(java.net.URLEncoder/encode (str %) "UTF-8")
+          sats (quot (long (or total-msat 0)) 1000)
+          params (cond-> []
+                   art (conj (str "art=" (enc art)))
+                   (:podcast b) (conj (str "title=" (enc (:podcast b))))
+                   (:episode b) (conj (str "ep=" (enc (:episode b))))
+                   (pos? sats) (conj (str "sats=" sats)))]
+      (str (str/replace (str base-url) #"/+$" "") "/og/boost.png"
+           (when (seq params) (str "?" (str/join "&" params)))))))
+
 (defn ->note-content
-  "The human-readable body of the kind:1 note.
+  "The human-readable body of the kind:1 note, laid out as boostmebitch lays
+   its own out (lib/nostr/boost-notes.ts, formatContent).
 
    Everything except the amount is conditional: plenty of real boosts arrive
-   with no message, no episode, or no sender name."
-  [b {:keys [boost-url received-msat]}]
-  (let [;; value_msat_total is absent often enough -- Alby's parsed struct
-        ;; drops it, single-recipient splits never set it -- that using it
-        ;; alone puts "0 sats" in the headline of a real boost.
-        total (or (:value-msat-total b) received-msat (:value-msat b))
+   with no message, no episode, or no sender name. With no sender the
+   attribution line reads \"Boosted 100 sats\" rather than naming nobody.
+
+   The banner URL goes last, on its own, because a Nostr client decides whether
+   a bare URL is an image from the text around it."
+  [b {:keys [boost-url received-msat banner-url]}]
+  (let [total (note-total-msat b received-msat)
         show (:podcast b)
         episode (:episode b)
         sender (:sender-name b)
-        message (:message b)]
-    (->> [(str "⚡ " (format-sats total) " boost"
-               (when show (str " to " show))
-               (when episode (str " — " episode))
-               (when sender (str "\nfrom " sender)))
-          (when message (str "\n\"" message "\""))
-          (when boost-url (str "\n" boost-url))]
-         (remove nil?)
-         (str/join "")
-         (str/trim))))
+        message (:message b)
+        links (->> [boost-url banner-url] (remove str/blank?) (remove nil?))]
+    (->> (concat
+          ["⚡ Boost ⚡" ""]
+          (when message [message ""])
+          [(str (if sender (str sender " boosted") "Boosted")
+                " " (note-sats total)
+                (when show (str " → " show)))]
+          (when episode [(str "📻 " episode)])
+          (mapcat (fn [l] ["" l]) links))
+         (str/join "\n")
+         (str/trimr))))

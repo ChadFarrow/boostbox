@@ -172,6 +172,7 @@ Configuration is handled via environment variables.
 | `BB_BASE_URL`     |    No    | `http://localhost:8080` | The public base URL of the service (e.g., `https://my-boostbox.com`). Used to construct response URLs.             |
 | `BB_ALLOWED_KEYS` |    No    | `v4v4me`                | Comma-separated list of API keys clients must provide in the `X-Api-Key` header to use the `POST /boost` endpoint. |
 | `BB_MAX_BODY`     |    No    | `102400`                | Maximum allowed size for request bodies in bytes (approximately 100KB by default).                                 |
+| `BB_BANNER_WORDMARK` |  No   | `Boostr`                | What the boost banner (`/og/boost.png`) signs itself with. The banner only ever appears on the bot's notes, so it carries the bot's name, not this host's. Set it to empty to fall back to the host in `BB_BASE_URL`. |
 | `BB_STORAGE`      |    No    | `FS`                    | The backend for storing metadata: `FS` (filesystem) or `S3`.                                                       |
 
 ### Filesystem Storage Configuration
@@ -265,6 +266,9 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_RELAYS`            |    No    | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net` | Comma-separated relays to publish to. One acceptance counts as success.                           |
 | `BBN_POLL_INTERVAL_SEC` |    No    | `60`                                                       | How often to poll the wallet. Notifications short-circuit the wait; polling guarantees delivery.  |
 | `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
+| `BBN_CLIENT_NAME`       |    No    | `Boostr`                                                   | NIP-89 `client` tag: the app that signed the note, which is this bot. Clients render it as "via ...". Never the paying app -- that gets its own `app` tag. |
+| `BBN_FEED_LOOKUP`       |    No    | `true`                                                     | Read the show's RSS feed to find its npubs and cover art. Off is supported: the note still publishes, with no picture and no `p` tags. |
+| `BBN_FEED_TIMEOUT_MS`   |    No    | `8000`                                                     | How long to wait on that feed read before giving up on it.                                        |
 | `BBN_BACKFILL_SEC`      |    No    | `0`                                                        | On the *first* run only, how far back to reach. `0` starts from now instead of replaying history. |
 | `BBN_DRY_RUN`           |    No    | `false`                                                    | Build and log events without publishing. Use this for the first run.                              |
 | `BBN_STATE_KEY`         |    No    | `nostrbot/state.json`                                      | Storage key for the cursor and de-duplication state.                                              |

@@ -19,6 +19,8 @@
             [boostbox.boostagram :as bg]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
+            [boostbox.safefetch :as sf]
+            [boostbox.feed :as feed]
             [boostbox.relay :as relay]))
 
 (def default-relays
@@ -64,6 +66,15 @@
                              (into [(str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
                                                  #"/+$" "")]
                                    named)))
+     ;; NIP-89's `client` tag: the app that created and signed the note, which
+     ;; is this bot. Never the app that paid -- that goes in the `app` tag, and
+     ;; a client renders `client` as "via ..." under the note.
+     :client-name (bb/get-env "BBN_CLIENT_NAME" bg/default-client-name)
+     ;; Reading the show's feed is what gives a note its picture and its p
+     ;; tags. Off is a supported way to run: the note still publishes, without
+     ;; either.
+     :feed-lookup? (truthy? (bb/get-env "BBN_FEED_LOOKUP" "true"))
+     :feed-timeout-ms (Long/parseLong (bb/get-env "BBN_FEED_TIMEOUT_MS" "8000"))
      :poll-interval-ms (* 1000 (Long/parseLong (bb/get-env "BBN_POLL_INTERVAL_SEC" "60")))
      :min-sats (Long/parseLong (bb/get-env "BBN_MIN_SATS" "0"))
      ;; how far back to reach on the very first run; 0 means "start from now"
@@ -158,113 +169,11 @@
 
 (def boost-link-timeout-ms 10000)
 
-(defn- reserved-address?
-  "Addresses the bot must never be talked into contacting."
-  [^java.net.InetAddress a]
-  (let [bs (map #(bit-and % 0xff) (.getAddress a))
-        [b0 b1] bs]
-    (or (.isAnyLocalAddress a)                 ; 0.0.0.0, ::
-        (.isLoopbackAddress a)                 ; 127/8, ::1
-        (.isLinkLocalAddress a)                ; 169.254/16, fe80::/10
-        (.isSiteLocalAddress a)                ; 10/8, 172.16/12, 192.168/16
-        (.isMulticastAddress a)
-        (and (= 4 (count bs))
-             (or (and (= 100 b0) (<= 64 b1 127))   ; CGNAT 100.64/10
-                 (>= b0 240)))                     ; reserved 240/4
-        (and (= 16 (count bs))
-             (= 0xfc (bit-and b0 0xfe))))))        ; IPv6 ULA fc00::/7
+(def fetchable-url?
+  "Whether a boost link is safe to request. See boostbox.safefetch -- the
+   address check, not the shape check, is the half that matters."
+  sf/fetchable-url?)
 
-(defn- public-addresses
-  "Every address `host` resolves to, or nil if any one of them is an address
-   the bot must not contact.
-
-   All-or-nothing on purpose: a name answering with both a public and a private
-   address is not a misconfiguration to be worked around, it is the shape of an
-   attack."
-  [^String host]
-  (let [addrs (seq (java.net.InetAddress/getAllByName host))]
-    (when (and addrs (not-any? reserved-address? addrs))
-      addrs)))
-
-(defn fetchable-url?
-  "Whether a boost link is safe to request.
-
-   bg/boost-link decides the shape of a URL; this decides its destination, and
-   it is the half that matters. The link comes out of a payment description
-   written by whoever paid us, so an unguarded fetch would let any payer aim
-   the bot's poll loop at whatever it can reach -- a cloud metadata endpoint,
-   something on the deploy's private network."
-  [^String url]
-  (try
-    (let [uri (java.net.URI. url)
-          host (.getHost uri)]
-      (boolean (and host
-                    (= "https" (str/lower-case (str (.getScheme uri))))
-                    (public-addresses host))))
-    (catch Exception _ false)))
-
-(def ^:private max-header-bytes
-  "A HEAD has no body, so the only thing a hostile server can send us is
-   headers. Stop reading rather than let it send them forever."
-  65536)
-
-(defn- head-pinned!
-  "HEAD `url` over a socket opened directly to `addr` -- the address already
-   checked by public-addresses.
-
-   Connecting to a verified address rather than a name is the whole point.
-   An ordinary client resolves the host itself, so checking a name and then
-   handing it to the client leaves a window in which DNS can answer differently
-   the second time, and the request lands inside the network the check existed
-   to keep it out of. One lookup, one address, no window.
-
-   Pinning the address does not weaken TLS: SNI is set explicitly and endpoint
-   identification stays on, so the certificate is still validated against the
-   hostname. Only the status line and headers are read."
-  [^String url ^java.net.InetAddress addr timeout-ms]
-  (let [uri (java.net.URI. url)
-        host (.getHost uri)
-        port (if (pos? (.getPort uri)) (.getPort uri) 443)
-        path (let [p (.getRawPath uri)
-                   q (.getRawQuery uri)]
-               (str (if (str/blank? p) "/" p) (when q (str "?" q))))
-        ^javax.net.ssl.SSLSocketFactory factory (javax.net.ssl.SSLSocketFactory/getDefault)
-        ^javax.net.ssl.SSLSocket sock (.createSocket factory)]
-    (try
-      (.connect sock (java.net.InetSocketAddress. addr (int port)) (int timeout-ms))
-      (.setSoTimeout sock (int timeout-ms))
-      (let [params (.getSSLParameters sock)]
-        (.setServerNames params [(javax.net.ssl.SNIHostName. host)])
-        (.setEndpointIdentificationAlgorithm params "HTTPS")
-        (.setSSLParameters sock params))
-      (.startHandshake sock)
-      (doto (.getOutputStream sock)
-        (.write (.getBytes (str "HEAD " path " HTTP/1.1\r\n"
-                                "Host: " host "\r\n"
-                                "User-Agent: boostbox-bot\r\n"
-                                "Accept: */*\r\n"
-                                "Connection: close\r\n\r\n")
-                           "UTF-8"))
-        (.flush))
-      (let [rdr (java.io.BufferedReader.
-                 (java.io.InputStreamReader. (.getInputStream sock) "ISO-8859-1"))
-            status (some-> (.readLine rdr)
-                           (str/split #"\s+")
-                           second
-                           (as-> s (try (Long/parseLong s) (catch Exception _ nil))))]
-        (loop [headers {} budget max-header-bytes]
-          (let [line (.readLine rdr)]
-            (if (or (nil? line) (str/blank? line) (neg? budget))
-              {:status status :headers headers}
-              (let [i (str/index-of line ":")]
-                (recur (if i
-                         (assoc headers
-                                (str/lower-case (str/trim (subs line 0 i)))
-                                (str/trim (subs line (inc i))))
-                         headers)
-                       (- budget (count line))))))))
-      (finally
-        (try (.close sock) (catch Exception _ nil))))))
 
 (defn fetch-boost-metadata!
   "Read a boost back out of a BoostBox permalink's x-rss-payment header.
@@ -288,8 +197,8 @@
     (let [uri (java.net.URI. (str url))
           host (.getHost uri)]
       (when (and host (= "https" (str/lower-case (str (.getScheme uri)))))
-        (when-let [addrs (public-addresses host)]
-          (let [{:keys [status headers]} (head-pinned! url (first addrs) boost-link-timeout-ms)
+        (when-let [addrs (sf/public-addresses host)]
+          (let [{:keys [status headers]} (sf/head-pinned! url (first addrs) boost-link-timeout-ms)
                 hdr (get headers "x-rss-payment")]
             (when (and (= 200 status) (not (str/blank? hdr)))
               (json/read-value (java.net.URLDecoder/decode ^String hdr "UTF-8")))))))
@@ -322,17 +231,86 @@
 
 ;; ~~~~~~~~~~~~~~~~~~~ Publishing ~~~~~~~~~~~~~~~~~~~
 
+(def max-feed-bytes
+  "How much of a feed we will read. Big enough for the long-running shows,
+   small enough that a hostile URL cannot hand the poll loop a heap."
+  (* 2 1024 1024))
+
+(def ^:private feed-cache-size
+  "One show's boosts arrive in bursts and publish-boost! sits inside the retry
+   loop, so the same feed would otherwise be fetched several times a minute.
+   Small on purpose: this is a burst absorber, not a store."
+  32)
+
+(defonce ^:private feed-cache (atom {}))
+
+(defn- cached-feed-read
+  "Read one feed, remembering the answer -- including a nil one, so an
+   unreadable feed is not re-fetched for every boost it sends."
+  [url read!]
+  (let [c @feed-cache]
+    (if (contains? c url)
+      (get c url)
+      (let [v (read!)]
+        (swap! feed-cache
+               (fn [m] (assoc (if (>= (count m) feed-cache-size) {} m) url v)))
+        v))))
+
+(defn feed-context
+  "The show's npubs and cover art, read from the feed the boostagram names.
+
+   Two things about this are deliberate.
+
+   The feed URL is written by whoever paid us, so it is fetched only through
+   boostbox.safefetch, which resolves it and refuses a private address. It is
+   read and never rendered: printing a payer's URL in a note this bot's key
+   signs would put an attacker's link under the bot's identity, and the note
+   already carries the BoostBox permalink.
+
+   Any failure at all answers nil. A feed being slow, moved or malformed must
+   not stop a boost being announced -- the note simply goes out with no picture
+   and no p tags, which is what every note looked like before this existed."
+  [{:keys [feed-lookup? feed-timeout-ms]} boostagram]
+  (when feed-lookup?
+    ;; `:url` is one of the few fields normalize passes through without
+    ;; bounding, because nothing used to read it. Longer than this is not a
+    ;; feed address, and it is also the cache key below.
+    (let [url (some-> (:url boostagram) str str/trim not-empty)
+          url (when (and url (<= (count url) 2048)) url)]
+      (when (and url (sf/fetchable-url? url))
+        (cached-feed-read
+         url
+         (fn []
+           (try
+             (when-let [{:keys [body]} (sf/fetch-pinned!
+                                        url {:max-bytes max-feed-bytes
+                                             :timeout-ms (or feed-timeout-ms 8000)})]
+               (feed/read-feed (String. ^bytes body "UTF-8") (:item-guid boostagram)))
+             (catch Exception e
+               (u/log ::feed-read-failed :error (ex-message e))
+               nil))))))))
+
 (defn build-note
   "The signed kind:1 event for a boost.
 
    `received-msat` is passed through because plenty of boostagrams omit
    value_msat_total; without it the note headline reads \"0 sats\"."
-  [{:keys [seckey]} boostagram {:keys [boost-url received-msat]}]
-  (nostr/sign-event seckey
-                    {:kind 1
-                     :content (bg/->note-content boostagram {:boost-url boost-url
-                                                             :received-msat received-msat})
-                     :tags (bg/->nip73-tags boostagram {:boost-url boost-url})}))
+  [{:keys [seckey client-name] :as ctx} boostagram {:keys [boost-url received-msat]}]
+  (let [ctxt (feed-context ctx boostagram)
+        total (bg/note-total-msat boostagram received-msat)
+        banner (bg/banner-url (:boostbox-url ctx) boostagram (:art ctxt) total)]
+    (nostr/sign-event seckey
+                      {:kind 1
+                       :content (bg/->note-content boostagram
+                                                   {:boost-url boost-url
+                                                    :received-msat received-msat
+                                                    :banner-url banner})
+                       :tags (bg/->nip73-tags boostagram
+                                              {:boost-url boost-url
+                                               :npubs (:npubs ctxt)
+                                               :banner-url banner
+                                               :client-name client-name
+                                               :total-msat total})})))
 
 (defn publish-profile!
   "Publish the bot's own kind:0 metadata, so clients render a name instead of a

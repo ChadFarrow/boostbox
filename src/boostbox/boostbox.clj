@@ -23,6 +23,8 @@
             [boostbox.ulid :as ulid]
             [com.brunobonacci.mulog :as u]
             [boostbox.images :as images]
+            [boostbox.banner :as banner]
+            [boostbox.boostagram :as bg]
             [clojure.string :as str]
             [malli.core :as m]
             [malli.util :as mu]))
@@ -72,7 +74,15 @@
                                                  (str/split #","))))
         _ (assert (seq allowed-keys) "must specify at least one key in BB_ALLOWED_KEYS (comma separated)")
         max-body-size (Long/parseLong (get-env "BB_MAX_BODY" "102400"))
+        ;; What the boost banner signs itself with. The banner is served by
+        ;; this app but only ever appears on the bot's notes, so it carries the
+        ;; bot's name rather than this host's -- the same name BBN_CLIENT_NAME
+        ;; defaults to, and the two should not disagree on one note. Set the
+        ;; variable to override it; set it to empty to fall back to the host in
+        ;; BB_BASE_URL.
+        banner-wordmark (get-env "BB_BANNER_WORDMARK" bg/default-client-name)
         base-config {:env env :storage storage :port port :base-url base-url
+                     :banner-wordmark banner-wordmark
                      :allowed-keys allowed-keys :max-body-size max-body-size}
         storage-config (case storage
                          "FS" {:root-path (get-env "BB_FS_ROOT_PATH" "boosts")}
@@ -768,8 +778,60 @@
         {:status 401
          :body {:error :unauthorized}}))))
 
+;; ~~~~~~~~~~~~~~~~~~~ Boost banner ~~~~~~~~~~~~~~~~~~~
+
+(defn client-address
+  "The caller, for rate limiting. The proxy headers are set by whoever is in
+   front of us and are trivially forged, so this bounds an ordinary caller and
+   is not a security control."
+  [request]
+  (or (some-> (get-in request [:headers "x-forwarded-for"])
+              (str/split #",") first str/trim not-empty)
+      (get-in request [:headers "x-real-ip"])
+      (:remote-addr request)))
+
+(defn boost-banner
+  "The picture a boost note carries: GET /og/boost.png?art=&title=&ep=&sats=
+
+   THIS URL IS A PERMANENT PUBLIC CONTRACT. Every boost note the bot publishes
+   writes it into a signed kind:1, which cannot be edited, so renaming the path
+   or a parameter blanks the picture on every note ever published, all at once.
+   Add parameters; never repurpose one. The `.png` is in the PATH because a
+   Nostr client decides whether a bare URL is an image before it fetches it.
+
+   The parameter names are boostmebitch's, deliberately: the two routes are
+   then interchangeable, and a note published by either app renders the same
+   way."
+  [cfg]
+  (fn [request]
+    (if-not (banner/allow? (client-address request))
+      {:status 429
+       :headers {"retry-after" "60"}
+       :body {:error "too many requests"}}
+      (try
+        (let [q (:query-params request)
+              wordmark (or (not-empty (str (:banner-wordmark cfg)))
+                           (some-> (:base-url cfg) (str/replace #"^https?://" "")
+                                   (str/replace #"/.*$" "") not-empty)
+                           "boostbox")
+              png (banner/banner-png
+                   {:title (get q "title") :ep (get q "ep") :sats (get q "sats")
+                    :art (get q "art") :art2 (get q "art2") :art3 (get q "art3")}
+                   wordmark)]
+          {:status 200
+           :headers {"content-type" "image/png"
+                     "content-length" (str (count png))
+                     "cache-control" "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"}
+           :body (java.io.ByteArrayInputStream. png)})
+        (catch Exception e
+          ;; A fixed message, never the exception: safefetch names the host it
+          ;; refused, so reflecting it turns the address check into an oracle.
+          (u/log ::banner-render-failed :error (ex-message e))
+          {:status 502 :body {:error "banner render failed"}})))))
+
 (defn routes [cfg storage]
   [["/" {:get {:no-doc true :handler (homepage storage)}}]
+   ["/og/boost.png" {:get {:no-doc true :handler (boost-banner cfg)}}]
    ["/openapi.json" {:get {:no-doc true :handler (swagger/create-swagger-handler)
                            :swagger {:info {:title "BoostBox API"
                                             :description "simple API to store boost metadata"
@@ -939,6 +1001,12 @@
       :executor :none})))
 
 (defn -main [& _]
+  ;; Before anything can load an AWT class. The banner route draws with Java2D,
+  ;; and on a server with no display an un-headless JVM throws
+  ;; HeadlessException on the first draw -- a 502 on a URL that is already
+  ;; written into signed, unfixable notes. Setting it here rather than as a
+  ;; -D covers the Docker CMD, the Nix wrapper and a bare `java -jar` alike.
+  (System/setProperty "java.awt.headless" "true")
   (let [cfg (config)
         storage (make-storage cfg)
         logger (u/start-publisher! {:type :console :pretty? (= (:env cfg) "DEV")})

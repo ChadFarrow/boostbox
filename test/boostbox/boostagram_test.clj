@@ -105,24 +105,42 @@
         (is (inst? (java.time.Instant/parse (get p "timestamp"))) "must be ISO-8601")))))
 
 (deftest nip73-tags
-  (testing "both guids present"
+  (testing "the full tag set, in boostmebitch's emission order"
     (is (= [["i" "podcast:guid:c90e609a-df1e-596a-bd5e-57bcc8aad6cc"]
             ["k" "podcast:guid"]
             ["i" "podcast:item:guid:d98d189b-dc7b-45b1-8720-d4b98690f31f"]
             ["k" "podcast:item:guid"]
             ["r" "https://tardbox.com/boost/01K9"]
-            ["t" "boostagram"]]
+            ["p" "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"]
+            ["imeta" "url https://tardbox.com/og/boost.png?sats=2100"
+             "m image/png" "dim 1200x300"]
+            ["amount" "2100000"]
+            ["client" "Boostr"]
+            ["app" "Fountain"]
+            ["t" "boostagram"]
+            ["t" "value4value"]]
            (bg/->nip73-tags (bg/normalize fountain-tlv)
-                            {:boost-url "https://tardbox.com/boost/01K9"}))))
-  (testing "no guids -- still publishable, just untagged"
-    (is (= [["t" "boostagram"]]
+                            {:boost-url "https://tardbox.com/boost/01K9"
+                             :npubs [{:npub "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
+                                      :pubkey "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"}]
+                             :banner-url "https://tardbox.com/og/boost.png?sats=2100"
+                             :total-msat 2100000}))))
+
+  (testing "Alby's parsed struct drops every GUID, so a boost through it is
+            publishable but untagged -- the constants and the paying app are
+            all that is left to say"
+    (is (= [["client" "Boostr"] ["app" "Fountain"]
+            ["t" "boostagram"] ["t" "value4value"]]
            (bg/->nip73-tags (bg/normalize alby-parsed) {}))))
+
   (testing "a malformed feed guid is dropped rather than emitted"
-    (is (= [["t" "boostagram"]]
+    (is (= [["client" "Boostr"] ["t" "boostagram"] ["t" "value4value"]]
            (bg/->nip73-tags (bg/normalize (assoc fountain-tlv
                                                  "guid" "920666"
-                                                 "episode_guid" ""))
+                                                 "episode_guid" ""
+                                                 "app_name" nil))
                             {}))))
+
   (testing "a non-UUID item guid is still tagged: RSS <item><guid> is an
             arbitrary string, and requiring a UUID would drop episode tags for
             almost every real feed"
@@ -130,9 +148,44 @@
                 (bg/normalize (assoc fountain-tlv
                                      "episode_guid" "https://example.com/ep/42?a=B"))
                 {})]
-      (is (some #(= ["i" "podcast:item:guid:https://example.com/ep/42?a=B"] %) tags)
-          "and not lower-cased -- an item guid may be a case-sensitive URL")
-      (is (some #(= ["k" "podcast:item:guid"] %) tags)))))
+      (is (some #(= ["i" "podcast:item:guid:https://example.com/ep/42?a=B"] %) tags))
+      (is (some #(= ["k" "podcast:item:guid"] %) tags))))
+
+  (testing "client vs app: `client` names who SIGNED the note, `app` who PAID.
+            Putting the paying app in `client` would have every reader's client
+            render this bot's note as 'via Fountain'."
+    (let [tags (bg/->nip73-tags (bg/normalize fountain-tlv) {})]
+      (is (= ["client" "Boostr"] (first (filter #(= "client" (first %)) tags))))
+      (is (= ["app" "Fountain"] (first (filter #(= "app" (first %)) tags)))))
+    (testing "and the client name is the operator's to set"
+      (is (= ["client" "MyBox"]
+             (first (filter #(= "client" (first %))
+                            (bg/->nip73-tags (bg/normalize fountain-tlv)
+                                             {:client-name "MyBox"})))))))
+
+  (testing "no app_name means no app tag, rather than an empty one"
+    (is (not-any? #(= "app" (first %))
+                  (bg/->nip73-tags (bg/normalize (dissoc fountain-tlv "app_name")) {}))))
+
+  (testing "an over-long banner drops its imeta tag and nothing else.
+
+            A relay that bounds a tag item rejects the whole event, so an
+            artwork URL long enough to push the tag over would stop the note
+            publishing at all. The body still names the banner, so every
+            client that scans text still renders the picture."
+    (let [long-url (str "https://tardbox.com/og/boost.png?art=" (apply str (repeat 520 "a")))
+          tags (bg/->nip73-tags (bg/normalize fountain-tlv) {:banner-url long-url})]
+      (is (not-any? #(= "imeta" (first %)) tags))
+      (is (some #(= "client" (first %)) tags)))
+    (testing "and one that just fits is kept"
+      (let [url (str "https://x/" (apply str (repeat (- bg/max-tag-item-length 4 10) "a")))]
+        (is (some #(= "imeta" (first %))
+                  (bg/->nip73-tags (bg/normalize fountain-tlv) {:banner-url url}))))))
+
+  (testing "a zero amount emits no amount tag: 0 msat is not a fact about a
+            payment, it is the absence of one"
+    (is (not-any? #(= "amount" (first %))
+                  (bg/->nip73-tags (bg/normalize alby-parsed) {:total-msat 0})))))
 
 (deftest guid-validation
   (testing "a feed guid must be a UUID"
@@ -152,31 +205,83 @@
     (is (not (bg/valid-item-guid? (apply str (repeat 257 "x")))))))
 
 (deftest note-content
-  (let [c (bg/->note-content (bg/normalize fountain-tlv)
-                             {:boost-url "https://tardbox.com/boost/01K9"})]
-    (is (str/includes? c "2,100 sats"))
-    (is (str/includes? c "Podcasting 2.0"))
-    (is (str/includes? c "Alice"))
-    (is (str/includes? c "Great show!"))
-    (is (str/includes? c "https://tardbox.com/boost/01K9")))
+  (testing "the whole note, laid out as boostmebitch lays its own out"
+    (is (= (str "\u26a1 Boost \u26a1\n"
+                "\n"
+                "Great show!\n"
+                "\n"
+                "Alice boosted 2100 sats \u2192 Podcasting 2.0\n"
+                "\ud83d\udcfb Episode 158: The Big One\n"
+                "\n"
+                "https://tardbox.com/boost/01K9\n"
+                "\n"
+                "https://tardbox.com/og/boost.png?sats=2100")
+           (bg/->note-content (bg/normalize fountain-tlv)
+                              {:boost-url "https://tardbox.com/boost/01K9"
+                               :banner-url "https://tardbox.com/og/boost.png?sats=2100"}))))
+
   (testing "a boost with no message, show or sender still reads sensibly"
-    (let [c (bg/->note-content (bg/normalize {"action" "boost" "value_msat_total" 1000}) {})]
-      (is (= "⚡ 1 sat boost" c))))
+    (is (= "\u26a1 Boost \u26a1\n\nBoosted 1 sats"
+           (bg/->note-content (bg/normalize {"action" "boost" "value_msat_total" 1000}) {}))))
+
   (testing "the headline falls back to what actually arrived when the
             boostagram omits value_msat_total, rather than reading 0 sats"
-    (is (= "⚡ 21 sats boost"
+    (is (= "\u26a1 Boost \u26a1\n\nBoosted 21 sats"
            (bg/->note-content (bg/normalize {"action" "boost"})
                               {:received-msat 21000})))
-    (is (= "⚡ 5 sats boost"
+    (is (= "\u26a1 Boost \u26a1\n\nBoosted 5 sats"
            (bg/->note-content (bg/normalize {"action" "boost" "value_msat" 5000})
                               {}))
-        "and to the boostagram's own share if even that is missing")))
+        "and to the boostagram's own share if even that is missing"))
+
+  (testing "the banner stands alone on the last line even with no permalink:
+            a Nostr client decides whether a bare URL is an image from the text
+            around it"
+    (is (= "\u26a1 Boost \u26a1\n\nBoosted 1 sats\n\nhttps://b/x.png"
+           (bg/->note-content (bg/normalize {"action" "boost" "value_msat_total" 1000})
+                              {:banner-url "https://b/x.png"})))))
+
+(deftest banner-url-is-a-permanent-contract
+  (testing "the parameter names are boostmebitch's, and every note ever
+            published writes this URL into a signed kind:1"
+    (is (= (str "https://tardbox.com/og/boost.png"
+                "?art=https%3A%2F%2Fcdn.x%2Fa.png"
+                "&title=Podcasting+2.0"
+                "&ep=Episode+158%3A+The+Big+One"
+                "&sats=2100")
+           (bg/banner-url "https://tardbox.com" (bg/normalize fountain-tlv)
+                          "https://cdn.x/a.png" 2100000))))
+
+  (testing "an art URL is encoded, so a payer cannot smuggle another parameter
+            in through their feed's cover address"
+    (let [u (bg/banner-url "https://tardbox.com" (bg/normalize {"action" "boost"})
+                           "https://evil/a.png&sats=999999" 1000)]
+      (is (str/includes? u "%26sats%3D999999"))
+      (is (= 1 (count (re-seq #"[?&]sats=" u))))))
+
+  (testing "no base URL means no picture, never a broken link"
+    (is (nil? (bg/banner-url nil (bg/normalize fountain-tlv) "https://cdn.x/a.png" 1000)))
+    (is (nil? (bg/banner-url "  " (bg/normalize fountain-tlv) nil 1000))))
+
+  (testing "a trailing slash on the base URL does not double up"
+    (is (= "https://tardbox.com/og/boost.png"
+           (bg/banner-url "https://tardbox.com//" (bg/normalize {"action" "boost"}) nil 0)))))
 
 (deftest sats-formatting-is-locale-independent
   (is (= "1 sat" (bg/format-sats 1000)))
   (is (= "0 sats" (bg/format-sats 999)) "sub-sat amounts truncate")
   (is (= "2,100 sats" (bg/format-sats 2100000)))
   (is (= "0 sats" (bg/format-sats nil))))
+
+(deftest the-note-and-the-html-page-count-sats-differently-on-purpose
+  (testing "format-sats renders the HTML pages: grouped, and singular at one"
+    (is (= ["1 sat" "2,100 sats"] [(bg/format-sats 1000) (bg/format-sats 2100000)])))
+  (testing "note-sats renders the note, matching boostmebitch exactly: plain,
+            always plural. Two functions rather than one because a boost note
+            and a boost card showing different strings for the same payment is
+            worse than either choice on its own -- change both or neither."
+    (is (= ["1 sats" "2100 sats" "0 sats"]
+           [(bg/note-sats 1000) (bg/note-sats 2100000) (bg/note-sats nil)]))))
 
 (deftest tlv-hex-decoding
   (let [json "{\"action\":\"boost\",\"message\":\"héllo 🚀\"}"
@@ -200,7 +305,7 @@
       (is (= "LNURL Test Episode 3" (:episode b)))
       (testing "so the note names the show instead of trailing off after the amount"
         (let [c (bg/->note-content b {})]
-          (is (str/includes? c "to LNURL Testing Podcast"))
+          (is (str/includes? c "ChadF boosted 100 sats \u2192 LNURL Testing Podcast"))
           (is (str/includes? c "LNURL Test Episode 3"))))
       (testing "and the stored boost keeps both titles"
         (let [p (bg/->boost-payload b {:received-msat 10000 :settled-at 1757288117})]
