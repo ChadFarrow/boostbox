@@ -4,7 +4,8 @@
             [boostbox.nostrbot :as bot]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
-            [boostbox.relay :as relay]))
+            [boostbox.relay :as relay]
+            [jsonista.core :as json]))
 
 (def seckey (nostr/hex->bytes (apply str (repeat 64 "9"))))
 
@@ -20,7 +21,8 @@
           :dry-run? false
           :min-sats 0
           :boostbox-url "https://tardbox.com"
-          :boostbox-api-key "test-key"}
+          :boostbox-api-key "test-key"
+          :boost-link-origins ["https://tardbox.com"]}
          overrides))
 
 (defn- boost [hash settled-at]
@@ -246,3 +248,65 @@
       (is (= 1 (count @published))
           "a 50,000 sat boost whose TLV omits value_msat_total is not below a
            1,000 sat threshold"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Boost links (LNURL payments) ~~~~~~~~~~~~~~~~~~~
+
+(def link-tx
+  {"payment_hash" "hL" "amount" 10000 "settled_at" 300
+   "description" "rss::payment::boost https://tardbox.com/boost/01LINKED hello"})
+
+(def linked-metadata
+  {"action" "boost" "feed_title" "LNURL Testing Podcast"
+   "item_title" "Episode 3" "feed_guid" "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf"
+   "item_guid" "c4dac22d-173f-4442-9b3b-5d89b20b26e6"
+   "sender_name" "ChadF" "message" "hi" "value_msat_total" 100000})
+
+(deftest a-boost-link-supplies-the-metadata-an-lnurl-payment-cannot-carry
+  (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+    (let [b (bot/tx->boost! (ctx (atom {})) link-tx)]
+      (is (some? b) "an LNURL payment with no TLV is still publishable")
+      (is (= "https://tardbox.com/boost/01LINKED" (:boost-url b)))
+      (is (= "01LINKED" (:boost-id b)))
+      (is (= "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf" (-> b :boostagram :feed-guid))
+          "so the note can still carry NIP-73 tags"))))
+
+(deftest a-linked-boost-is-never-stored-twice
+  (let [a (atom {"cursor" 50 "recent" []})
+        posted (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [link-tx])
+                  bot/fetch-boost-metadata! (fn [_] linked-metadata)
+                  bot/store-boost! (fn [_ p] (swap! posted conj p) {:id "NEW" :url "NEW"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (empty? @posted)
+          "the record already exists at the linked URL; POSTing would mint a duplicate")
+      (is (= 1 (count @published)))
+      (testing "and the note points at the existing record, not a new one"
+        (is (some #(= ["r" "https://tardbox.com/boost/01LINKED"] %) (:tags (first @published)))))
+      (is (= "01LINKED" (get (first (get @a "recent")) "boost_id"))))))
+
+(deftest an-untrusted-link-is-not-fetched
+  (let [fetched (atom [])]
+    (with-redefs [bot/fetch-boost-metadata! (fn [u] (swap! fetched conj u) nil)]
+      (is (nil? (bot/tx->boost! (ctx (atom {}))
+                                {"payment_hash" "x" "amount" 1000
+                                 "description" "rss::payment::boost https://evil.example/y hi"})))
+      (is (empty? @fetched)
+          "a payer controls the description, so an untrusted origin is never even requested"))))
+
+(deftest a-tlv-boostagram-still-wins-and-costs-no-round-trip
+  (let [fetched (atom 0)
+        tlv (nostr/bytes->hex (.getBytes (json/write-value-as-string
+                                          {"action" "boost" "podcast" "From TLV"
+                                           "guid" "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"
+                                           "value_msat_total" 2100000})
+                                         "UTF-8"))]
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] (swap! fetched inc) linked-metadata)]
+      (let [b (bot/tx->boost! (ctx (atom {}))
+                              {"payment_hash" "hT" "amount" 21000 "settled_at" 1
+                               "description" "rss::payment::boost https://tardbox.com/boost/01LINKED hi"
+                               "metadata" {"tlv_records" [{"type" 7629169 "value" tlv}]}})]
+        (is (= "From TLV" (-> b :boostagram :podcast)))
+        (is (nil? (:boost-url b)) "so it is stored normally, as before")
+        (is (zero? @fetched) "no network round trip when the TLV is right there")))))

@@ -54,6 +54,12 @@
      :boostbox-url (str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
                                 #"/+$" "")
      :boostbox-api-key (bb/get-env "BBN_BOOSTBOX_API_KEY")
+     ;; Origins the bot will fetch a boost link from. Defaults to just our own
+     ;; BoostBox; BBN_BOOST_LINK_ORIGINS adds others for feeds whose apps post
+     ;; to a different instance.
+     :boost-link-origins (into [(str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
+                                             #"/+$" "")]
+                               (csv (bb/get-env "BBN_BOOST_LINK_ORIGINS" "")))
      :poll-interval-ms (* 1000 (Long/parseLong (bb/get-env "BBN_POLL_INTERVAL_SEC" "60")))
      :min-sats (Long/parseLong (bb/get-env "BBN_MIN_SATS" "0"))
      ;; how far back to reach on the very first run; 0 means "start from now"
@@ -144,6 +150,51 @@
       (throw (ex-info "BoostBox rejected the boost"
                       {:status (:status resp) :body (:body resp)})))))
 
+;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
+
+(def boost-link-timeout-ms 10000)
+
+(defn fetch-boost-metadata!
+  "Read a boost back out of a BoostBox permalink's x-rss-payment header.
+
+   This is how an LNURL payment carries its boostagram: there is no TLV to put
+   one in, so the app POSTs the metadata to BoostBox first and puts the
+   resulting permalink in the BOLT11 description. Returns the decoded map, or
+   nil if the URL does not answer like a BoostBox."
+  [url]
+  (try
+    (let [resp (http/get url {:throw false :timeout boost-link-timeout-ms})
+          hdr (or (get-in resp [:headers "x-rss-payment"])
+                  (get-in resp [:headers "X-Rss-Payment"]))]
+      (when (and (= 200 (:status resp)) (not (str/blank? hdr)))
+        (json/read-value (java.net.URLDecoder/decode ^String hdr "UTF-8"))))
+    (catch Exception e
+      (u/log ::boost-link-fetch-failed :url url :error (ex-message e))
+      nil)))
+
+(defn tx->boost!
+  "A transaction turned into something publishable, from whichever source
+   actually carries the metadata.
+
+   The TLV comes first because it is authoritative and free. Only if there is
+   none do we look for a boost link, which most Podcasting 2.0 apps use for
+   LNURL payments -- the paths are mutually exclusive in practice, and a TLV
+   never needs a network round trip to read."
+  [ctx tx]
+  (or (nwc/transaction->boost tx)
+      (when-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
+        (when-let [b (some-> (fetch-boost-metadata! url) bg/normalize)]
+          (when (bg/boost? b)
+            (u/log ::boost-from-link :url url)
+            {:payment-hash (get tx "payment_hash")
+             :boostagram b
+             :received-msat (let [a (get tx "amount")] (when (number? a) (long a)))
+             :settled-at (let [t (get tx "settled_at")] (when (number? t) (long t)))
+             ;; the record already exists at this URL -- publish-boost! must
+             ;; reuse it rather than POST a second copy of the same boost
+             :boost-url url
+             :boost-id (bg/boost-id-from-url url)})))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Publishing ~~~~~~~~~~~~~~~~~~~
 
 (defn build-note
@@ -178,7 +229,7 @@
    the note is published, so a publish failure retries without minting a second
    BoostBox record for the same payment."
   [{:keys [relays dry-run? min-sats] :as ctx} state
-   {:keys [payment-hash boostagram received-msat settled-at]}]
+   {:keys [payment-hash boostagram received-msat settled-at boost-url boost-id]}]
   (let [seen (get (seen-index state) payment-hash)
         ;; value_msat_total is frequently absent -- Alby's parsed struct drops
         ;; it, and single-recipient splits never set it. Falling back to what
@@ -197,8 +248,18 @@
           (remember state {"payment_hash" payment-hash "skipped" "below-threshold"}))
 
       :else
-      (let [stored (if-let [url (get seen "url")]
-                     {:id (get seen "boost_id") :url url}
+      (let [stored (cond
+                     ;; already stored on an earlier attempt
+                     (get seen "url")
+                     {:id (get seen "boost_id") :url (get seen "url")}
+
+                     ;; the boostagram came from a boost link, so the record it
+                     ;; points at is the boost -- POSTing would mint a second
+                     ;; copy of something BoostBox already holds
+                     boost-url
+                     {:id boost-id :url boost-url}
+
+                     :else
                      (store-boost! ctx (bg/->boost-payload
                                         boostagram
                                         {:received-msat received-msat
@@ -299,7 +360,7 @@
             (save-state! (:state-io ctx) s)
             [s c]))
         txs (fetch-transactions! session cursor)
-        boosts (->> txs (keep nwc/transaction->boost) (sort-by #(or (:settled-at %) 0)))
+        boosts (->> txs (keep #(tx->boost! ctx %)) (sort-by #(or (:settled-at %) 0)))
         high-water (reduce max 0 (keep tx-settled-at txs))]
     (u/log ::poll :transactions (count txs) :boosts (count boosts) :cursor cursor)
     (loop [state state
