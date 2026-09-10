@@ -248,7 +248,7 @@
 
    The name of the bot as readers meet it, not the name of this repo: a client
    renders this as \"via ...\" under the note. Override with BBN_CLIENT_NAME."
-  "Boostr")
+  "Boostr_Bot")
 
 (def max-tag-item-length
   "The longest one item of one tag may be. Mirrors boostmebitch's

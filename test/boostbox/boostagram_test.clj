@@ -115,7 +115,7 @@
             ["imeta" "url https://tardbox.com/og/boost.png?sats=2100"
              "m image/png" "dim 1200x300"]
             ["amount" "2100000"]
-            ["client" "Boostr"]
+            ["client" "Boostr_Bot"]
             ["app" "Fountain"]
             ["t" "boostagram"]
             ["t" "value4value"]]
@@ -129,12 +129,12 @@
   (testing "Alby's parsed struct drops every GUID, so a boost through it is
             publishable but untagged -- the constants and the paying app are
             all that is left to say"
-    (is (= [["client" "Boostr"] ["app" "Fountain"]
+    (is (= [["client" "Boostr_Bot"] ["app" "Fountain"]
             ["t" "boostagram"] ["t" "value4value"]]
            (bg/->nip73-tags (bg/normalize alby-parsed) {}))))
 
   (testing "a malformed feed guid is dropped rather than emitted"
-    (is (= [["client" "Boostr"] ["t" "boostagram"] ["t" "value4value"]]
+    (is (= [["client" "Boostr_Bot"] ["t" "boostagram"] ["t" "value4value"]]
            (bg/->nip73-tags (bg/normalize (assoc fountain-tlv
                                                  "guid" "920666"
                                                  "episode_guid" ""
@@ -155,7 +155,7 @@
             Putting the paying app in `client` would have every reader's client
             render this bot's note as 'via Fountain'."
     (let [tags (bg/->nip73-tags (bg/normalize fountain-tlv) {})]
-      (is (= ["client" "Boostr"] (first (filter #(= "client" (first %)) tags))))
+      (is (= ["client" "Boostr_Bot"] (first (filter #(= "client" (first %)) tags))))
       (is (= ["app" "Fountain"] (first (filter #(= "app" (first %)) tags)))))
     (testing "and the client name is the operator's to set"
       (is (= ["client" "MyBox"]
