@@ -116,7 +116,8 @@
              "m image/png" "dim 1200x300"]
             ["amount" "2100000"]
             ["client" "Boostr_Bot"]
-            ["app" "Fountain"]
+            ["app" "Fountain" "1.1.9"]
+            ["recipient" "TardBox"]
             ["t" "boostagram"]
             ["t" "value4value"]]
            (bg/->nip73-tags (bg/normalize fountain-tlv)
@@ -134,7 +135,8 @@
            (bg/->nip73-tags (bg/normalize alby-parsed) {}))))
 
   (testing "a malformed feed guid is dropped rather than emitted"
-    (is (= [["client" "Boostr_Bot"] ["t" "boostagram"] ["t" "value4value"]]
+    (is (= [["client" "Boostr_Bot"] ["recipient" "TardBox"]
+            ["t" "boostagram"] ["t" "value4value"]]
            (bg/->nip73-tags (bg/normalize (assoc fountain-tlv
                                                  "guid" "920666"
                                                  "episode_guid" ""
@@ -151,12 +153,66 @@
       (is (some #(= ["i" "podcast:item:guid:https://example.com/ep/42?a=B"] %) tags))
       (is (some #(= ["k" "podcast:item:guid"] %) tags))))
 
+  (testing "a remote item boost tags the remote feed and episode too: the
+            payment settles on the host feed's splits, but the thing boosted
+            lives elsewhere and its own audience must be able to find this"
+    (let [tags (bg/->nip73-tags
+                (bg/normalize (assoc fountain-tlv
+                                     "remote_feed_guid" "8A9FBFA9-6C4C-5C3F-89A6-C1B4E1A0F9F1"
+                                     "remote_item_guid" "https://example.com/track/7"))
+                {})]
+      (is (some #(= ["i" "podcast:guid:8a9fbfa9-6c4c-5c3f-89a6-c1b4e1a0f9f1"] %) tags)
+          "a remote feed guid is a UUID, so it is lower-cased like any other")
+      (is (some #(= ["i" "podcast:item:guid:https://example.com/track/7"] %) tags)
+          "a remote item guid is an arbitrary string, taken verbatim")
+      (testing "and k names each kind once, not once per id"
+        (is (= 1 (count (filter #(= ["k" "podcast:guid"] %) tags))))
+        (is (= 1 (count (filter #(= ["k" "podcast:item:guid"] %) tags)))))))
+
+  (testing "an app that repeats the host guid in the remote field does not get
+            the same i tag twice"
+    (let [tags (bg/->nip73-tags
+                (bg/normalize (assoc fountain-tlv
+                                     "remote_feed_guid" (get fountain-tlv "guid")))
+                {})]
+      (is (= 1 (count (filter #(and (= "i" (first %))
+                                    (str/starts-with? (second %) "podcast:guid:"))
+                              tags))))))
+
+  (testing "a malformed remote guid is dropped, exactly as a local one is: a
+            bad i tag pollutes the global NIP-73 index forever"
+    (let [tags (bg/->nip73-tags
+                (bg/normalize (assoc fountain-tlv "remote_feed_guid" "not-a-uuid"))
+                {})]
+      (is (= 1 (count (filter #(and (= "i" (first %))
+                                    (str/starts-with? (second %) "podcast:guid:"))
+                              tags))))))
+
+  (testing "a remote feed guid still tags even when the host feed sent none,
+            and brings its own k with it"
+    (let [tags (bg/->nip73-tags
+                (bg/normalize (assoc fountain-tlv
+                                     "guid" nil
+                                     "remote_feed_guid" "8a9fbfa9-6c4c-5c3f-89a6-c1b4e1a0f9f1"))
+                {})]
+      (is (some #(= ["i" "podcast:guid:8a9fbfa9-6c4c-5c3f-89a6-c1b4e1a0f9f1"] %) tags))
+      (is (= 1 (count (filter #(= ["k" "podcast:guid"] %) tags))))))
+
+  (testing "the app version rides along as a third item, and its absence
+            leaves a plain two-item app tag"
+    (is (= ["app" "Fountain" "1.1.9"]
+           (first (filter #(= "app" (first %))
+                          (bg/->nip73-tags (bg/normalize fountain-tlv) {})))))
+    (is (= ["app" "Fountain"]
+           (first (filter #(= "app" (first %))
+                          (bg/->nip73-tags (bg/normalize alby-parsed) {}))))))
+
   (testing "client vs app: `client` names who SIGNED the note, `app` who PAID.
             Putting the paying app in `client` would have every reader's client
             render this bot's note as 'via Fountain'."
     (let [tags (bg/->nip73-tags (bg/normalize fountain-tlv) {})]
       (is (= ["client" "Boostr_Bot"] (first (filter #(= "client" (first %)) tags))))
-      (is (= ["app" "Fountain"] (first (filter #(= "app" (first %)) tags)))))
+      (is (= ["app" "Fountain" "1.1.9"] (first (filter #(= "app" (first %)) tags)))))
     (testing "and the client name is the operator's to set"
       (is (= ["client" "MyBox"]
              (first (filter #(= "client" (first %))

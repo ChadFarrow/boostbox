@@ -261,12 +261,56 @@
    bytes arrive. Must agree with boostbox.banner."
   "1200x300")
 
+(def ^:private nip73-id-fields
+  "The boostagram fields that become NIP-73 external content ids, in emission
+   order, each with the validator its kind demands.
+
+   The remote pair carries a `<podcast:remoteItem>` boost: a listener boosting
+   music played inside someone else's show. The payment settles against the
+   host feed's splits, but the thing being boosted lives in another feed, and
+   without these tags that reference is lost -- the remote feed's own audience
+   can never find the boost by querying for it.
+
+   A remote guid is validated exactly as its local counterpart is, and for the
+   same reason: `podcast:guid` is a UUID and is lower-cased, an item guid is an
+   arbitrary string and is taken verbatim. See valid-feed-guid?."
+  [{:field :feed-guid        :kind "podcast:guid"      :valid? valid-feed-guid?
+    :norm (fn [v] (str/lower-case (str/trim v)))}
+   {:field :item-guid        :kind "podcast:item:guid" :valid? valid-item-guid?
+    :norm str/trim}
+   {:field :remote-feed-guid :kind "podcast:guid"      :valid? valid-feed-guid?
+    :norm (fn [v] (str/lower-case (str/trim v)))}
+   {:field :remote-item-guid :kind "podcast:item:guid" :valid? valid-item-guid?
+    :norm str/trim}])
+
+(defn- nip73-id-tags
+  "The `i`/`k` tags for every content id the boostagram names.
+
+   `k` answers \"what kinds of external content does this event reference\",
+   so it is emitted once per kind rather than once per id -- a second identical
+   `k` says nothing the first did not. Ids are de-duplicated because apps that
+   send a remote item routinely repeat the host feed's guid in both fields, and
+   the same `i` tag twice is noise a relay has to store forever."
+  [b]
+  (->> nip73-id-fields
+       (keep (fn [{:keys [field kind valid? norm]}]
+               (let [v (get b field)]
+                 (when (valid? v) [kind (norm v)]))))
+       (distinct)
+       (reduce (fn [[tags seen] [kind v]]
+                 [(cond-> (conj tags ["i" (str kind ":" v)])
+                    (not (contains? seen kind)) (conj ["k" kind]))
+                  (conj seen kind)])
+               [[] #{}])
+       (first)))
+
 (defn ->nip73-tags
   "Every tag on the boost note, in the order boostmebitch emits them.
 
-   Each `i` tag is paired with a `k` tag naming its kind, so clients can query
-   every event for a kind. Tags are emitted only for GUIDs that pass their own
-   validator -- and the two validators differ on purpose, see valid-feed-guid?.
+   The `i`/`k` content ids come from nip73-id-tags, which covers the remote
+   pair as well as the host feed and episode. Tags are emitted only for GUIDs
+   that pass their own validator -- and the validators differ on purpose, see
+   valid-feed-guid?.
 
    Two attribution tags, and they answer different questions. `client` is
    NIP-89: the app that CREATED AND SIGNED this event, which is always this bot
@@ -275,20 +319,8 @@
    app that SENT the boost, the convention boostmebitch uses on its kind:3369
    receipts. It is payer-written text, so it is a claim, not a fact."
   [b {:keys [boost-url npubs banner-url client-name total-msat]}]
-  (let [feed (:feed-guid b)
-        item (:item-guid b)
-        banner-item (when banner-url (str "url " banner-url))]
-    (cond-> []
-      (valid-feed-guid? feed)
-      (into [["i" (str "podcast:guid:" (str/lower-case (str/trim feed)))]
-             ["k" "podcast:guid"]])
-
-      (valid-item-guid? item)
-      ;; not lower-cased: an item guid is an opaque string and may well be a
-      ;; case-sensitive URL, unlike the feed guid's UUID
-      (into [["i" (str "podcast:item:guid:" (str/trim item))]
-             ["k" "podcast:item:guid"]])
-
+  (let [banner-item (when banner-url (str "url " banner-url))]
+    (cond-> (nip73-id-tags b)
       boost-url
       (conj ["r" boost-url])
 
@@ -311,8 +343,18 @@
       :always
       (conj ["client" (or (not-empty (str client-name)) default-client-name)])
 
+      ;; The version rides along as a third item: a reader looking at element 1
+      ;; still finds the name, and a pass-through service that drops what the
+      ;; sending app told us about itself cannot get it back later.
       (:app-name b)
-      (conj ["app" (:app-name b)])
+      (conj (cond-> ["app" (:app-name b)]
+              (:app-version b) (conj (:app-version b))))
+
+      ;; Which split this note is announcing. Not standard anywhere; it is the
+      ;; recipient the paying app addressed, which on a multi-split boost is
+      ;; the only thing distinguishing one recipient's note from another's.
+      (:recipient-name b)
+      (conj ["recipient" (:recipient-name b)])
 
       :always
       (into [["t" "boostagram"] ["t" "value4value"]]))))
