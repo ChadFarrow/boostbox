@@ -112,6 +112,7 @@
      :message (clean (get* m "message"))
      :sender-name (clean (get* m "sender_name") max-name-length)
      :sender-id (->str (get* m "sender_id"))
+     :sender-npub (->str (get* m "sender_npub"))
      :recipient-name (clean (get* m "name" "recipient_name") max-name-length)
      ;; blip-10 names these "podcast" and "episode", but senders that model
      ;; their payload on BoostBox's own schema (BoostMeBitch, for one) send
@@ -120,7 +121,13 @@
      ;; episode name and the stored boost loses both titles.
      :podcast (clean (get* m "podcast" "feed_title") max-title-length)
      :episode (clean (get* m "episode" "item_title") max-title-length)
-     :url (->str (get* m "url"))
+     ;; blip-10 calls the feed address "url". BoostMeBitch sends it as
+     ;; "boost_link" instead -- a name that means a BoostBox permalink
+     ;; everywhere else in this repo, so read it last and only as a fallback.
+     ;; Nothing here decides it really is a feed: feed-context hands it to
+     ;; safefetch like any other payer-written URL, and a document that is not
+     ;; RSS simply reads as no feed.
+     :url (->str (get* m "url" "boost_link"))
      :feed-id (->str (get* m "feedID" "feedId"))
      :item-id (->str (get* m "itemID" "itemId"))
      ;; blip-10 calls the feed guid "guid" and the episode guid "episode_guid"
@@ -197,6 +204,37 @@
   (when (string? url)
     (last (remove str/blank? (str/split url #"/")))))
 
+;; ~~~~~~~~~~~~~~~~~~~ The booster's own identity ~~~~~~~~~~~~~~~~~~~
+
+(def ^:private hex-pubkey-re #"(?i)^[0-9a-f]{64}$")
+
+(defn sender-npub
+  "The booster's Nostr identity as a canonical npub, or nil.
+
+   Two spellings, because apps disagree. BoostMeBitch sends `sender_npub`
+   outright, and its `sender_id` happens to be the same key in hex -- worth
+   reading, but only when it is exactly a 64-character hex pubkey, because for
+   every other app `sender_id` is an app-internal string (\"abc123\") that
+   means nothing here.
+
+   The value is round-tripped through NIP-19 rather than passed along as text:
+   that both validates it and normalizes whatever casing arrived, so a
+   malformed npub is dropped instead of published.
+
+   Both fields are payer-written, so this is a CLAIM about who paid, never a
+   proof of it -- which is why it becomes a plain `sender` tag and deliberately
+   not a `p`. A `p` tag would put this bot's signed note in the mentions of
+   whatever npub a payer named: a notification the payer chose, the recipient
+   cannot decline, and no one can delete."
+  [b]
+  (letfn [(canonical [^bytes pk] (try (nostr/->npub pk) (catch Exception _ nil)))]
+    (or (when-let [s (some-> (:sender-npub b) str str/trim not-empty)]
+          (try (canonical (nostr/decode-key s "npub")) (catch Exception _ nil)))
+        (when-let [s (some-> (:sender-id b) str str/trim not-empty)]
+          (when (re-matches hex-pubkey-re s)
+            (try (canonical (nostr/hex->bytes (str/lower-case s)))
+                 (catch Exception _ nil)))))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ BoostMetadata payload ~~~~~~~~~~~~~~~~~~~
 
 (defn- iso8601 [epoch-seconds]
@@ -232,6 +270,7 @@
            "app_version" (:app-version b)
            "sender_name" (:sender-name b)
            "sender_id" (:sender-id b)
+           "sender_npub" (sender-npub b)
            "recipient_name" (:recipient-name b)
            "position" (:position b)
            "feed_guid" (:feed-guid b)
@@ -319,7 +358,8 @@
    app that SENT the boost, the convention boostmebitch uses on its kind:3369
    receipts. It is payer-written text, so it is a claim, not a fact."
   [b {:keys [boost-url npubs banner-url client-name total-msat]}]
-  (let [banner-item (when banner-url (str "url " banner-url))]
+  (let [banner-item (when banner-url (str "url " banner-url))
+        sender (sender-npub b)]
     (cond-> (nip73-id-tags b)
       boost-url
       (conj ["r" boost-url])
@@ -355,6 +395,11 @@
       ;; the only thing distinguishing one recipient's note from another's.
       (:recipient-name b)
       (conj ["recipient" (:recipient-name b)])
+
+      ;; Who paid, when the app knew. Not a `p` tag on purpose -- see
+      ;; sender-npub.
+      sender
+      (conj ["sender" sender])
 
       :always
       (into [["t" "boostagram"] ["t" "value4value"]]))))

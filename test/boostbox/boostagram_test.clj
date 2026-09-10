@@ -7,6 +7,12 @@
 ;; A realistic blip-10 payload as a podcast app sends it in TLV 7629169.
 ;; Note `ts` is seconds into the episode and `value_msat` is only this split's
 ;; share -- both are routinely misread.
+
+;; The booster's identity from a real BoostMeBitch boost: sender_npub and
+;; sender_id are the same key, in bech32 and in hex.
+(def bmb-npub "npub177fz5zkm87jdmf0we2nz7mm7uc2e7l64uzqrv6rvdrsg8qkrg7yqx0aaq7")
+(def bmb-hex "f7922a0adb3fa4dda5eecaa62f6f7ee6159f7f55e08036686c68e08382c34788")
+
 (def fountain-tlv
   {"podcast" "Podcasting 2.0"
    "feedID" 920666
@@ -207,6 +213,36 @@
            (first (filter #(= "app" (first %))
                           (bg/->nip73-tags (bg/normalize alby-parsed) {}))))))
 
+  (testing "the booster's own npub rides along as a `sender` tag -- never as a
+            `p`, which would notify whatever stranger a payer named"
+    (let [tags (bg/->nip73-tags
+                (bg/normalize (assoc fountain-tlv "sender_npub" bmb-npub))
+                {})]
+      (is (some #(= ["sender" bmb-npub] %) tags))
+      (is (empty? (filter #(= "p" (first %)) tags))
+          "a p tag here is a notification the recipient cannot decline")))
+
+  (testing "BoostMeBitch's sender_id is the same key in hex, so it is read when
+            no sender_npub arrives"
+    (is (some #(= ["sender" bmb-npub] %)
+              (bg/->nip73-tags
+               (bg/normalize (assoc fountain-tlv "sender_id" bmb-hex "sender_npub" nil))
+               {}))))
+
+  (testing "every other app's sender_id is an app-internal string and must not
+            be mistaken for a pubkey"
+    (let [tags (bg/->nip73-tags (bg/normalize fountain-tlv) {})]
+      (is (= "abc123" (:sender-id (bg/normalize fountain-tlv))))
+      (is (empty? (filter #(= "sender" (first %)) tags)))))
+
+  (testing "a malformed npub is dropped rather than published"
+    (doseq [bad ["npub1notarealkey" "" "   " "nsec1abc" "zzzz"]]
+      (is (empty? (filter #(= "sender" (first %))
+                          (bg/->nip73-tags
+                           (bg/normalize (assoc fountain-tlv "sender_npub" bad))
+                           {})))
+          (str "should drop " (pr-str bad)))))
+
   (testing "client vs app: `client` names who SIGNED the note, `app` who PAID.
             Putting the paying app in `client` would have every reader's client
             render this bot's note as 'via Fountain'."
@@ -259,6 +295,60 @@
     (is (not (bg/valid-item-guid? "   ")))
     (is (not (bg/valid-item-guid? nil)))
     (is (not (bg/valid-item-guid? (apply str (repeat 257 "x")))))))
+
+(deftest feed-url-spellings
+  (testing "blip-10 calls the feed address `url`"
+    (is (= "https://example.com/rss"
+           (:url (bg/normalize {"action" "boost" "url" "https://example.com/rss"})))))
+
+  (testing "BoostMeBitch sends it as `boost_link`, and without reading that the
+            feed is never fetched: no cover art on the banner, no p tags"
+    (is (= "https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53"
+           (:url (bg/normalize
+                  {"action" "boost"
+                   "boost_link" "https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53"})))))
+
+  (testing "`url` wins when an app sends both: boost_link means a BoostBox
+            permalink everywhere else in this repo, so it is read last"
+    (is (= "https://example.com/rss"
+           (:url (bg/normalize {"action" "boost"
+                                "url" "https://example.com/rss"
+                                "boost_link" "https://tardbox.com/boost/01K9"}))))))
+
+(deftest real-boostmebitch-boost
+  (testing "the whole tag set for a boost this bot actually received, taken
+            verbatim from the stored record"
+    (let [b (bg/normalize
+             {"sender_id" bmb-hex
+              "sender_name" "ChadF and 33 others"
+              "app_version" "0.1.0"
+              "app_name" "BoostMeBitch"
+              "group" "06219bb3-546e-4cc7-92a5-215fbe20882b"
+              "remote_feed_guid" "7c6f7875-2b73-491e-b32c-e2c8d6e91d53"
+              "feed_title" "Chad and Reeds Podcast"
+              "sender_npub" bmb-npub
+              "action" "boost"
+              "boost_link" "https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53"
+              "value_msat" 1000
+              "value_msat_total" 100000
+              "recipient_name" "boostr"
+              "feed_guid" "7c6f7875-2b73-491e-b32c-e2c8d6e91d53"})]
+      (is (= [["i" "podcast:guid:7c6f7875-2b73-491e-b32c-e2c8d6e91d53"]
+              ["k" "podcast:guid"]
+              ["amount" "100000"]
+              ["client" "Boostr_Bot"]
+              ["app" "BoostMeBitch" "0.1.0"]
+              ["recipient" "boostr"]
+              ["sender" bmb-npub]
+              ["t" "boostagram"]
+              ["t" "value4value"]]
+             (bg/->nip73-tags b {:total-msat 100000})))
+      (testing "remote_feed_guid repeats feed_guid, and one i tag is emitted"
+        (is (= 1 (count (filter #(= "i" (first %))
+                                (bg/->nip73-tags b {}))))))
+      (testing "and the feed address is now reachable for artwork and p tags"
+        (is (= "https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53"
+               (:url b)))))))
 
 (deftest note-content
   (testing "the whole note, laid out as boostmebitch lays its own out"
