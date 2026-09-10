@@ -611,6 +611,11 @@
    [:app_version {:optional true} [:maybe :string]]
    [:sender_id {:optional true} [:maybe :string]]
    [:sender_name {:optional true} [:maybe :string]]
+   ;; The booster's own Nostr identity, when the sending app knows it. Declared
+   ;; because the map is open and apps were already sending it -- an undeclared
+   ;; field is stored but invisible in the OpenAPI docs, so app authors cannot
+   ;; discover it.
+   [:sender_npub {:optional true} [:maybe :string]]
    [:recipient_name {:optional true} [:maybe :string]]
    [:recipient_address {:optional true} [:maybe :string]]
    [:value_usd {:optional true} [:maybe [:double {:min 0.0}]]]
@@ -623,7 +628,11 @@
    [:publisher_title {:optional true} [:maybe :string]]
    [:remote_feed_guid {:optional true} [:maybe :string]]
    [:remote_item_guid {:optional true} [:maybe :string]]
-   [:remote_publisher_guid {:optional true} [:maybe :string]]])
+   [:remote_publisher_guid {:optional true} [:maybe :string]]
+   ;; The feed this boost came from. blip-10 calls it "url"; BoostMeBitch sends
+   ;; "boost_link". Both are read, "url" first.
+   [:url {:optional true} [:maybe :string]]
+   [:boost_link {:optional true} [:maybe :string]]])
 
 ;; ~~~~~~~~~~~~~~~~~~~ GET View ~~~~~~~~~~~~~~~~~~~
 (defn encode-header [data]
