@@ -485,8 +485,13 @@
                 " " (note-sats total)
                 (when show (str " → " show)))]
           (when episode [(str "📻 " episode)])
+          ;; label and URL on separate lines: a client that pulls the URL out
+          ;; into a preview card would otherwise leave the separator dangling
+          ;; at the end of the label, and one that renders links inline reads
+          ;; the same either way.
           (when app [(str (if (:episode? app) "▶️ Listen on " "🎧 Find it on ")
-                          (:label app) " — " (:url app))])
+                          (:label app))
+                     (:url app)])
           (mapcat (fn [l] ["" l]) links))
          (str/join "\n")
          (str/trimr))))
