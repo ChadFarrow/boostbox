@@ -361,12 +361,26 @@
                 "\u25b6\ufe0f Listen on Fountain\n"
                 "https://fountain.fm/episode/16795090\n"
                 "\n"
-                "https://tardbox.com/boost/01K9\n"
-                "\n"
+                ;; no BoostBox permalink: it stays on the `r` tag, where a
+                ;; client can still find it and a reader is not shown a preview
+                ;; card whose whole content is a boost id
                 "https://tardbox.com/og/boost.png?sats=2100")
            (bg/->note-content (bg/normalize fountain-tlv)
                               {:boost-url "https://tardbox.com/boost/01K9"
                                :banner-url "https://tardbox.com/og/boost.png?sats=2100"}))))
+
+  (testing "the BoostBox permalink stays out of the body and on the `r` tag:
+            a client that wants the full metadata still finds it, and a reader
+            is not shown a preview card whose whole content is a boost id"
+    (let [b (bg/normalize fountain-tlv)
+          opts {:boost-url "https://tardbox.com/boost/01K9"
+                :banner-url "https://tardbox.com/og/boost.png?sats=2100"}
+          body (bg/->note-content b opts)
+          tags (bg/->nip73-tags b opts)]
+      (is (not (str/includes? body "/boost/01K9")))
+      (is (some #(= ["r" "https://tardbox.com/boost/01K9"] %) tags))
+      (testing "and the banner is still the last line, so it still renders"
+        (is (str/ends-with? body "https://tardbox.com/og/boost.png?sats=2100")))))
 
   (testing "a boost with no message, show or sender still reads sensibly"
     (is (= "\u26a1 Boost \u26a1\n\nBoosted 1 sats"

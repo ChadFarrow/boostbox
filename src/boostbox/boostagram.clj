@@ -465,19 +465,26 @@
    The banner URL goes last, on its own, because a Nostr client decides whether
    a bare URL is an image from the text around it.
 
+   The BoostBox permalink is deliberately NOT here. It stays on the `r` tag,
+   where a client that wants the full metadata can still find it, but a reader
+   has no use for it: clients render a bare link as a preview card, and a card
+   whose whole content is a boost id sits under every note saying nothing the
+   note did not already say. The app link above is the one a reader wants --
+   it goes to the episode, not to a record of the payment.
+
    The app line is the one departure from BMB's layout. It points back into the
    app the boost came from -- the episode where the app has a route for one,
    the show otherwise -- so a reader can go listen to the thing that was
    boosted. Its origin comes from boostbox.applinks' own table and never from
    the payment, which is what makes it safe to sign: see that namespace."
-  [b {:keys [boost-url received-msat banner-url]}]
+  [b {:keys [received-msat banner-url]}]
   (let [total (note-total-msat b received-msat)
         show (:podcast b)
         episode (:episode b)
         sender (:sender-name b)
         message (:message b)
         app (al/app-link b)
-        links (->> [boost-url banner-url] (remove str/blank?) (remove nil?))]
+        links (->> [banner-url] (remove str/blank?) (remove nil?))]
     (->> (concat
           ["⚡ Boost ⚡" ""]
           (when message [message ""])
