@@ -20,6 +20,7 @@
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
             [boostbox.safefetch :as sf]
+            [boostbox.podcastindex :as pi]
             [boostbox.feed :as feed]
             [boostbox.relay :as relay]))
 
@@ -74,6 +75,12 @@
      ;; tags. Off is a supported way to run: the note still publishes, without
      ;; either.
      :feed-lookup? (truthy? (bb/get-env "BBN_FEED_LOOKUP" "true"))
+     ;; Optional. Without them the feed address memo is the only way a boost
+     ;; that carries no address finds its feed, which needs another app to have
+     ;; sent one for that show first.
+     :pi-key (bb/get-env "BBN_PI_KEY" nil)
+     :pi-secret (bb/get-env "BBN_PI_SECRET" nil)
+     :pi-timeout-ms (Long/parseLong (bb/get-env "BBN_PI_TIMEOUT_MS" "8000"))
      :feed-timeout-ms (Long/parseLong (bb/get-env "BBN_FEED_TIMEOUT_MS" "8000"))
      :poll-interval-ms (* 1000 (Long/parseLong (bb/get-env "BBN_POLL_INTERVAL_SEC" "60")))
      :min-sats (Long/parseLong (bb/get-env "BBN_MIN_SATS" "0"))
@@ -176,6 +183,31 @@
       (if-let [url (get (get state "feeds" {}) guid)]
         (do (u/log ::feed-address-recalled :feed-guid guid) (assoc b :url url))
         b))))
+
+(defn resolve-feed
+  "Everything we can work out about where this boost's feed lives.
+
+   Three sources, cheapest first: the address the app sent, the address an
+   earlier boost taught us, and the Podcast Index. The memo alone leaves a show
+   that is only ever boosted from an app sending no address permanently without
+   cover art or `p` tags, because nothing else maps a guid to an address; the
+   API closes that on the very first boost. An address the API returns is
+   memoized like any other, so a show is looked up once rather than per boost.
+
+   Returns {:state :boostagram :artwork}. `:artwork` is the API's own cover,
+   used only if the feed read finds none -- the feed is the better source,
+   since it can carry the episode's art rather than the show's."
+  [ctx state b]
+  (let [b' (with-known-feed state b)]
+    (if (or (some-> (:url b') str str/trim not-empty)
+            (not (pi/configured? ctx))
+            (nil? (:feed-guid b)))
+      {:state state :boostagram b' :artwork nil}
+      (if-let [{:keys [url artwork]} (pi/feed-by-guid ctx (:feed-guid b))]
+        (let [b'' (cond-> b' url (assoc :url url))]
+          (u/log ::feed-address-resolved :feed-guid (:feed-guid b) :found-url (some? url))
+          {:state (remember-feed state b'') :boostagram b'' :artwork artwork})
+        {:state state :boostagram b' :artwork nil}))))
 
 (defn- seen-index [state]
   (into {} (map (juxt #(get % "payment_hash") identity)) (get state "recent" [])))
@@ -330,11 +362,17 @@
   "The signed kind:1 event for a boost.
 
    `received-msat` is passed through because plenty of boostagrams omit
-   value_msat_total; without it the note headline reads \"0 sats\"."
-  [{:keys [seckey client-name] :as ctx} boostagram {:keys [boost-url received-msat]}]
+   value_msat_total; without it the note headline reads \"0 sats\".
+
+   `fallback-art` is the Podcast Index's cover for the show, used only when the
+   feed read finds none. The feed is preferred because it can carry the art of
+   the episode that was actually boosted; the API only knows the show."
+  [{:keys [seckey client-name] :as ctx} boostagram
+   {:keys [boost-url received-msat fallback-art]}]
   (let [ctxt (feed-context ctx boostagram)
         total (bg/note-total-msat boostagram received-msat)
-        banner (bg/banner-url (:boostbox-url ctx) boostagram (:art ctxt) total)]
+        banner (bg/banner-url (:boostbox-url ctx) boostagram
+                              (or (:art ctxt) fallback-art) total)]
     (nostr/sign-event seckey
                       {:kind 1
                        :content (bg/->note-content boostagram
@@ -393,9 +431,11 @@
    BoostBox record for the same payment."
   [{:keys [relays dry-run? min-sats] :as ctx} state
    {:keys [payment-hash boostagram received-msat settled-at boost-url boost-id]}]
-  (let [;; one app's boost teaches the next one where this feed lives
+  (let [;; one app's boost teaches the next one where this feed lives, and the
+        ;; Podcast Index answers for a show no app has told us about
         state (remember-feed state boostagram)
-        boostagram (with-known-feed state boostagram)
+        {state :state boostagram :boostagram pi-artwork :artwork}
+        (resolve-feed ctx state boostagram)
         seen (get (seen-index state) payment-hash)
         ;; value_msat_total is frequently absent -- Alby's parsed struct drops
         ;; it, and single-recipient splits never set it. Falling back to what
@@ -435,7 +475,8 @@
                                    "url" (:url stored)})
             _ (save-state! (:state-io ctx) state)
             event (build-note ctx boostagram {:boost-url (:url stored)
-                                              :received-msat received-msat})]
+                                              :received-msat received-msat
+                                              :fallback-art pi-artwork})]
         (if dry-run?
           (do (u/log ::dry-run-note :boost-url (:url stored)
                      :event (nostr/event->json event))
