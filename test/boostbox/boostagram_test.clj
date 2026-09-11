@@ -358,6 +358,7 @@
                 "\n"
                 "Alice boosted 2100 sats \u2192 Podcasting 2.0\n"
                 "\ud83d\udcfb Episode 158: The Big One\n"
+                "\u25b6\ufe0f Listen on Fountain \u2014 https://fountain.fm/episode/16795090\n"
                 "\n"
                 "https://tardbox.com/boost/01K9\n"
                 "\n"

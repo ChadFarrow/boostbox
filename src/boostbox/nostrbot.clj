@@ -141,6 +141,42 @@
 (defn- save-state! [{:keys [write]} state]
   (write state))
 
+(def max-feeds
+  "How many feed addresses the memo below keeps. The whole state file is
+   rewritten on every boost, so this is a bound on write size, not on memory."
+  500)
+
+(defn- remember-feed
+  "Memoize feed guid -> feed address whenever a boost carries both.
+
+   Apps disagree about what they send: BoostMeBitch sends the feed address,
+   Castamatic sends only the guid. So one app's boost supplies the address that
+   lets a *different* app's boost find cover art and the feed's npubs -- which
+   is the only way a show boosted solely from an app that sends no address ever
+   gets either, short of a directory lookup.
+
+   Cleared rather than evicted when full, exactly as feed-cache is: this is an
+   optimization, and rebuilding it costs one boost per feed."
+  [state b]
+  (let [guid (some-> (:feed-guid b) str str/trim not-empty str/lower-case)
+        url (some-> (:url b) str str/trim not-empty)]
+    (if (and guid url (sf/fetchable-url? url))
+      (let [feeds (get state "feeds" {})]
+        (assoc state "feeds"
+               (assoc (if (>= (count feeds) max-feeds) {} feeds) guid url)))
+      state)))
+
+(defn- with-known-feed
+  "Fill in a feed address this boost did not carry from what an earlier one
+   taught us. A boost that brought its own address is left alone."
+  [state b]
+  (let [guid (some-> (:feed-guid b) str str/trim not-empty str/lower-case)]
+    (if (or (some-> (:url b) str str/trim not-empty) (nil? guid))
+      b
+      (if-let [url (get (get state "feeds" {}) guid)]
+        (do (u/log ::feed-address-recalled :feed-guid guid) (assoc b :url url))
+        b))))
+
 (defn- seen-index [state]
   (into {} (map (juxt #(get % "payment_hash") identity)) (get state "recent" [])))
 
@@ -357,7 +393,10 @@
    BoostBox record for the same payment."
   [{:keys [relays dry-run? min-sats] :as ctx} state
    {:keys [payment-hash boostagram received-msat settled-at boost-url boost-id]}]
-  (let [seen (get (seen-index state) payment-hash)
+  (let [;; one app's boost teaches the next one where this feed lives
+        state (remember-feed state boostagram)
+        boostagram (with-known-feed state boostagram)
+        seen (get (seen-index state) payment-hash)
         ;; value_msat_total is frequently absent -- Alby's parsed struct drops
         ;; it, and single-recipient splits never set it. Falling back to what
         ;; actually arrived is what ->boost-payload already does; without the

@@ -361,3 +361,67 @@
         (is (= "From TLV" (-> b :boostagram :podcast)))
         (is (nil? (:boost-url b)) "so it is stored normally, as before")
         (is (zero? @fetched) "no network round trip when the TLV is right there")))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Feed address memo ~~~~~~~~~~~~~~~~~~~
+;;
+;; One app's boost supplies the feed address a different app's boost needs:
+;; BoostMeBitch sends the address, Castamatic sends only the guid.
+
+(def ^:private remember-feed #'bot/remember-feed)
+(def ^:private with-known-feed #'bot/with-known-feed)
+
+(def ^:private podhome "https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53")
+(def ^:private show-guid "7c6f7875-2b73-491e-b32c-e2c8d6e91d53")
+
+(deftest feed-memo-learns-and-recalls
+  (testing "a boost carrying both guid and address teaches the memo"
+    (let [state (remember-feed {} (bg/normalize {"action" "boost"
+                                                 "guid" show-guid
+                                                 "boost_link" podhome}))]
+      (is (= {show-guid podhome} (get state "feeds")))
+
+      (testing "and a later boost with only the guid picks the address up"
+        (let [b (with-known-feed state (bg/normalize {"action" "boost"
+                                                      "app_name" "Castamatic"
+                                                      "guid" show-guid}))]
+          (is (= podhome (:url b)))))
+
+      (testing "a guid the memo has never seen is left alone"
+        (is (nil? (:url (with-known-feed
+                          state
+                          (bg/normalize {"action" "boost"
+                                         "guid" "11111111-2222-3333-4444-555555555555"}))))))
+
+      (testing "a boost that brought its own address keeps it"
+        (is (= "https://other.example/rss"
+               (:url (with-known-feed state
+                       (bg/normalize {"action" "boost"
+                                      "guid" show-guid
+                                      "url" "https://other.example/rss"})))))))))
+
+(deftest feed-memo-refuses-what-safefetch-would
+  (testing "a private or non-https address is never memoized: recalling it
+            later would only hand safefetch something it has to refuse"
+    (doseq [bad ["http://plain.example/rss"
+                 "https://127.0.0.1/rss"
+                 "https://192.168.1.10/rss"
+                 "not-a-url"]]
+      (is (nil? (get (remember-feed {} (bg/normalize {"action" "boost"
+                                                      "guid" show-guid
+                                                      "url" bad}))
+                     "feeds"))
+          (str "should refuse " (pr-str bad)))))
+
+  (testing "a boost with a guid and no address teaches nothing"
+    (is (nil? (get (remember-feed {} (bg/normalize {"action" "boost" "guid" show-guid}))
+                   "feeds")))))
+
+(deftest feed-memo-is-bounded
+  (testing "the state file is rewritten on every boost, so the memo is capped"
+    (let [full (into {} (for [i (range bot/max-feeds)] [(str "guid-" i) "https://x.example/f"]))
+          state (remember-feed {"feeds" full}
+                               (bg/normalize {"action" "boost"
+                                              "guid" show-guid
+                                              "url" podhome}))]
+      (is (= {show-guid podhome} (get state "feeds"))
+          "cleared rather than evicted, exactly as feed-cache is"))))

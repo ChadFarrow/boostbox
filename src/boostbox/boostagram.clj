@@ -6,6 +6,7 @@
    lives in boostbox.nwc, at the edge, which keeps this -- the part with all
    the fiddly field mapping -- unit testable on its own."
   (:require [clojure.string :as str]
+            [boostbox.applinks :as al]
             [boostbox.nostr :as nostr])
   (:import (java.nio.charset StandardCharsets)
            (java.time Instant)))
@@ -462,13 +463,20 @@
    attribution line reads \"Boosted 100 sats\" rather than naming nobody.
 
    The banner URL goes last, on its own, because a Nostr client decides whether
-   a bare URL is an image from the text around it."
+   a bare URL is an image from the text around it.
+
+   The app line is the one departure from BMB's layout. It points back into the
+   app the boost came from -- the episode where the app has a route for one,
+   the show otherwise -- so a reader can go listen to the thing that was
+   boosted. Its origin comes from boostbox.applinks' own table and never from
+   the payment, which is what makes it safe to sign: see that namespace."
   [b {:keys [boost-url received-msat banner-url]}]
   (let [total (note-total-msat b received-msat)
         show (:podcast b)
         episode (:episode b)
         sender (:sender-name b)
         message (:message b)
+        app (al/app-link b)
         links (->> [boost-url banner-url] (remove str/blank?) (remove nil?))]
     (->> (concat
           ["⚡ Boost ⚡" ""]
@@ -477,6 +485,8 @@
                 " " (note-sats total)
                 (when show (str " → " show)))]
           (when episode [(str "📻 " episode)])
+          (when app [(str (if (:episode? app) "▶️ Listen on " "🎧 Find it on ")
+                          (:label app) " — " (:url app))])
           (mapcat (fn [l] ["" l]) links))
          (str/join "\n")
          (str/trimr))))
