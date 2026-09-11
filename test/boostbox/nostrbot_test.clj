@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.boostagram :as bg]
             [boostbox.nostrbot :as bot]
+            [boostbox.podcastindex]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
             [boostbox.relay :as relay]
@@ -425,3 +426,71 @@
                                               "url" podhome}))]
       (is (= {show-guid podhome} (get state "feeds"))
           "cleared rather than evicted, exactly as feed-cache is"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Feed resolution order ~~~~~~~~~~~~~~~~~~~
+
+(def ^:private resolve-feed #'bot/resolve-feed)
+
+(def ^:private pi-creds {:pi-key "K" :pi-secret "S"})
+
+(defn- pi-returns [v]
+  (fn [_cfg _guid] v))
+
+(deftest resolve-feed-prefers-cheaper-sources
+  (testing "an address the app sent is used as-is, with no API call"
+    (with-redefs [boostbox.podcastindex/feed-by-guid
+                  (fn [& _] (throw (AssertionError. "must not call the API")))]
+      (let [b (bg/normalize {"action" "boost" "guid" show-guid "url" podhome})
+            r (resolve-feed pi-creds {} b)]
+        (is (= podhome (:url (:boostagram r))))
+        (is (nil? (:artwork r))))))
+
+  (testing "the memo is consulted before the API"
+    (with-redefs [boostbox.podcastindex/feed-by-guid
+                  (fn [& _] (throw (AssertionError. "must not call the API")))]
+      (let [b (bg/normalize {"action" "boost" "guid" show-guid})
+            r (resolve-feed pi-creds {"feeds" {show-guid podhome}} b)]
+        (is (= podhome (:url (:boostagram r)))))))
+
+  (testing "only when both miss does the API answer -- and what it returns is
+            memoized, so a show is looked up once rather than per boost"
+    (with-redefs [boostbox.podcastindex/feed-by-guid
+                  (pi-returns {:url podhome :artwork "https://cdn.example/a.jpg"})]
+      (let [b (bg/normalize {"action" "boost" "guid" show-guid})
+            r (resolve-feed pi-creds {} b)]
+        (is (= podhome (:url (:boostagram r))))
+        (is (= "https://cdn.example/a.jpg" (:artwork r)))
+        (is (= {show-guid podhome} (get (:state r) "feeds"))
+            "memoized, so the next boost for this show needs no lookup")))))
+
+(deftest resolve-feed-degrades-quietly
+  (testing "with no credentials the API is never called and the memo is the
+            only source -- exactly the behaviour before it existed"
+    (with-redefs [boostbox.podcastindex/feed-by-guid
+                  (fn [& _] (throw (AssertionError. "must not call the API")))]
+      (let [b (bg/normalize {"action" "boost" "guid" show-guid})
+            r (resolve-feed {} {} b)]
+        (is (nil? (:url (:boostagram r))))
+        (is (nil? (:artwork r))))))
+
+  (testing "an API miss leaves the boost exactly as it arrived"
+    (with-redefs [boostbox.podcastindex/feed-by-guid (pi-returns nil)]
+      (let [b (bg/normalize {"action" "boost" "guid" show-guid})
+            r (resolve-feed pi-creds {} b)]
+        (is (nil? (:url (:boostagram r))))
+        (is (nil? (get (:state r) "feeds"))))))
+
+  (testing "a boost with no feed guid has nothing to look up"
+    (with-redefs [boostbox.podcastindex/feed-by-guid
+                  (fn [& _] (throw (AssertionError. "must not call the API")))]
+      (let [r (resolve-feed pi-creds {} (bg/normalize {"action" "boost"}))]
+        (is (nil? (:url (:boostagram r)))))))
+
+  (testing "artwork with no address is still worth having: the API knows the
+            show's cover even when it cannot tell us where the feed lives"
+    (with-redefs [boostbox.podcastindex/feed-by-guid
+                  (pi-returns {:url nil :artwork "https://cdn.example/a.jpg"})]
+      (let [b (bg/normalize {"action" "boost" "guid" show-guid})
+            r (resolve-feed pi-creds {} b)]
+        (is (nil? (:url (:boostagram r))))
+        (is (= "https://cdn.example/a.jpg" (:artwork r)))))))
