@@ -77,6 +77,7 @@ Operator scripts (all read-only against the wallet, all prompt for the NWC strin
 - `scripts/bot-setup.sh` — validate an NWC connection string and mint the bot's Nostr key into a 0600 file, printing only the npub
 - `scripts/nwc-inspect.sh` — dump what the wallet actually reports for recent payments: `description`, TLV types, whether a boostagram can be extracted. The first thing to run when the bot sees payments but publishes nothing
 - `scripts/bot-local.sh` — run the bot locally in dry-run with backfill, against the same wallet as the deployed one. Its cursor goes to a temp dir, so the deployed bot's state is untouched
+- `scripts/pi-check.sh` — check a Podcast Index key against one feed guid before setting it on the deployed bot: resolves the guid, then reads the feed behind it and reports the cover and npubs the notes would actually get
 
 ### Key Patterns
 
