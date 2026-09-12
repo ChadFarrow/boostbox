@@ -140,3 +140,82 @@
         ms (- (System/currentTimeMillis) t0)]
     (is (= "https://cdn/100.png" (:art r)))
     (is (< ms 5000) (str "5000 items took " ms " ms"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Fediverse ~~~~~~~~~~~~~~~~~~~
+
+(deftest fediverse-profiles-are-rebuilt-never-echoed
+  (testing "the three spellings a feed uses, all normalised to one form"
+    (doseq [[raw expected]
+            {"@pc20@podcastindex.social" "https://podcastindex.social/@pc20"
+             "pc20@podcastindex.social" "https://podcastindex.social/@pc20"
+             "https://podcastindex.social/@pc20" "https://podcastindex.social/@pc20"
+             "https://podcastindex.social/users/pc20" "https://podcastindex.social/@pc20"
+             ;; a socialInteract URI names a post; the account that wrote it is
+             ;; what a boost credits
+             "https://podcastindex.social/@pc20/113456789" "https://podcastindex.social/@pc20"
+             "  @pc20@PodcastIndex.Social  " "https://podcastindex.social/@pc20"}]
+      (is (= expected (feed/fediverse-profile raw)) (pr-str raw))))
+  (testing "a feed is reached by a URL whoever paid us chose, so nothing out of
+            one is printed verbatim -- the host and username are shape-checked
+            and a fresh URL is built from the two"
+    (doseq [raw ["http://podcastindex.social/@pc20"     ; not https
+                 "javascript:alert(1)"
+                 "https://user:pw@evil.test/@a"         ; credentials in the host
+                 "https://localhost/@a"                 ; no dot
+                 "https://evil.test/@a?x=<script>"      ; query dropped, not echoed
+                 "https://evil.test/not-a-profile"
+                 "https://evil.test/@"                  ; no username
+                 "@@double@example.social"
+                 "@waytoolongausernamethatnoinstanceallows@example.social"
+                 "" "   " nil]]
+      (let [got (feed/fediverse-profile raw)]
+        (is (or (nil? got) (= "https://evil.test/@a" got)) (pr-str raw)))))
+  (testing "a query string cannot ride along into the post"
+    (is (= "https://evil.test/@a" (feed/fediverse-profile "https://evil.test/@a?x=<script>")))))
+
+(deftest fediverse-is-read-from-the-feed-only
+  (testing "podcast:txt, in any of the three spellings nobody standardised"
+    (doseq [purpose ["fediverse" "mastodon" "activitypub" "FEDIVERSE"]]
+      (is (= "https://example.social/@show"
+             (feed/feed-fediverse
+              (str "<rss><podcast:txt purpose=\"" purpose "\">@show@example.social"
+                   "</podcast:txt></rss>"))))))
+  (testing "podcast:socialInteract is the fallback, and accountUrl beats uri"
+    (is (= "https://example.social/@show"
+           (feed/feed-fediverse
+            (str "<rss><podcast:socialInteract protocol=\"activitypub\""
+                 " accountUrl=\"https://example.social/@show\""
+                 " uri=\"https://example.social/@other/1\" /></rss>")))))
+  (testing "podcast:txt wins: it is a podcaster naming their account, where
+            socialInteract names one episode's discussion"
+    (is (= "https://example.social/@show"
+           (feed/feed-fediverse
+            (str "<rss><podcast:socialInteract protocol=\"activitypub\""
+                 " uri=\"https://example.social/@discussion/1\" />"
+                 "<podcast:txt purpose=\"fediverse\">@show@example.social</podcast:txt>"
+                 "</rss>")))))
+  (testing "a decoy attribute is not read as the real one -- \\bprotocol matches
+            inside x-protocol"
+    (is (nil? (feed/feed-fediverse
+               (str "<rss><podcast:socialInteract x-protocol=\"activitypub\""
+                    " uri=\"https://evil.test/@bad\" /></rss>")))))
+  (testing "a commented-out account does not outlive the person who left"
+    (is (nil? (:fediverse
+               (feed/read-feed
+                (str "<rss><channel><!--<podcast:txt purpose=\"fediverse\">"
+                     "@old@example.social</podcast:txt>-->"
+                     "<itunes:image href=\"https://cdn/a.png\"/></channel></rss>")
+                nil)))))
+  (testing "read-feed carries it alongside the npubs and the art"
+    (let [r (feed/read-feed
+             (str "<rss><channel>"
+                  "<podcast:txt purpose=\"fediverse\">@show@example.social</podcast:txt>"
+                  "<itunes:image href=\"https://cdn/a.png\"/></channel></rss>")
+             nil)]
+      (is (= "https://example.social/@show" (:fediverse r)))
+      (is (= "https://cdn/a.png" (:art r)))))
+  (testing "a feed declaring only an account still reads"
+    (is (= "https://example.social/@show"
+           (:fediverse (feed/read-feed
+                        "<rss><podcast:txt purpose=\"fediverse\">@show@example.social</podcast:txt></rss>"
+                        nil))))))

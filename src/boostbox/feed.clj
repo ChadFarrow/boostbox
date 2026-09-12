@@ -1,6 +1,7 @@
 (ns boostbox.feed
-  "The two things a boost note needs out of an RSS feed and nothing else: the
-   npubs the feed declares for its people, and a cover image.
+  "The three things a boost announcement needs out of an RSS feed and nothing
+   else: the npubs the feed declares for its people, a fediverse account for
+   the same reason, and a cover image.
 
    Modelled on boostmebitch's lib/feed-xml.ts so the two apps agree about what
    a feed says. Two rules carry over from there, and both are load-bearing:
@@ -171,6 +172,17 @@
 
 ;; ~~~~~~~~~~~~~~~~~~~ npubs ~~~~~~~~~~~~~~~~~~~
 
+(defn- txt-blocks
+  "The `<podcast:txt>` blocks, found once.
+
+   Both readers below want these, and find-tags is EAGER -- it walks every open
+   tag in the document and builds an entry for each before anything downstream
+   takes its first few. So calling it twice doubles the cost of exactly the
+   document `the-scan-is-linear` pins, and the second caller is the one that
+   pushes it over the limit. read-feed finds them once and hands them to both."
+  [^String xml]
+  (take max-npub-tags-scanned (find-blocks xml "podcast:txt")))
+
 (def ^:private nostr-txt-purposes
   "Two spellings in the wild: Podhome writes purpose=\"npub\", others write
    \"nostr\". Accepting both is safe because the value still has to decode as a
@@ -196,24 +208,108 @@
    `<podcast:txt>` before `<podcast:person>` because the cap truncates, so the
    order is data: the show's own npub should survive a feed that lists a dozen
    guests."
-  [^String xml]
-  (let [txt (for [{:keys [attrs inner]} (take max-npub-tags-scanned
-                                              (find-blocks xml "podcast:txt"))
-                  :let [purpose (some-> (read-attr attrs "purpose") str/lower-case)]
-                  :when (contains? nostr-txt-purposes purpose)]
-              (decode-npub (decode-xml-text inner)))
-        person (for [{:keys [attrs]} (take max-npub-tags-scanned
-                                           (find-tags xml "podcast:person"))]
-                 (decode-npub (read-attr attrs "npub")))]
-    (->> (concat txt person)
-         (remove nil?)
-         (reduce (fn [acc n]
-                   (if (some #(= (:pubkey %) (:pubkey n)) acc)
-                     acc
-                     (conj acc n)))
-                 [])
-         (take max-feed-npubs)
-         vec)))
+  ([^String xml] (feed-npubs xml (txt-blocks xml)))
+  ([^String xml txts]
+   (let [txt (for [{:keys [attrs inner]} txts
+                   :let [purpose (some-> (read-attr attrs "purpose") str/lower-case)]
+                   :when (contains? nostr-txt-purposes purpose)]
+               (decode-npub (decode-xml-text inner)))
+         person (for [{:keys [attrs]} (take max-npub-tags-scanned
+                                            (find-tags xml "podcast:person"))]
+                  (decode-npub (read-attr attrs "npub")))]
+     (->> (concat txt person)
+          (remove nil?)
+          (reduce (fn [acc n]
+                    (if (some #(= (:pubkey %) (:pubkey n)) acc)
+                      acc
+                      (conj acc n)))
+                  [])
+          (take max-feed-npubs)
+          vec))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Fediverse ~~~~~~~~~~~~~~~~~~~
+;;
+;; The counterpart of the npubs above, for the other network the bot posts to.
+;; Same rule, and it matters more here: an account is credited only because a
+;; podcaster named it in their own RSS, and what comes back is emitted as a
+;; plain link -- never as an @mention. A mention would let whoever paid decide
+;; whose notifications this bot's posts land in, which is the attack the
+;; sender-not-p rule exists to stop, with an instance suspension on the end.
+
+(def ^:private fediverse-txt-purposes
+  "Three spellings, for the same reason nostr has two: nobody has standardised
+   one, and the value still has to survive the shape check below."
+  #{"fediverse" "mastodon" "activitypub"})
+
+(def ^:private fediverse-host-re
+  ;; A hostname, lowercased, with at least one dot. No userinfo, no port, no
+  ;; credentials -- none of which belongs in a profile address, and all of
+  ;; which are ways to make a link read as one host and resolve to another.
+  #"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
+
+(def ^:private fediverse-user-re
+  ;; Mastodon usernames are [A-Za-z0-9_], 30 characters at most.
+  #"^[A-Za-z0-9_]{1,30}$")
+
+(defn fediverse-profile
+  "A canonical `https://host/@user` profile URL, or nil.
+
+   Accepts the three spellings a feed uses in practice -- `@user@host`,
+   `https://host/@user`, `https://host/users/user` -- with anything after the
+   username ignored, so a `<podcast:socialInteract>` URI pointing at a specific
+   post still yields the account that wrote it.
+
+   **The returned string is built here, never echoed.** A feed is reached by a
+   URL whoever paid us chose, so its contents are only as trustworthy as that
+   payer; passing a URL out of one verbatim would put an arbitrary link under
+   the bot's identity, which is the same reason boostbox.boostagram never
+   renders a feed address. Instead the host and the username are each checked
+   against a shape above and a fresh URL is assembled from the two. An attacker
+   can still name their own host -- unavoidable in any feature that links a
+   podcaster's account -- but they cannot choose the scheme, the path, or
+   anything else about what gets printed."
+  [raw]
+  (let [v (some-> raw str str/trim not-empty)]
+    (when (and v (<= (count v) max-url-length))
+      (let [[user host]
+            (or (when-let [[_ u h] (re-matches #"(?i)^@?([A-Za-z0-9_]{1,30})@([^@/\s]+)$" v)]
+                  [u h])
+                (when-let [[_ h u] (re-matches
+                                    #"(?i)^https://([^/@\s:]+)/(?:@|users/)([A-Za-z0-9_]{1,30})(?:[/?#].*)?$" v)]
+                  [u h]))]
+        (when (and user host)
+          (let [host (str/lower-case host)]
+            (when (and (re-matches fediverse-host-re host)
+                       (re-matches fediverse-user-re user)
+                       (<= (count host) 253))
+              (str "https://" host "/@" user))))))))
+
+(defn feed-fediverse
+  "The one fediverse account the feed declares, or nil.
+
+   `<podcast:txt>` before `<podcast:socialInteract>`: the first is a podcaster
+   naming their account, the second names where one episode's discussion lives,
+   and only the former is certainly the show's own. One is returned because a
+   post credits the show, not its guest list."
+  ([^String xml] (feed-fediverse xml (txt-blocks xml)))
+  ([^String xml txts]
+   (or (first
+        (for [{:keys [attrs inner]} txts
+              :let [purpose (some-> (read-attr attrs "purpose") str/lower-case)]
+              :when (contains? fediverse-txt-purposes purpose)
+              :let [profile (fediverse-profile (decode-xml-text inner))]
+              :when profile]
+          profile))
+       (first
+        (for [{:keys [attrs]} (take max-npub-tags-scanned
+                                    (find-tags xml "podcast:socialInteract"))
+              :let [protocol (some-> (read-attr attrs "protocol") str/lower-case)]
+              :when (contains? fediverse-txt-purposes protocol)
+              :let [profile (some fediverse-profile
+                                  [(read-attr attrs "accountUrl")
+                                   (read-attr attrs "uri")])]
+              :when profile]
+          profile)))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Artwork ~~~~~~~~~~~~~~~~~~~
 
@@ -270,14 +366,17 @@
 ;; ~~~~~~~~~~~~~~~~~~~ Entry point ~~~~~~~~~~~~~~~~~~~
 
 (defn read-feed
-  "{:npubs :art} for one feed document. Returns nil for anything unusable, so
-   a caller has one thing to test rather than several."
+  "{:npubs :art :fediverse} for one feed document. Returns nil for anything
+   unusable, so a caller has one thing to test rather than several."
   [^String xml item-guid]
   (try
     (when-not (str/blank? xml)
       (let [clean (strip-comments xml)
-            npubs (feed-npubs clean)
-            art (feed-art clean item-guid)]
-        (when (or (seq npubs) art)
-          {:npubs npubs :art art})))
+            ;; found once, read twice -- see txt-blocks
+            txts (txt-blocks clean)
+            npubs (feed-npubs clean txts)
+            art (feed-art clean item-guid)
+            fediverse (feed-fediverse clean txts)]
+        (when (or (seq npubs) art fediverse)
+          {:npubs npubs :art art :fediverse fediverse})))
     (catch Exception _ nil)))
