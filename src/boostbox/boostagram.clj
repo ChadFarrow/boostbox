@@ -431,6 +431,34 @@
   [b received-msat]
   (or (:value-msat-total b) received-msat (:value-msat b)))
 
+(def banner-param-order
+  "The order the query string is written in.
+
+   Fixed, and not merely the map's iteration order, because the URL itself is
+   the contract: two notes describing the same boost must carry byte-identical
+   picture URLs, or a client caches one and refetches the other."
+  [:art :title :ep :sats])
+
+(defn banner-params
+  "The picture's parameters, under the names boostbox.banner reads them by.
+
+   One value, two consumers. banner-url below renders it into the URL a note
+   carries; the bot hands the same map straight to boostbox.banner/banner-png
+   to draw those exact bytes for a Mastodon attachment, which is why the keys
+   are banner's query-parameter names rather than this namespace's field names.
+   Naming them once is what keeps the URL on a note and the picture posted
+   beside it from describing different boosts.
+
+   The names are boostmebitch's and they are a PERMANENT PUBLIC CONTRACT -- see
+   banner-url directly below."
+  [b art total-msat]
+  (let [sats (quot (long (or total-msat 0)) 1000)]
+    (cond-> {}
+      art (assoc :art art)
+      (:podcast b) (assoc :title (:podcast b))
+      (:episode b) (assoc :ep (:episode b))
+      (pos? sats) (assoc :sats sats))))
+
 (defn banner-url
   "The picture the note carries: the boost banner on the BoostBox web app.
 
@@ -445,14 +473,13 @@
   [base-url b art total-msat]
   (when-not (str/blank? (str base-url))
     (let [enc #(java.net.URLEncoder/encode (str %) "UTF-8")
-          sats (quot (long (or total-msat 0)) 1000)
-          params (cond-> []
-                   art (conj (str "art=" (enc art)))
-                   (:podcast b) (conj (str "title=" (enc (:podcast b))))
-                   (:episode b) (conj (str "ep=" (enc (:episode b))))
-                   (pos? sats) (conj (str "sats=" sats)))]
+          params (banner-params b art total-msat)
+          qs (for [k banner-param-order
+                   :let [v (get params k)]
+                   :when (some? v)]
+               (str (name k) "=" (enc v)))]
       (str (str/replace (str base-url) #"/+$" "") "/og/boost.png"
-           (when (seq params) (str "?" (str/join "&" params)))))))
+           (when (seq qs) (str "?" (str/join "&" qs)))))))
 
 (defn ->note-content
   "The human-readable body of the kind:1 note, laid out as boostmebitch lays
@@ -500,5 +527,154 @@
                           (:label app))
                      (:url app)])
           (mapcat (fn [l] ["" l]) links))
+         (str/join "\n")
+         (str/trimr))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Mastodon ~~~~~~~~~~~~~~~~~~~
+;;
+;; The same boost, said for a different room. The body below is ->note-content's
+;; line for line wherever it can be, because a reader who follows the bot in
+;; both places should see one kind of card -- but three things genuinely differ
+;; and none of them is cosmetic:
+;;
+;; 1. A status has a hard character limit and a note does not.
+;; 2. A Mastodon reader cannot resolve an npub, so nostr identifiers are not
+;;    carried over as text that would read as line noise.
+;; 3. Nostr's tags are a separate field that costs a reader nothing. Mastodon
+;;    has no such field, so anything worth keeping has to earn its place in the
+;;    body or be dropped.
+
+(def mastodon-hashtags
+  "Discovery, in the only place Mastodon offers it.
+
+   These are ->nip73-tags' two `t` tags, moved into the body because a status
+   has nowhere else to put them. Keeping the same two words means one boost is
+   findable under the same search on either network."
+  "#boostagram #value4value")
+
+(def default-mastodon-max-chars
+  "Mastodon's stock status limit.
+
+   Only the floor to assume when nobody has said otherwise: instances routinely
+   raise it, and scripts/mastodon-check.sh reports what the configured one
+   actually allows. Assuming too little costs a few truncated characters;
+   assuming too much means the server rejects the post outright."
+  500)
+
+(defn- truncate-chars
+  "Cut a string to `n` characters, marking the cut with an ellipsis.
+
+   The trailing-surrogate check is not paranoia: emoji are ordinary in a boost
+   message, they occupy two chars each, and a cut landing between the halves
+   leaves a lone surrogate that renders as a replacement box and is not valid
+   UTF-8 on the wire."
+  [^String s ^long n]
+  (if (<= (count s) n)
+    s
+    (let [end (max 0 (dec n))
+          end (if (and (pos? end) (Character/isHighSurrogate (.charAt s (dec end))))
+                (dec end)
+                end)]
+      (str (str/trimr (subs s 0 end)) "…"))))
+
+(defn- defang
+  "Stop payer-written text from addressing anyone, or going anywhere.
+
+   Mastodon parses the body of a status. `@user@host` in it becomes a real
+   mention that lands in that account's notifications, and `#word` files the
+   post under that hashtag. Both would be chosen by whoever paid, on a post
+   this bot published under its own name -- which is exactly the attack the
+   sender-tag-not-p-tag rule exists to stop on the other network, and on this
+   one it is also the fastest way to have the account suspended: a boost
+   costing one sat could mention a stranger repeatedly, or stuff the bot's post
+   into thirty unrelated public timelines.
+
+   A zero-width space after the sigil stops the parser matching without
+   removing anything: a message saying \"@dave\" still reads \"@dave\". Applied
+   to the payer's fields only -- the post's own two hashtags are ours, and the
+   app label comes from boostbox.applinks' table."
+  [s]
+  (when s
+    (str/replace (str s) #"(?<=[@#])(?=[\p{L}\p{N}_])" "\u200b")))
+
+(defn banner-alt-text
+  "Alt text for the banner attachment.
+
+   Built from the same three facts the picture is drawn from, so it describes
+   what is actually in the image. Mastodon readers expect alt text and screen
+   readers get nothing from the banner without it -- the amount, the show and
+   the episode are the whole content of the picture."
+  [b total-msat]
+  (let [show (:podcast b)
+        episode (:episode b)]
+    (str "Boost banner: " (note-sats total-msat)
+         (when show (str " to " show))
+         (when episode (str " — " episode)))))
+
+(defn ->mastodon-content
+  "The body of the Mastodon status announcing one boost.
+
+   ->note-content's layout, with four deliberate differences:
+
+   - **No banner URL.** The picture is a real media attachment, so the URL
+     would be a second copy of something already on the post, paid for out of
+     the character budget.
+   - **No npub, anywhere.** `sender` on a note is a nostr identifier a Mastodon
+     client cannot resolve; as text it is forty characters of noise.
+   - **A fediverse link, when the feed declared one.** This is the counterpart
+     of a note's `p` tags, and like them the value comes ONLY from the feed --
+     a podcaster naming their own account in their own RSS. It is emitted as a
+     plain URL and never as an `@mention`: a mention would put this bot's posts
+     in someone's notifications on the say-so of whoever paid, which is the
+     same attack the `sender`-not-`p` rule exists to stop, with an instance
+     suspension on the end of it.
+   - **A hard length cap.** The payer's message is the only part that gives
+     way; the attribution, the show, the app link and the hashtags are what the
+     post is for.
+
+   Every payer-written field goes through `defang` first, so nothing in a boost
+   can turn into a mention or a hashtag on a post this bot signs its own name
+   to. See that function -- it is the Mastodon half of the rule that keeps a
+   payer's npub off a note as a `p` tag.
+
+   The character budget is counted conservatively. Java counts an astral
+   character as two where Mastodon counts one, and Mastodon counts any URL as
+   23 characters however long it is, so this always measures the post as at
+   least as long as the server will -- erring towards a slightly short message
+   rather than a rejected post.
+
+   The BoostBox permalink is left out for the same reason ->note-content leaves
+   it out: a client renders a bare link as a preview card, and a card whose
+   whole content is a boost id says nothing the post has not already said."
+  [b {:keys [received-msat fediverse max-chars]}]
+  (let [total (note-total-msat b received-msat)
+        limit (long (or max-chars default-mastodon-max-chars))
+        ;; every one of these four is written by whoever paid -- see defang
+        show (defang (:podcast b))
+        episode (defang (:episode b))
+        sender (defang (:sender-name b))
+        app (al/app-link b)
+        profile (some-> fediverse str str/trim not-empty)
+        head "⚡ Boost ⚡"
+        tail (->> (concat
+                   [(str (if sender (str sender " boosted") "Boosted")
+                         " " (note-sats total)
+                         (when show (str " → " show)))]
+                   (when episode [(str "📻 " episode)])
+                   (when app [(str (if (:episode? app) "▶️ Listen on " "🎧 Find it on ")
+                                   (:label app))
+                              (:url app)])
+                   (when profile ["" profile])
+                   ["" mastodon-hashtags])
+                  (str/join "\n"))
+        ;; What the post costs with no message at all: the header, the blank
+        ;; line under it, everything below, and the blank line a message would
+        ;; add between the two.
+        budget (- limit (count head) 2 (count tail) 2)
+        message (some-> (:message b) defang str/trim not-empty)
+        message (when (and message (pos? budget)) (truncate-chars message budget))]
+    (->> (concat [head ""]
+                 (when message [message ""])
+                 [tail])
          (str/join "\n")
          (str/trimr))))

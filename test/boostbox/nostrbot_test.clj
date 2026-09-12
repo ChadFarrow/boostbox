@@ -1,11 +1,14 @@
 (ns boostbox.nostrbot-test
   (:require [clojure.test :refer [deftest testing is]]
+            [clojure.string :as str]
             [boostbox.boostagram :as bg]
             [boostbox.nostrbot :as bot]
             [boostbox.podcastindex]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
             [boostbox.relay :as relay]
+            [boostbox.mastodon :as mastodon]
+            [boostbox.banner :as banner]
             [jsonista.core :as json]))
 
 (def seckey (nostr/hex->bytes (apply str (repeat 64 "9"))))
@@ -494,3 +497,151 @@
             r (resolve-feed pi-creds {} b)]
         (is (nil? (:url (:boostagram r))))
         (is (= "https://cdn.example/a.jpg" (:artwork r)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Mastodon ~~~~~~~~~~~~~~~~~~~
+
+(defn- masto-ctx [a & {:as overrides}]
+  (ctx a (merge {:mastodon-url "https://example.social"
+                 :mastodon-token "tok"
+                 :mastodon-visibility "public"
+                 :bb-cfg {:banner-wordmark "Boostr"}}
+                overrides)))
+
+(defn- run-with-mastodon
+  "Poll one boost with both destinations stubbed. Returns
+   {:state :posts :media :notes}."
+  [a ctx-map & {:keys [post-result png]
+                :or {post-result {:ok? true :id "109"}}}]
+  (let [posts (atom []) media (atom []) notes (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! notes conj e) {:ok? true :results []})
+                  banner/banner-png (fn [params _wordmark]
+                                      (swap! media conj params)
+                                      (or png (byte-array 4)))
+                  mastodon/upload-media! (fn [_ _ alt] (str "media-for:" alt))
+                  mastodon/post-status! (fn [_ req] (swap! posts conj req) post-result)]
+      (bot/poll-once! ctx-map ::session))
+    {:state @a :posts @posts :media @media :notes @notes}))
+
+(deftest a-boost-is-announced-on-both-destinations
+  (let [a (atom {"cursor" nil "recent" []})
+        {:keys [state posts notes media]} (run-with-mastodon a (masto-ctx a))]
+    (is (= 1 (count notes)) "the note still goes to the relays")
+    (is (= 1 (count posts)) "and the boost is posted to Mastodon")
+    (testing "the status id is recorded beside the event id"
+      (let [entry (first (get state "recent"))]
+        (is (= "109" (get entry "status_id")))
+        (is (some? (get entry "event_id")))
+        (is (nil? (get entry "mastodon")))))
+    (testing "the payment hash is the idempotency key, so a retry cannot
+              double-post"
+      (is (= "h1" (:idempotency-key (first posts)))))
+    (testing "the banner is drawn here from the same parameters the note's URL
+              is built from, so the two cannot describe different boosts"
+      (is (= 1 (count media)))
+      (is (= "Podcasting 2.0" (:title (first media))))
+      (is (= 2100 (:sats (first media)))))
+    (testing "the attachment carries alt text"
+      (is (= ["media-for:Boost banner: 2100 sats to Podcasting 2.0"]
+             (:media-ids (first posts)))))))
+
+(deftest mastodon-is-off-without-credentials
+  (let [a (atom {"cursor" nil "recent" []})]
+    (with-redefs [mastodon/post-status! (fn [& _] (throw (AssertionError. "must not post")))
+                  mastodon/upload-media! (fn [& _] (throw (AssertionError. "must not upload")))
+                  banner/banner-png (fn [& _] (throw (AssertionError. "must not render")))
+                  nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (some? (get (first (get @a "recent")) "event_id")) "the note still publishes")
+      (is (nil? (get (first (get @a "recent")) "status_id"))))))
+
+(deftest a-mastodon-failure-never-holds-up-a-boost
+  (testing "holding the cursor to retry a post would stop every later boost
+            being announced anywhere, so a failure is recorded and passed over"
+    (let [a (atom {"cursor" nil "recent" []})
+          {:keys [state notes]} (run-with-mastodon a (masto-ctx a)
+                                                   :post-result {:ok? false :error "HTTP 503"})]
+      (is (= 1 (count notes)) "the note was published")
+      (is (= 100 (get state "cursor")) "and the cursor advanced")
+      (let [entry (first (get state "recent"))]
+        (is (some? (get entry "event_id")))
+        (is (nil? (get entry "status_id")))
+        (is (= "failed" (get entry "mastodon"))
+            "recorded, so an outage is visible in the state file")))))
+
+(deftest a-thrown-mastodon-error-is-contained
+  (let [a (atom {"cursor" nil "recent" []})
+        notes (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ e] (swap! notes conj e) {:ok? true :results []})
+                  mastodon/post-status! (fn [& _] (throw (ex-info "boom" {})))]
+      (bot/poll-once! (masto-ctx a) ::session)
+      (is (= 1 (count @notes)))
+      (is (= 100 (get @a "cursor")) "the boost is not retried forever"))))
+
+(deftest a-banner-that-will-not-render-still-gets-a-post
+  (testing "a picture is worth having, not worth losing the post over"
+    (let [a (atom {"cursor" nil "recent" []})
+          posts (atom [])]
+      (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                    nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                    bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                    relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                    banner/banner-png (fn [& _] (throw (ex-info "no fonts" {})))
+                    mastodon/upload-media! (fn [& _] (throw (AssertionError. "nothing to upload")))
+                    mastodon/post-status! (fn [_ req] (swap! posts conj req) {:ok? true :id "1"})]
+        (bot/poll-once! (masto-ctx a) ::session)
+        (is (= 1 (count @posts)))
+        (is (nil? (:media-ids (first @posts))) "posted with no attachment")))))
+
+(deftest dry-run-posts-nothing
+  (let [a (atom {"cursor" nil "recent" []})]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  mastodon/post-status! (fn [& _] (throw (AssertionError. "must not post")))
+                  mastodon/upload-media! (fn [& _] (throw (AssertionError. "must not upload")))]
+      (bot/poll-once! (masto-ctx a :dry-run? true) ::session)
+      (is (nil? (get (first (get @a "recent")) "status_id"))))))
+
+(deftest an-already-posted-boost-is-not-posted-twice
+  (let [a (atom {"cursor" 50
+                 "recent" [{"payment_hash" "h1" "boost_id" "01K9" "url" "u"
+                            "event_id" "abc" "status_id" "109"}]})]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  mastodon/post-status! (fn [& _] (throw (AssertionError. "must not post again")))
+                  relay/publish-to-relays! (fn [_ _] (throw (AssertionError. "must not publish again")))]
+      (bot/poll-once! (masto-ctx a) ::session)
+      (is (= "109" (get (first (get @a "recent")) "status_id"))))))
+
+(deftest the-feed-is-read-once-for-both-destinations
+  (let [a (atom {"cursor" nil "recent" []})
+        reads (atom 0)
+        posts (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "u"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  bot/feed-context (fn [_ _]
+                                     (swap! reads inc)
+                                     {:npubs [] :art "https://cdn/a.png"
+                                      :fediverse "https://example.social/@show"})
+                  banner/banner-png (fn [_ _] (byte-array 4))
+                  mastodon/upload-media! (fn [& _] "m1")
+                  mastodon/post-status! (fn [_ req] (swap! posts conj req) {:ok? true :id "1"})]
+      (bot/poll-once! (masto-ctx a) ::session)
+      (is (= 1 @reads) "one boost costs one feed read, however many destinations")
+      (testing "the account the feed declares is credited as a plain link, never
+                as a mention"
+        (let [text (:text (first @posts))]
+          (is (str/includes? text "https://example.social/@show"))
+          (is (not (str/includes? text "@show@"))))))))

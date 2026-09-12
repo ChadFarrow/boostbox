@@ -220,18 +220,31 @@ export BB_S3_BUCKET=boostbox
 
 The included `flake.nix` dev environment provides MinIO. Run `devenv up` to start it for manual testing. This is done automatically for `./tests.sh`.
 
-## Boost Bot (Nostr)
+## Boost Bot
 
 BoostBox ships a second, optional process: a bot that watches a Lightning
 wallet over [NWC](https://nwc.dev) (Nostr Wallet Connect), stores every
-incoming boostagram in BoostBox, and republishes it to Nostr as a `kind:1`
-note tagged with [NIP-73](https://github.com/nostr-protocol/nips/blob/master/73.md)
-external content ids.
+incoming boostagram in BoostBox, and announces it publicly.
 
 The intended setup is to add the bot's Lightning address as a small (say 1%)
 recipient in a podcast's `<podcast:value>` block. Podcast apps send the
 boostagram TLV to *every* recipient in a split, so a 1% share is enough to
 receive the full metadata for the whole boost.
+
+What that 1% buys a podcaster is the announcement. Where it lands is the bot's
+problem, not theirs, so there are two destinations and adding one changes
+nothing about the arrangement:
+
+- **Nostr** (always): a `kind:1` note tagged with
+  [NIP-73](https://github.com/nostr-protocol/nips/blob/master/73.md) external
+  content ids, fanned out to `BBN_RELAYS`.
+- **Mastodon** (when configured): a status with the boost banner attached, from
+  one account the bot owns. Off entirely without `BBN_MASTODON_URL` and
+  `BBN_MASTODON_TOKEN`.
+
+Each destination stands alone. A relay rejection holds the cursor and retries;
+a Mastodon failure is logged and the boost moves on, because holding the queue
+for one network would stop every later boost being announced on any of them.
 
 It runs from the same uberjar as the web app, as its own process:
 
@@ -275,6 +288,11 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_BACKFILL_SEC`      |    No    | `0`                                                        | On the *first* run only, how far back to reach. `0` starts from now instead of replaying history. |
 | `BBN_DRY_RUN`           |    No    | `false`                                                    | Build and log events without publishing. Use this for the first run.                              |
 | `BBN_STATE_KEY`         |    No    | `nostrbot/state.json`                                      | Storage key for the cursor and de-duplication state.                                              |
+| `BBN_MASTODON_URL`      |    No    | —                                                          | Mastodon instance to post to, e.g. `https://podcastindex.social`. Absent, nothing is posted.      |
+| `BBN_MASTODON_TOKEN`    |    No    | —                                                          | Access token for the bot's account, scoped `write:statuses` and `write:media`. Both this and the URL must be set or neither does anything. Never logged. |
+| `BBN_MASTODON_VISIBILITY` | No     | `public`                                                   | Status visibility: `public`, `unlisted`, `private` or `direct`.                                   |
+| `BBN_MASTODON_MAX_CHARS` | No      | `500`                                                      | The instance's status limit. Raise it to match yours — `scripts/mastodon-check.sh` reports the real one. The payer's message is what gets truncated to fit. |
+| `BBN_MASTODON_TIMEOUT_MS` | No     | `15000`                                                    | How long to wait on the API. A failure is not retried: the boost is already on the relays.        |
 | `BBN_ALLOW_EPHEMERAL_STATE` | No   | `false`                                                    | Permit `BB_STORAGE=FS` outside `ENV=DEV`. Only set this if the filesystem is a persistent volume.  |
 | `BBN_BOOST_LINK_ORIGINS` | No      | (any public https host)                                    | Lock boost-link fetching to these origins, comma separated. See "Where the metadata comes from". |
 | `BBN_PUBLISH_PROFILE`   |    No    | `false`                                                    | One-shot: publish the bot's `kind:0` profile and NIP-65 `kind:10002` relay list on startup.        |
@@ -284,7 +302,8 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_PROFILE_NIP05`     |    No    | N/A                                                        | NIP-05 identifier. Only set this if you actually serve `/.well-known/nostr.json`.                 |
 | `BBN_PROFILE_LUD16`     |    No    | the NWC URI's `lud16`                                      | Lightning address for the profile, so the bot itself can be boosted back.                         |
 
-The bot logs its own `npub` on startup, so you can find and follow it.
+The bot logs its own `npub` on startup, so you can find and follow it, and the
+Mastodon instance it is posting to when one is configured.
 
 Set `BBN_PUBLISH_PROFILE=true` once and restart, then unset it -- every restart
 would otherwise republish. That publishes two events: the `kind:0` profile, so
@@ -293,6 +312,58 @@ relay list naming `BBN_RELAYS`. The relay list is the part that makes the npub
 followable: without it a client has no idea where the bot's notes live and can
 only guess from its own relay set. The wallet's relay is deliberately absent --
 it is reachable only with the NWC credential and has no place in a public list.
+
+### Posting to Mastodon
+
+Unlike the Nostr identity — a keypair `scripts/bot-setup.sh` mints locally,
+against interchangeable relays — a Mastodon identity is *hosted*. The account
+lives on someone else's server, its admin can suspend it, and migrating later
+carries your followers but **not your posts**. Choose the instance once.
+
+[podcastindex.social](https://podcastindex.social) is the natural home: it is
+the Podcasting 2.0 community's own instance, so boost announcements land in
+front of people who care about them.
+
+1. **Ask the admins first.** An account posting on every boost is high-volume
+   and it is their server. Asking costs nothing; being suspended after a few
+   thousand posts costs all of them.
+2. **Tick "This is an automated account"** in Preferences → Profile. An
+   unflagged automated account is what admins act on.
+3. **Create a token** at Preferences → Development → New Application, scoped
+   `write:statuses` and `write:media` and nothing else.
+4. **Check it before deploying:**
+
+   ```sh
+   ./scripts/mastodon-check.sh https://podcastindex.social
+   ```
+
+   That prompts for the token with echo off, posts nothing, and reports the
+   account, whether the instance considers it a bot, the real character limit,
+   and whether the banner renders in this process.
+
+5. Set `BBN_MASTODON_URL` and `BBN_MASTODON_TOKEN` on the bot service, keeping
+   `BBN_DRY_RUN=1` for the first run.
+
+One account serves every show. Podcasters never hand over credentials.
+
+Turning it on affects **boosts from that point on**. A boost the bot has
+already published to Nostr is finished as far as it is concerned, so nothing is
+backfilled — and by the same rule, a post that fails is not retried later.
+
+**What a post says**, and how it differs from the note:
+
+- The boost banner is a real media attachment with alt text, not a link.
+- No `npub` appears: a Mastodon client cannot resolve one.
+- If the show's RSS declares a fediverse account — `<podcast:txt
+  purpose="fediverse">`, or `<podcast:socialInteract protocol="activitypub">` —
+  it is credited as a **plain link, never an `@mention`**. A mention would let
+  whoever paid decide whose notifications the bot's posts land in, which is the
+  same reason a payer's npub never becomes a `p` tag on a note.
+- Everything the payer wrote is neutralised first: an `@handle` or a `#tag` in
+  a boost message reads exactly as written but cannot address anyone or file
+  the post under a hashtag.
+- The payer's message is truncated to fit the instance's limit; the
+  attribution, the app link and the credited account never are.
 
 ### Only boosts are republished
 

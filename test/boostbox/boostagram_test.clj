@@ -558,3 +558,137 @@
          (bg/boost-id-from-url "https://tardbox.com/boost/01M1Z3KRQ0E27RZ2T0CT1B2NEE")))
   (is (= "01ABC" (bg/boost-id-from-url "https://tardbox.com/boost/01ABC/")))
   (is (nil? (bg/boost-id-from-url nil))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Mastodon content ~~~~~~~~~~~~~~~~~~~
+
+(deftest mastodon-content
+  (let [b (bg/normalize {"podcast" "Podcasting 2.0"
+                         "episode" "Episode 158: The Big One"
+                         "sender_name" "Alice"
+                         "message" "Great show!"
+                         "app_name" "Fountain"
+                         "itemID" "16795090"})]
+    (testing "the note's layout, with the picture attached instead of linked"
+      (is (= (str "⚡ Boost ⚡\n"
+                  "\n"
+                  "Great show!\n"
+                  "\n"
+                  "Alice boosted 2100 sats → Podcasting 2.0\n"
+                  "📻 Episode 158: The Big One\n"
+                  "▶️ Listen on Fountain\n"
+                  "https://fountain.fm/episode/16795090\n"
+                  "\n"
+                  "#boostagram #value4value")
+             (bg/->mastodon-content b {:received-msat 2100000}))))
+    (testing "a declared fediverse account sits above the hashtags"
+      (is (str/includes? (bg/->mastodon-content
+                          b {:received-msat 2100000
+                             :fediverse "https://podcastindex.social/@pc20"})
+                         "\nhttps://podcastindex.social/@pc20\n\n#boostagram")))
+    (testing "the sats figure is note-sats, so a post and a note never disagree
+              about one payment"
+      (is (str/includes? (bg/->mastodon-content b {:received-msat 2100000})
+                         (bg/note-sats 2100000))))))
+
+(deftest mastodon-content-degrades-like-the-note
+  (testing "with no message, sender, episode or app there is still a post"
+    (is (= (str "⚡ Boost ⚡\n\nBoosted 100 sats → Some Show\n\n"
+                "#boostagram #value4value")
+           (bg/->mastodon-content (bg/normalize {"podcast" "Some Show"})
+                                  {:received-msat 100000}))))
+  (testing "value_msat_total absent falls back to what arrived, or the headline
+            reads 0 sats on a real boost"
+    (is (str/includes? (bg/->mastodon-content (bg/normalize {"value_msat" 5000})
+                                              {:received-msat 5000})
+                       "Boosted 5 sats"))))
+
+(deftest a-post-never-carries-a-nostr-identifier
+  (testing "sender_npub reaches a note's sender tag; on Mastodon it is forty
+            characters a reader's client cannot resolve"
+    (let [npub "npub1sg6plzptd64u62a878hep2kev88swjh3tw00gjsfl8f237lmu63q0uf63m"
+          b (bg/normalize {"podcast" "Show" "sender_npub" npub "sender_name" "Alice"})
+          out (bg/->mastodon-content b {:received-msat 1000})]
+      (is (= npub (bg/sender-npub b)) "the note still gets it")
+      (is (not (str/includes? out "npub1"))
+          "the post does not carry it as text")
+      (is (str/includes? out "Alice boosted") "the human name is what is used"))))
+
+(deftest payer-text-cannot-address-anyone-or-go-anywhere
+  (testing "Mastodon parses a status body: @user@host notifies that account and
+            #word files the post under that tag. Either would be chosen by
+            whoever paid, on a post this bot signs its own name to."
+    (let [b (bg/normalize {"podcast" "@showhandle@evil.social"
+                           "episode" "#trending"
+                           "sender_name" "@victim@example.social"
+                           "message" "hi @dave@example.social see #crypto"})
+          out (bg/->mastodon-content b {:received-msat 1000})]
+      (doseq [handle ["@dave@example.social" "@victim@example.social"
+                      "@showhandle@evil.social"]]
+        (is (not (str/includes? out handle))
+            (str handle " would have become a real mention")))
+      (doseq [tag ["#crypto" "#trending"]]
+        (is (not (str/includes? out tag))
+            (str tag " would have filed the post under a payer's hashtag")))
+      (testing "nothing is deleted -- the text still reads as written"
+        (is (str/includes? (str/replace out "\u200b" "") "hi @dave@example.social"))
+        (is (str/includes? (str/replace out "\u200b" "") "see #crypto")))
+      (testing "the post's own two hashtags are ours and survive intact"
+        (is (str/includes? out "#boostagram #value4value"))))))
+
+(deftest the-post-fits-the-instance-limit
+  (let [b (bg/normalize {"podcast" "Podcasting 2.0"
+                         "episode" "Episode 158: The Big One"
+                         "sender_name" "Alice"
+                         "app_name" "Fountain"
+                         "itemID" "16795090"
+                         ;; normalize already caps a message at 500; the rest of
+                         ;; the post then pushes it past any 500-char limit
+                         "message" (apply str (repeat 600 "x"))})]
+    (doseq [limit [500 1000]]
+      (let [out (bg/->mastodon-content b {:received-msat 2100000
+                                          :fediverse "https://podcastindex.social/@pc20"
+                                          :max-chars limit})]
+        (is (<= (count out) limit) (str "limit " limit " produced " (count out)))
+        (testing "the payer's message is what gives way, never the attribution,
+                  the app link or the account being credited"
+          (is (str/includes? out "Alice boosted 2100 sats → Podcasting 2.0"))
+          (is (str/includes? out "https://fountain.fm/episode/16795090"))
+          (is (str/includes? out "https://podcastindex.social/@pc20"))
+          (is (str/includes? out "#boostagram #value4value")))))
+    (testing "default is Mastodon's stock limit"
+      (is (= 500 bg/default-mastodon-max-chars))
+      (is (<= (count (bg/->mastodon-content b {:received-msat 2100000})) 500)))
+    (testing "a limit too small for the fixed lines drops the message rather
+              than emitting a broken post"
+      (let [out (bg/->mastodon-content b {:received-msat 2100000 :max-chars 60})]
+        (is (not (str/includes? out "xxx")))))))
+
+(deftest truncation-does-not-split-an-emoji
+  (testing "a cut between the halves of a surrogate pair leaves a replacement
+            box and is not valid UTF-8 on the wire"
+    (let [b (bg/normalize {"podcast" "S" "message" (apply str (repeat 200 "🎧"))})]
+      (doseq [limit (range 40 80)]
+        (let [out (bg/->mastodon-content b {:received-msat 1000 :max-chars limit})]
+          (is (not (some #(Character/isHighSurrogate ^char %)
+                         (take-last 2 (vec out))))
+              (str "limit " limit " ended mid-pair")))))))
+
+(deftest banner-alt-text-describes-the-picture
+  (let [b (bg/normalize {"podcast" "Podcasting 2.0" "episode" "Ep 158"})]
+    (is (= "Boost banner: 2100 sats to Podcasting 2.0 — Ep 158"
+           (bg/banner-alt-text b 2100000)))
+    (is (= "Boost banner: 5 sats" (bg/banner-alt-text (bg/normalize {}) 5000)))))
+
+(deftest banner-params-and-banner-url-agree
+  (testing "one set of names, so the URL a note carries and the picture posted
+            beside it cannot describe different boosts"
+    (let [b (bg/normalize {"podcast" "Show & Co" "episode" "Ep 1"})
+          params (bg/banner-params b "https://cdn.test/a.png" 2100000)]
+      (is (= {:art "https://cdn.test/a.png" :title "Show & Co" :ep "Ep 1" :sats 2100}
+             params))
+      (testing "every param in the map appears in the URL, under the same name"
+        (let [url (bg/banner-url "https://tardbox.com" b "https://cdn.test/a.png" 2100000)]
+          (doseq [k (keys params)]
+            (is (str/includes? url (str (name k) "=")))))))
+    (testing "no art, no title, no episode and a zero amount yield no params"
+      (is (= {} (bg/banner-params (bg/normalize {}) nil 0))))))
