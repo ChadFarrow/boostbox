@@ -102,10 +102,73 @@
         "sanity: type matched even as a string"))
 
   (testing "streams are not republished"
-    (let [stream-json (clojure.string/replace blip10-json "\"boost\"" "\"stream\"")]
-      (is (nil? (nwc/transaction->boost
-                 {"payment_hash" "x" "amount" 1000
-                  "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv stream-json)}]}})))))
+    (let [stream-json (clojure.string/replace blip10-json "\"boost\"" "\"stream\"")
+          r (nwc/transaction->boost
+             {"payment_hash" "x" "amount" 1000
+              "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv stream-json)}]}})]
+      (is (nil? (:boostagram r)))
+      (is (= :not-a-boost (:skip r)))
+      (is (= "stream" (:action r)) "so the log line says what it actually was")))
 
   (testing "a payment with no boostagram is not a boost"
-    (is (nil? (nwc/transaction->boost {"payment_hash" "x" "amount" 1000})))))
+    (is (= :no-boostagram (:skip (nwc/transaction->boost {"payment_hash" "x" "amount" 1000}))))))
+
+(deftest a-skipped-transaction-says-why
+  (testing "the reasons are distinct, because a count cannot tell a stream from a defect"
+    (is (= :no-boostagram (:skip (nwc/transaction->boost {})))
+        "an ordinary payment, and the common case on a wallet that also takes them")
+
+    (is (= :tlv-undecodable
+           (:skip (nwc/transaction->boost
+                   {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}})))
+        "a TLV record was there and neither hex nor base64 read it")
+
+    (is (= :tlv-unparseable
+           (:skip (nwc/transaction->boost
+                   {"metadata" {"tlv_records"
+                                [{"type" 7629169 "value" (hex-tlv "[1,2,3]")}]}})))
+        "it decoded, and still did not normalize into a boostagram"))
+
+  (testing "a TLV for some other record type is not a boostagram at all"
+    (is (= :no-boostagram
+           (:skip (nwc/transaction->boost
+                   {"metadata" {"tlv_records"
+                                [{"type" 133773310 "value" (hex-tlv "whatever")}]}})))))
+
+  (testing "every reason the classifier can emit is a declared one"
+    (doseq [tx [{}
+                {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}}
+                {"metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv "[1,2,3]")}]}}
+                {"metadata" {"boostagram" {"action" "stream"}}}]]
+      (is (contains? nwc/skip-reasons (:skip (nwc/transaction->boost tx)))
+          (pr-str tx)))))
+
+(deftest podcast-guru-sends-both-url-and-boost-link
+  (testing "the feed address wins over the app deep link, and the boost publishes"
+    ;; A real PodcastGuru payload. Its `boost_link` is an app.podcastguru.io
+    ;; deep link, NOT a BoostBox permalink and NOT a feed -- so reading it as
+    ;; the feed address would cost the note its cover art and every p tag.
+    (let [json (str "{\"value_msat\":3000,\"app_version\":\"2.3.2-beta2\","
+                    "\"sender_name\":\"Silvie\",\"episode\":\"007. The show must go one\","
+                    "\"message\":\"enjoyed the rewind, Chad\",\"value_msat_total\":333000,"
+                    "\"url\":\"https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53\","
+                    "\"sender_id\":\"fd4fdc23-2836-4eeb-86b0-8627b9bf51cb\","
+                    "\"boost_link\":\"https://app.podcastguru.io/podcast/X686874\","
+                    "\"app_name\":\"PodcastGuru\","
+                    "\"episode_guid\":\"8c82416b-4adf-43aa-8836-e79257362fd5\","
+                    "\"podcast\":\"Chad and Reeds Podcast\",\"name\":\"boostr\","
+                    "\"guid\":\"7c6f7875-2b73-491e-b32c-e2c8d6e91d53\","
+                    "\"action\":\"boost\",\"ts\":4910}")
+          r (nwc/transaction->boost
+             {"payment_hash" "7f4e94e3" "amount" 105000 "settled_at" 1789000000
+              "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv json)}]}})
+          b (:boostagram r)]
+      (is (nil? (:skip r)) "this is a publishable boost")
+      (is (= "https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53" (:url b))
+          "url wins over boost_link")
+      (is (= "7c6f7875-2b73-491e-b32c-e2c8d6e91d53" (:feed-guid b)))
+      (is (= "8c82416b-4adf-43aa-8836-e79257362fd5" (:item-guid b)))
+      (is (= "boostr" (:recipient-name b)))
+      (is (= 333000 (:value-msat-total b)) "the whole boost, not this split")
+      (is (= 105000 (:received-msat r)) "what actually arrived")
+      (is (= 4910 (:position b)) "ts is seconds into the episode"))))

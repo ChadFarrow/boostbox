@@ -305,9 +305,9 @@
 (deftest an-unlisted-origin-is-not-fetched-when-origins-are-named
   (let [fetched (atom [])]
     (with-redefs [bot/fetch-boost-metadata! (fn [u] (swap! fetched conj u) nil)]
-      (is (nil? (bot/tx->boost! (ctx (atom {}))
-                                {"payment_hash" "x" "amount" 1000
-                                 "description" "rss::payment::boost https://evil.example/y hi"})))
+      (is (nil? (:boostagram (bot/tx->boost! (ctx (atom {}))
+                                             {"payment_hash" "x" "amount" 1000
+                                              "description" "rss::payment::boost https://evil.example/y hi"}))))
       (is (empty? @fetched)
           "the fixture names tardbox explicitly, so nothing else is requested"))))
 
@@ -346,6 +346,21 @@
                "http://tardbox.com/boost/01ABC"
                "https://no-such-host.invalid/x"]]
       (is (nil? (bot/fetch-boost-metadata! u)) u))))
+
+(deftest a-transaction-that-publishes-nothing-still-says-why
+  (testing "an ordinary payment is a skip carrying the hash the wallet shows"
+    (let [r (bot/tx->boost! (ctx (atom {})) {"payment_hash" "hP" "amount" 1000})]
+      (is (nil? (:boostagram r)))
+      (is (= :no-boostagram (:skip r)))
+      (is (= "hP" (:payment-hash r))
+          "so a boost that went missing is findable in the logs by the same id")))
+
+  (testing "a TLV that would not decode is a defect, and reads as one"
+    (let [r (bot/tx->boost! (ctx (atom {}))
+                            {"payment_hash" "hD" "amount" 1000
+                             "metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}})]
+      (is (= :tlv-undecodable (:skip r)))
+      (is (= "hD" (:payment-hash r))))))
 
 (deftest a-tlv-boostagram-still-wins-and-costs-no-round-trip
   (let [fetched (atom 0)

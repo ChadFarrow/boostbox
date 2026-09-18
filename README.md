@@ -300,6 +300,34 @@ Per-minute `stream` payments are skipped. Only `action: boost` is published,
 with or without a message. A payment that carries no boostagram at all is
 ignored.
 
+### Working out why a boost was not published
+
+Every transaction the poll sees either publishes or says why it did not. The
+per-poll `boostbox.nostrbot/poll` line carries a `:skipped` breakdown, and
+anything that is not a plain non-podcast payment also gets its own
+`boostbox.nostrbot/transaction-skipped` line with the payment hash the wallet
+shows, so a single boost can be searched for by id:
+
+| `:reason`          | Meaning                                                                                                   |
+| ------------------ | --------------------------------------------------------------------------------------------------------- |
+| `:no-boostagram`   | An ordinary payment. Expected, and only counted, never narrated.                                          |
+| `:not-a-boost`     | A boostagram we read, for something we do not republish -- normally a `stream`. The `:action` says which. |
+| `:tlv-undecodable` | TLV `7629169` was present and neither hex nor base64 yielded JSON.                                        |
+| `:tlv-unparseable` | It decoded and still did not read as a boostagram.                                                        |
+
+The last two are defects worth reporting. `scripts/nwc-inspect.sh` dumps what
+the wallet actually reports for recent payments.
+
+**No line at all for a payment you can see in the wallet** means the poll never
+covered it, which is a cursor problem rather than a metadata one. Look for
+`boostbox.nostrbot/no-cursor-window-dropped`: it is logged whenever the bot
+starts with no cursor and no `BBN_BACKFILL_SEC`, and it means every boost
+received before that moment was dropped unpublished. On a brand new bot that is
+correct. After a restart it means the state was not durable -- see
+`BBN_ALLOW_EPHEMERAL_STATE` below, and the
+`boostbox.nostrbot/ephemeral-state-permitted` line logged at startup when the
+bot is running on a filesystem someone has asserted is a mounted volume.
+
 ### Where the metadata comes from
 
 A keysend can carry the boostagram in TLV record `7629169`, but an LNURL
