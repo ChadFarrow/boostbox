@@ -280,7 +280,7 @@
 (deftest a-boost-link-supplies-the-metadata-an-lnurl-payment-cannot-carry
   (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
     (let [b (bot/tx->boost! (ctx (atom {})) link-tx)]
-      (is (some? b) "an LNURL payment with no TLV is still publishable")
+      (is (some? (:boostagram b)) "an LNURL payment with no TLV is still publishable")
       (is (= "https://tardbox.com/boost/01LINKED" (:boost-url b)))
       (is (= "01LINKED" (:boost-id b)))
       (is (= "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf" (-> b :boostagram :feed-guid))
@@ -305,9 +305,9 @@
 (deftest an-unlisted-origin-is-not-fetched-when-origins-are-named
   (let [fetched (atom [])]
     (with-redefs [bot/fetch-boost-metadata! (fn [u] (swap! fetched conj u) nil)]
-      (is (nil? (bot/tx->boost! (ctx (atom {}))
-                                {"payment_hash" "x" "amount" 1000
-                                 "description" "rss::payment::boost https://evil.example/y hi"})))
+      (is (nil? (:boostagram (bot/tx->boost! (ctx (atom {}))
+                                             {"payment_hash" "x" "amount" 1000
+                                              "description" "rss::payment::boost https://evil.example/y hi"}))))
       (is (empty? @fetched)
           "the fixture names tardbox explicitly, so nothing else is requested"))))
 
@@ -316,7 +316,7 @@
     (let [c (assoc (ctx (atom {})) :boost-link-origins nil)
           b (bot/tx->boost! c {"payment_hash" "y" "amount" 10000 "settled_at" 5
                                "description" "rss::payment::boost https://boostbox.someapp.com/boost/01Z hi"})]
-      (is (some? b) "a podcaster cannot enumerate every app's BoostBox in advance")
+      (is (some? (:boostagram b)) "a podcaster cannot enumerate every app's BoostBox in advance")
       (is (= "https://boostbox.someapp.com/boost/01Z" (:boost-url b))))))
 
 (deftest the-address-behind-a-link-is-what-is-actually-checked
@@ -346,6 +346,72 @@
                "http://tardbox.com/boost/01ABC"
                "https://no-such-host.invalid/x"]]
       (is (nil? (bot/fetch-boost-metadata! u)) u))))
+
+(deftest a-transaction-that-publishes-nothing-still-says-why
+  (testing "an ordinary payment is a skip carrying the hash the wallet shows"
+    (let [r (bot/tx->boost! (ctx (atom {})) {"payment_hash" "hP" "amount" 1000})]
+      (is (nil? (:boostagram r)))
+      (is (= :no-boostagram (:skip r)))
+      (is (= "hP" (:payment-hash r))
+          "so a boost that went missing is findable in the logs by the same id")))
+
+  (testing "a TLV that would not decode is a defect, and reads as one"
+    (let [r (bot/tx->boost! (ctx (atom {}))
+                            {"payment_hash" "hD" "amount" 1000
+                             "metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}})]
+      (is (= :tlv-unreadable (:skip r)))
+      (is (= "hD" (:payment-hash r)))))
+
+  (testing "a boost link that yields nothing says so, rather than passing as an ordinary payment"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] nil)]
+      (let [r (bot/tx->boost! (ctx (atom {})) link-tx)]
+        (is (= :boost-link-unreadable (:skip r))
+            "the lightning-address path is the common one; this cannot be a silent count")
+        (is (= "https://tardbox.com/boost/01LINKED" (:url r)))
+        (is (= "hL" (:payment-hash r))))))
+
+  (testing "a boost link to a stream is a stream"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc linked-metadata "action" "stream"))]
+      (let [r (bot/tx->boost! (ctx (atom {})) link-tx)]
+        (is (= :not-a-boost (:skip r)))
+        (is (= "stream" (:action r))))))
+
+  (testing "an unreadable TLV keeps its own reason when a link beside it fails too"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] nil)]
+      (let [r (bot/tx->boost! (ctx (atom {}))
+                              (assoc link-tx "metadata"
+                                     {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}))]
+        (is (= :tlv-unreadable (:skip r)) "the defect is the TLV; the link is incidental"))))
+
+  (testing "every reason tx->boost! can give is a declared one"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] nil)]
+      (doseq [tx [{"payment_hash" "a"}
+                  link-tx
+                  {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}}
+                  {"metadata" {"boostagram" {"action" "stream"}}}]]
+        (is (contains? bot/skip-reasons (:skip (bot/tx->boost! (ctx (atom {})) tx)))
+            (pr-str tx))))))
+
+(deftest only-the-skips-worth-finding-are-narrated
+  (let [narrate? #'bot/narrate-skip?]
+    (testing "an ordinary payment and a stream are constant traffic, so only counted"
+      (is (not (narrate? {:skip :no-boostagram})))
+      (is (not (narrate? {:skip :not-a-boost :action "stream"}))))
+    (testing "a defect, a dead link and an unexpected action each get a line"
+      (is (narrate? {:skip :tlv-unreadable}))
+      (is (narrate? {:skip :boost-link-unreadable}))
+      (is (narrate? {:skip :not-a-boost :action "auto"})))
+    (testing "a published boost is not a skip"
+      (is (not (narrate? {:boostagram {}}))))))
+
+(deftest a-skipped-payment-is-narrated-once-however-often-it-is-re-read
+  (let [first-sighting! #'bot/first-sighting!
+        h (str "narrate-once-" (System/nanoTime))]
+    (is (true? (first-sighting! h)))
+    (is (false? (first-sighting! h))
+        "the poll re-reads the newest transaction and anything behind a held cursor")
+    (is (true? (first-sighting! nil)))
+    (is (true? (first-sighting! nil)) "no hash, nothing to de-duplicate on")))
 
 (deftest a-tlv-boostagram-still-wins-and-costs-no-round-trip
   (let [fetched (atom 0)

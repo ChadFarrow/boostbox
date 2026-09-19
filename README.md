@@ -300,6 +300,40 @@ Per-minute `stream` payments are skipped. Only `action: boost` is published,
 with or without a message. A payment that carries no boostagram at all is
 ignored.
 
+### Working out why a boost was not published
+
+Every transaction the poll sees either publishes or says why it did not. The
+per-poll `boostbox.nostrbot/poll` line carries a `:skipped` breakdown, and a
+skip worth looking up also gets its own `boostbox.nostrbot/transaction-skipped`
+line with the payment hash the wallet shows, so a single boost can be searched
+for by id. That line is written once per payment per process, however many polls
+re-read it:
+
+| `:reason`                | Meaning                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `:no-boostagram`         | An ordinary payment: no TLV and no boost link. Only counted.                                                                         |
+| `:not-a-boost`           | A boostagram we read, for something we do not republish. The `:action` says which. A `stream` is only counted; anything else is logged. |
+| `:tlv-unreadable`        | TLV `7629169` was present and neither hex nor base64 yielded a JSON object.                                                          |
+| `:boost-link-unreadable` | The description named a boost link and it did not answer with a boost. The `:url` says which.                                        |
+
+The last two are defects worth reporting. `scripts/nwc-inspect.sh` dumps what
+the wallet actually reports for recent payments, including each one's reason.
+
+**No line at all for a boost you can see in the wallet** means either that it
+reached the bot carrying neither a TLV nor a boost link, so it counted as
+`:no-boostagram`, or that the poll never covered it, which is a cursor problem
+rather than a metadata one. For the second, look for
+`boostbox.nostrbot/no-cursor-window-dropped`: it is logged whenever the bot
+starts with no cursor and no `BBN_BACKFILL_SEC`, and it means every boost
+received before that moment was dropped unpublished. On a brand new bot that is
+correct. After a restart it means the state was not durable -- see
+`BBN_ALLOW_EPHEMERAL_STATE` under Bot Configuration above, and the
+`boostbox.nostrbot/ephemeral-state-permitted` line logged at startup when the
+bot is running on a filesystem someone has asserted is a mounted volume. Do not
+reach back over the gap with `BBN_BACKFILL_SEC`: the de-duplication set was lost
+with the cursor, so every boost in that window that was already announced would
+be announced again.
+
 ### Where the metadata comes from
 
 A keysend can carry the boostagram in TLV record `7629169`, but an LNURL

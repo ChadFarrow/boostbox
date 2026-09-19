@@ -276,26 +276,55 @@
 
 (defn tx->boost!
   "A transaction turned into something publishable, from whichever source
-   actually carries the metadata.
+   actually carries the metadata -- or a `{:skip <reason>}` map naming why it
+   is not publishable.
 
    The TLV comes first because it is authoritative and free. Only if there is
    none do we look for a boost link, which most Podcasting 2.0 apps use for
    LNURL payments -- the paths are mutually exclusive in practice, and a TLV
-   never needs a network round trip to read."
+   never needs a network round trip to read.
+
+   Always returns a map, and a skip carries the payment hash so a transaction
+   the poll saw and did not publish can be found in the logs under the same id
+   the wallet shows. Callers test for `:boostagram`.
+
+   A boost link that yields nothing is `:boost-link-unreadable`, not the
+   `:no-boostagram` the TLV path reported. Folding it into that reason would
+   hide it -- `:no-boostagram` is counted and never narrated -- and for a bot
+   paid at a lightning address this is the path most boosts take, so it is
+   exactly where one going missing needs to say so."
   [ctx tx]
-  (or (nwc/transaction->boost tx)
-      (when-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
-        (when-let [b (some-> (fetch-boost-metadata! url) bg/normalize)]
-          (when (bg/boost? b)
-            (u/log ::boost-from-link :url url)
-            {:payment-hash (get tx "payment_hash")
-             :boostagram b
-             :received-msat (let [a (get tx "amount")] (when (number? a) (long a)))
-             :settled-at (let [t (get tx "settled_at")] (when (number? t) (long t)))
-             ;; the record already exists at this URL -- publish-boost! must
-             ;; reuse it rather than POST a second copy of the same boost
-             :boost-url url
-             :boost-id (bg/boost-id-from-url url)})))))
+  (let [;; nil only where a caller has stubbed transaction->boost
+        result (or (nwc/transaction->boost tx) {:skip :no-boostagram})
+        skip (fn [m] (assoc m :payment-hash (get tx "payment_hash")))]
+    (if (:boostagram result)
+      result
+      (if-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
+        (let [b (some-> (fetch-boost-metadata! url) bg/normalize)]
+          (cond
+            (bg/boost? b)
+            (do (u/log ::boost-from-link :url url)
+                {:payment-hash (get tx "payment_hash")
+                 :boostagram b
+                 :received-msat (let [a (get tx "amount")] (when (number? a) (long a)))
+                 :settled-at (let [t (get tx "settled_at")] (when (number? t) (long t)))
+                 ;; the record already exists at this URL -- publish-boost! must
+                 ;; reuse it rather than POST a second copy of the same boost
+                 :boost-url url
+                 :boost-id (bg/boost-id-from-url url)})
+
+            ;; a TLV that was there and was not a boost says more than the link
+            (not= :no-boostagram (:skip result)) (skip result)
+
+            b (skip {:skip :not-a-boost :action (:action b) :url url})
+
+            :else (skip {:skip :boost-link-unreadable :url url})))
+        (skip result)))))
+
+(def skip-reasons
+  "Every reason tx->boost! can give for publishing nothing: whatever the
+   transaction's own metadata says, plus the one only a boost link can."
+  (conj nwc/skip-reasons :boost-link-unreadable))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Publishing ~~~~~~~~~~~~~~~~~~~
 
@@ -539,6 +568,42 @@
         acc
         (recur (+ offset transactions-page-size) acc)))))
 
+(defn- narrate-skip?
+  "Whether a skipped transaction earns a log line of its own, rather than only
+   a place in the poll line's `:skipped` count.
+
+   The ones that do are the ones someone looking for a missing boost needs to
+   find by payment hash: a TLV we could not read, a boost link that yielded
+   nothing, and an action we did not expect. An ordinary payment and a stream
+   are both constant, expected traffic on a wallet in a podcast's splits, so
+   narrating them would bury exactly those lines."
+  [{:keys [skip action]}]
+  (and (some? skip)
+       (not= :no-boostagram skip)
+       (not (and (= :not-a-boost skip) (= "stream" action)))))
+
+(def ^:private narrated-size
+  "Enough to cover any window a poll re-reads. Cleared rather than evicted when
+   full, exactly as feed-cache is: the worst a clear costs is one repeated line."
+  4096)
+
+(defonce ^:private narrated (atom #{}))
+
+(defn- first-sighting!
+  "True the first time this process is asked about a payment hash.
+
+   A poll re-reads transactions it has already seen -- the newest one when the
+   wallet treats `from` as inclusive, and everything behind a failed publish
+   while the cursor is held -- so without this one unreadable TLV is a fresh
+   log line every poll interval, indefinitely. A missing hash is always new:
+   there is nothing to de-duplicate it on."
+  [payment-hash]
+  (or (nil? payment-hash)
+      (let [[before _] (swap-vals! narrated
+                                   (fn [s] (conj (if (>= (count s) narrated-size) #{} s)
+                                                 payment-hash)))]
+        (not (contains? before payment-hash)))))
+
 (defn poll-once!
   "Fetch transactions since the cursor and publish any new boosts.
 
@@ -561,15 +626,46 @@
         [state cursor]
         (if-let [c (get state0 "cursor")]
           [state0 c]
-          (let [c (- (quot (System/currentTimeMillis) 1000) (:backfill-sec ctx 0))
+          (let [backfill (long (:backfill-sec ctx 0))
+                c (- (quot (System/currentTimeMillis) 1000) backfill)
                 s (assoc state0 "cursor" c)]
-            (u/log ::first-run-watermark :cursor c :backfill-sec (:backfill-sec ctx 0))
+            (u/log ::first-run-watermark :cursor c :backfill-sec backfill)
+            ;; The single most expensive silent failure this bot has. On a
+            ;; genuinely new bot starting from now is right. On a restart it
+            ;; means the state was not durable, and every boost received while
+            ;; the bot was down has just been dropped unpublished -- which used
+            ;; to leave no trace at all beyond the line above, whose meaning is
+            ;; only obvious if you already know it.
+            (when (zero? backfill)
+              (u/log ::no-cursor-window-dropped
+                     :cursor c
+                     ;; Not "set BBN_BACKFILL_SEC to reach back": the
+                     ;; de-duplication set was in the same lost file, so a
+                     ;; backfill now republishes every boost in the window
+                     ;; that was already announced, as notes nobody can edit.
+                     :note (str "No cursor was found, so the watermark starts at now and "
+                                "every boost received before it will never be published. "
+                                "That is correct for a new bot. After a restart it means "
+                                "the state was lost: use BB_STORAGE=S3 for durable state. "
+                                "Do not backfill over the gap unless nothing in it was "
+                                "already published -- the de-duplication set was lost "
+                                "with the cursor, so those boosts would be announced twice.")))
             (save-state! (:state-io ctx) s)
             [s c]))
         txs (fetch-transactions! session cursor)
-        boosts (->> txs (keep #(tx->boost! ctx %)) (sort-by #(or (:settled-at %) 0)))
+        results (mapv #(tx->boost! ctx %) txs)
+        boosts (->> results (filter :boostagram) (sort-by #(or (:settled-at %) 0)))
+        skipped (frequencies (keep :skip results))
         high-water (reduce max 0 (keep tx-settled-at txs))]
-    (u/log ::poll :transactions (count txs) :boosts (count boosts) :cursor cursor)
+    (doseq [r results
+            :when (and (narrate-skip? r) (first-sighting! (:payment-hash r)))]
+      (u/log ::transaction-skipped
+             :payment-hash (:payment-hash r)
+             :reason (:skip r)
+             :action (:action r)
+             :url (:url r)))
+    (u/log ::poll :transactions (count txs) :boosts (count boosts)
+           :skipped skipped :cursor cursor)
     (loop [state state
            [b & more] boosts]
       (if-not b
@@ -611,6 +707,19 @@
            :boostbox (:boostbox-url cfg)
            :wallet-relay (first (:relays (:nwc cfg)))
            :dry-run (:dry-run? cfg))
+    ;; check-state-durability! let this through, so someone asserted the
+    ;; filesystem is a mounted volume. Say so once at startup: if it is not,
+    ;; this line and ::no-cursor-window-dropped are the pair that explain every
+    ;; boost that goes missing across a restart.
+    (when (and (= "FS" (:storage (:bb-cfg cfg)))
+               (not= "DEV" (:env (:bb-cfg cfg))))
+      (u/log ::ephemeral-state-permitted
+             :root-path (:root-path (:bb-cfg cfg))
+             :state-key (:state-key cfg)
+             :note (str "BB_STORAGE=FS with BBN_ALLOW_EPHEMERAL_STATE set. The cursor "
+                        "and de-duplication set live here and must survive a restart; "
+                        "if this path is not a mounted volume, every boost received "
+                        "while the bot is down will be dropped unpublished.")))
     (println "boost bot identity:" (:npub cfg))
     (.addShutdownHook (Runtime/getRuntime)
                       (Thread. (fn []

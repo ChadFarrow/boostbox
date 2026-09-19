@@ -201,6 +201,19 @@
             (catch Exception _ nil)))
         tlv-decoders))
 
+(defn boostagram-tlv
+  "The raw blip-10 TLV record value on a transaction, or nil.
+
+   Broken out because \"this payment carried no TLV\" and \"this payment carried
+   a TLV we could not read\" are the same nil to extract-boostagram and very
+   different things to whoever is working out why a boost went missing. See
+   transaction->boost."
+  [tx]
+  (some (fn [r]
+          (when (= bg/boostagram-tlv-type (->long (get r "type")))
+            (get r "value")))
+        (get-in tx ["metadata" "tlv_records"])))
+
 (defn extract-boostagram
   "Pull the blip-10 boostagram out of a transaction's metadata.
 
@@ -210,29 +223,61 @@
    podcast under NIP-73. Returns a normalized map, or nil for an ordinary
    payment that carries no boostagram."
   [tx]
-  (let [md (get tx "metadata")
-        raw (some (fn [r]
-                    (when (= bg/boostagram-tlv-type (->long (get r "type")))
-                      (get r "value")))
-                  (get md "tlv_records"))]
+  (let [raw (boostagram-tlv tx)]
     (or (when raw
           (try
             (some-> (decode-tlv-value raw) (json/read-value) (bg/normalize))
             (catch Exception e
               (u/log ::boostagram-tlv-unparseable :error (ex-message e))
               nil)))
-        (when-let [parsed (get md "boostagram")]
+        (when-let [parsed (get-in tx ["metadata" "boostagram"])]
           (u/log ::boostagram-from-wallet-fallback
                  :note "GUIDs unavailable; note will not carry NIP-73 tags")
           (bg/normalize parsed)))))
 
+(def skip-reasons
+  "Why a transaction is not a republishable boost, as far as its own metadata
+   can say.
+
+   `:no-boostagram` and `:not-a-boost` are ordinary and expected -- a wallet
+   that also takes normal payments sees the first constantly, and the second is
+   normally a per-minute stream, which is filtered on purpose. `:tlv-unreadable`
+   is a defect: a TLV record was there and could not be read.
+
+   There is deliberately no separate \"decoded but did not parse\" reason.
+   decode-tlv-value only accepts a decoding that is a JSON object, and
+   bg/normalize turns any object into a boostagram, so that case cannot occur
+   and a reason for it would only ever be seen in a test."
+  #{:no-boostagram :not-a-boost :tlv-unreadable})
+
 (defn transaction->boost
   "Combine a transaction and its boostagram into everything downstream needs,
-   or nil if this payment is not a republishable boost."
+   or a `{:skip <reason>}` map saying why this payment is not a republishable
+   boost.
+
+   The reason is not decoration. It used to be nil for all three cases below,
+   and `poll-once!` only counted transactions, so a boost that went missing
+   left no trace anywhere -- working out why meant asking the payer to send
+   their TLV by hand. Distinguishing an ordinary payment from a stream from a
+   TLV that would not decode is the difference between reading one log line and
+   guessing.
+
+   Callers test for `:boostagram`, never for nil."
   [tx]
-  (when-let [b (extract-boostagram tx)]
-    (when (bg/boost? b)
+  (let [raw (boostagram-tlv tx)
+        b (extract-boostagram tx)]
+    (cond
+      (and b (bg/boost? b))
       {:payment-hash (get tx "payment_hash")
        :boostagram b
        :received-msat (->long (get tx "amount"))
-       :settled-at (->long (get tx "settled_at"))})))
+       :settled-at (->long (get tx "settled_at"))}
+
+      ;; a boostagram we could read, for something we do not republish
+      b {:skip :not-a-boost :action (:action b)}
+
+      ;; a TLV record was present, neither hex nor base64 yielded a JSON
+      ;; object, and the wallet offered no parsed copy to fall back on
+      raw {:skip :tlv-unreadable}
+
+      :else {:skip :no-boostagram})))

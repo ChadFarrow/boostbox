@@ -88,8 +88,12 @@ exec java -cp "$JAR" clojure.main -e '
                                              " feed-guid=" (:feed-guid parsed)
                                              " total=" (:value-msat-total parsed))
                                         "NO -- no readable boostagram"))
-          (println "  publishable  :" (some? boost))))
+          (println "  publishable  :" (if (:boostagram boost)
+                                        "yes"
+                                        (str "no   reason=" (:skip boost)
+                                             (when (:action boost)
+                                               (str " action=" (:action boost))))))))
       (println)
       (println "publishable boosts in window:"
-               (count (keep nwc/transaction->boost txs))))
+               (count (filter :boostagram (map nwc/transaction->boost txs)))))
     (finally (nwc/close! sess))))'
