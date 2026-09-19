@@ -1,6 +1,7 @@
 (ns boostbox.boostbox-test
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.boostbox :as bb]
+            [boostbox.images :as images]
             [babashka.http-client :as http]
             [cognitect.aws.client.protocol :as aws-proto]
             [jsonista.core :as json]
@@ -182,6 +183,36 @@
                                 {:throw false})]
          (is (= 200 (:status get-resp)) "Should return 200")
          (is (seq (:body get-resp))))))))
+
+;; Every page once carried both images as base64 data: URIs, 3.65 MB around a
+;; 9 KB boost, and crawlers following the homepage's links cost 96 GB of
+;; Railway egress. The pages must name the images by URL.
+(deftest pages-link-artwork-instead-of-inlining-it
+  (run-with-storage
+   (fn [{test-config :config}]
+     (let [base-url (:base-url test-config)
+           api-key (-> test-config :allowed-keys first)
+           post-resp (http/post (str base-url "/boost")
+                                {:headers {"x-api-key" api-key
+                                           "Content-Type" "application/json"}
+                                 :body (json/write-value-as-string (minimal-boost-payload))
+                                 :throw false})
+           boost-url (get (json/read-value (:body post-resp)) "url")]
+       (is (= 201 (:status post-resp)))
+       (doseq [[page url] [["homepage" base-url] ["boost page" boost-url]]]
+         (testing page
+           (let [body (:body (http/get url {:throw false}))]
+             (is (not (str/includes? body "data:image")))
+             (is (str/includes? body (:path images/v4vbox)))
+             (is (str/includes? body (:path images/favicon)))
+             (is (< (count body) (* 64 1024)) "a page is KB, not MB"))))
+       (doseq [{:keys [path content-type bytes]} [images/v4vbox images/favicon]]
+         (testing path
+           (let [resp (http/get (str base-url path) {:as :bytes :throw false})]
+             (is (= 200 (:status resp)))
+             (is (= content-type (get-in resp [:headers "content-type"])))
+             (is (str/includes? (get-in resp [:headers "cache-control"]) "immutable"))
+             (is (= (seq bytes) (seq (:body resp)))))))))))
 
 (deftest smoke-test-health
   (run-with-storage

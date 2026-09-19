@@ -52,12 +52,12 @@ nix flake check              # Runs treefmt formatting check
 
 - `src/boostbox/boostbox.clj` — Main application: config, storage, routes, middleware, HTML rendering, server startup (single-file monolith with `(:gen-class)`)
 - `src/boostbox/ulid.clj` — Custom ULID encoding/decoding using Crockford Base32
-- `src/boostbox/images.clj` — Loads base64 image assets (favicon, logo) from `resources/` at runtime
+- `src/boostbox/images.clj` — Loads the page artwork (favicon, background) from `resources/` and names each by a content-hashed `/assets/…` path
 - `src/boostbox/safefetch.clj` — The one door for outbound HTTP to a URL we did not choose. Shared by the bot (boost links, feeds) and the web app (banner art)
 - `src/boostbox/banner.clj` — Draws the 1200×300 PNG a boost note carries, served at `GET /og/boost.png`
 - `resources/fonts/` — The bundled display face for that banner, plus its OFL licence
-- `resources/v4vbox.b64` — Base64-encoded background image for landing page
-- `resources/favicon.b64` — Base64-encoded favicon
+- `resources/v4vbox.jpg` — Background image for the homepage and boost pages
+- `resources/favicon.png` — 64×64 favicon
 - `test/boostbox/boostbox_test.clj` — All tests (unit + integration, both storage backends)
 
 Boost bot (separate process, same uberjar — see "Boost Bot" below):
@@ -98,7 +98,7 @@ Operator scripts (all read-only against the wallet, all prompt for the NWC strin
 
 **Client-side npub resolution:** `npub-resolve-js` is an inline JS blob injected on both homepage and boost-view. It walks text nodes for `npub1…` (optionally `nostr:`-prefixed), replaces them with a truncated `<span class="npub-ref" data-npub="…">`, then fans out a `kind:0` REQ in parallel across `wss://relay.damus.io`, `wss://nos.lol`, and `wss://relay.primal.net`. First relay to return a profile with `display_name`/`name` wins and closes the other sockets. No server-side Nostr code — all resolution is client-side. If you add another spot that renders an npub, no extra work is needed as long as it ends up in a text node within `document.body`.
 
-**Image assets:** Base64 image data is stored in `resources/*.b64` files (not inline in source) to avoid exceeding JVM's 65535-byte constant pool limit during AOT compilation. The `build.clj` copies both `src/` and `resources/` into the uberjar.
+**Page artwork is served by URL, never inlined (`boostbox.images`, `asset-handler`).** Every page used to carry the favicon and background as base64 `data:` URIs — 3.65 MB around a 9 KB boost, which gzip cannot shrink. The homepage links every boost page, so each crawler pass paid that thousands of times: **96 GB of Railway egress in one billing period, 44% of the bill.** Each image now lives at `/assets/<name>.<sha256 prefix>.<ext>`, served `immutable` for a year; the hash is in the path, so replacing a file changes its URL rather than serving a stale copy. `pages-link-artwork-instead-of-inlining-it` fails if a `data:image` comes back. Raw bytes loaded through `io/resource` have no size limit — the old `.b64` files existed only to keep large string *literals* out of AOT class files. The `build.clj` copies both `src/` and `resources/` into the uberjar.
 
 **BOLT11 description:** `rss::payment::{action} {url} {message}` format, truncated to 639-char limit.
 
@@ -167,6 +167,8 @@ Private functions are tested through their var (`#'bot/first-sighting!`), as `no
 ### Deployment
 
 - **Railway (web app):** Dockerfile-based deploy at `https://tardbox.com`. `railway.toml` configures builder and healthcheck. Railway's `PORT` env var is mapped to `BB_PORT` automatically in the Dockerfile CMD. Domain via Namecheap DNS CNAME. Storage is `BB_STORAGE=FS` on an attached Railway volume, not S3.
+- **Railway bills memory by the minute, and the JVM defaults are wrong for that.** Uncapped, a JVM takes a quarter of the container limit as its heap ceiling and keeps whatever it grows into; locally a burst of homepage renders took one to 3.5 GB resident, and it never came back. The Dockerfile `CMD` and `railway.bot.toml`'s `startCommand` therefore carry explicit defaults — web: `-Xms64m -Xmx512m`, G1 with `G1PeriodicGCInterval` so the heap is handed back after a burst; bot: `-Xms32m -Xmx192m`, SerialGC, since it has no bursts. Both use `ExitOnOutOfMemoryError`, because an OOM otherwise kills one thread and leaves a process that looks alive. Setting `JAVA_OPTS` on a service **replaces** its defaults (the commands use `${JAVA_OPTS:-…}`), so include every flag you still want. 512m is sized for the banner's worst case (`banner/max-art-pixels`, ~144 MB decoded); the homepage reads and renders every stored boost on each hit, so its peak grows with the boost count — if the web service starts restarting on OOM, that is the thing to fix, not the cap.
+- **`watchPatterns`** in both toml files limit redeploys to changes that reach the image (`src/`, `resources/`, `deps.edn`, `build.clj`, `Dockerfile`, the toml itself). A docs-only push used to rebuild twice and redeploy both services — and the web service has a volume, so each redeploy is a short outage. A new file the image depends on must be added to both lists.
 - **Railway (bot):** a *second service on the same repo and image*, whose "Config-as-code file path" must point at **`railway.bot.toml`**. Two traps, both of which fail quietly:
   - The Dockerfile `CMD` starts the *web app*. Without `startCommand` you deploy a second copy of tardbox — and the only symptom is `boostbox.boostbox/app-starting-up` in the logs where `boostbox.nostrbot/bot-starting` should be. That one line is the fastest way to tell which program a service is actually running.
   - `railway.toml` sets `healthcheckPath = "/health"` for every service on the repo, and the bot serves no HTTP at all. Config-as-code beats dashboard settings, so overriding it in the UI does not reliably stick; the bot needs its own config file. `numReplicas = 1` is deliberate — two replicas would poll the same wallet and race on the same state file, publishing duplicate notes.

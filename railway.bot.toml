@@ -11,11 +11,27 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
+# Only what goes into the image, so a docs-only push does not restart the bot.
+watchPatterns = ["src/**", "resources/**", "deps.edn", "build.clj", "Dockerfile", "railway.bot.toml"]
 
 [deploy]
 # The Dockerfile CMD starts the web app; the bot is a second -main in the same
 # uberjar.
-startCommand = "java -cp boostbox.jar boostbox.nostrbot"
+#
+# The heap is capped for the same reason as the web app's (Railway bills memory
+# by the minute), lower because the bot draws no banners; its largest single
+# read is a 2 MB feed. SerialGC rather than the web app's G1: the bot has no
+# bursts to give memory back after, and Serial's bookkeeping is ~55 MB less.
+#
+# ExitOnOutOfMemoryError matters more here than there: nothing in the bot
+# catches Error, so an OOM kills whichever thread it lands on -- the poll loop,
+# a relay socket's -- and the process can live on without it, running,
+# publishing nothing, and never restarted. With the flag any OOM is an exit,
+# which restartPolicyType below turns into a restart.
+#
+# Setting JAVA_OPTS on the service replaces these defaults outright. The sh -c
+# is what expands it.
+startCommand = "sh -c 'exec java ${JAVA_OPTS:--Xms32m -Xmx192m -XX:+UseSerialGC -XX:+ExitOnOutOfMemoryError} -cp boostbox.jar boostbox.nostrbot'"
 
 # No healthcheckPath on purpose -- see above.
 
