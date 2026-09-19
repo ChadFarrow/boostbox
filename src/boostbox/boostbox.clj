@@ -510,7 +510,7 @@
     [:meta {:name "color-scheme", :content "dark"}]
     [:meta {:name "theme-color", :content "#0f0a07"}]
     [:title "TardBox"]
-    [:link {:rel "icon" :type "image/png" :href (str "data:image/png;base64," images/favicon)}]
+    [:link {:rel "icon" :type (:content-type images/favicon) :href (:path images/favicon)}]
     [:link {:rel "preconnect" :href "https://fonts.googleapis.com"}]
     [:link {:rel "preconnect" :href "https://fonts.gstatic.com" :crossorigin ""}]
     [:link {:rel "stylesheet" :href "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"}]
@@ -546,7 +546,7 @@
   (let [boost-count (count boosts)]
     (html/html
      [:body
-      [:main {:style (str "background-image: url('data:image/png;base64," images/v4vbox "');")}
+      [:main {:style (str "background-image: url('" (:path images/v4vbox) "');")}
        [:div.overlay-top
         [:h1 "Tard" [:span.accent "Box"]]
         [:p "Store and serve your boostagrams"]
@@ -694,7 +694,7 @@
        [:meta {:name "color-scheme", :content "dark"}]
        [:meta {:name "theme-color", :content "#0f0a07"}]
        [:title (str "Boost " boost-id " | TardBox")]
-       [:link {:rel "icon" :type "image/png" :href (str "data:image/png;base64," images/favicon)}]
+       [:link {:rel "icon" :type (:content-type images/favicon) :href (:path images/favicon)}]
        [:link {:rel "preconnect" :href "https://fonts.googleapis.com"}]
        [:link {:rel "preconnect" :href "https://fonts.gstatic.com" :crossorigin ""}]
        [:link {:rel "stylesheet" :href "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"}]
@@ -702,7 +702,7 @@
        [:script {:src "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"}]
        [:style boost-view-css]]
       [:body
-       [:main {:style (str "background-image: url('data:image/png;base64," images/v4vbox "');")}
+       [:main {:style (str "background-image: url('" (:path images/v4vbox) "');")}
         [:nav.nav-bar
          [:a.nav-back {:href "/"} "\u2190 All Boosts"]
          [:span.nav-title "Tard" [:span.accent "Box"]]]
@@ -838,9 +838,24 @@
           (u/log ::banner-render-failed :error (ex-message e))
           {:status 502 :body {:error "banner render failed"}})))))
 
+;; ~~~~~~~~~~~~~~~~~~~ Page artwork ~~~~~~~~~~~~~~~~~~~
+(defn asset-handler
+  "Serve one of the images in `boostbox.images`. Its path carries a hash of
+   its bytes, so the response is cached as immutable: a changed picture gets a
+   new URL rather than a stale cache entry."
+  [{:keys [content-type ^bytes bytes]}]
+  (fn [_]
+    {:status 200
+     :headers {"content-type" content-type
+               "content-length" (str (alength bytes))
+               "cache-control" "public, max-age=31536000, immutable"}
+     :body (java.io.ByteArrayInputStream. bytes)}))
+
 (defn routes [cfg storage]
   [["/" {:get {:no-doc true :handler (homepage storage)}}]
    ["/og/boost.png" {:get {:no-doc true :handler (boost-banner cfg)}}]
+   [(:path images/v4vbox) {:get {:no-doc true :handler (asset-handler images/v4vbox)}}]
+   [(:path images/favicon) {:get {:no-doc true :handler (asset-handler images/favicon)}}]
    ["/openapi.json" {:get {:no-doc true :handler (swagger/create-swagger-handler)
                            :swagger {:info {:title "BoostBox API"
                                             :description "simple API to store boost metadata"

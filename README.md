@@ -244,6 +244,12 @@ a wallet credential, and it is a long-lived loop with at-least-once delivery.
 Deploy it as a separate service (on Railway, a second service from this same
 repo with the start command above and no healthcheck).
 
+On Railway, `railway.bot.toml` carries that start command along with JVM memory
+defaults (`-Xmx192m`, SerialGC); the web app's are in the Dockerfile `CMD`
+(`-Xmx512m`, G1). Railway bills memory by the minute and an uncapped JVM keeps
+whatever heap it grows into. Set `JAVA_OPTS` on a service to replace its
+defaults -- it replaces them outright, so include every flag you still want.
+
 ### Bot Configuration
 
 All bot variables are `BBN_`-prefixed. Storage (`BB_STORAGE` and its
