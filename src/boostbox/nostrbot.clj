@@ -286,15 +286,24 @@
 
    Always returns a map, and a skip carries the payment hash so a transaction
    the poll saw and did not publish can be found in the logs under the same id
-   the wallet shows. Callers test for `:boostagram`."
+   the wallet shows. Callers test for `:boostagram`.
+
+   A boost link that yields nothing is `:boost-link-unreadable`, not the
+   `:no-boostagram` the TLV path reported. Folding it into that reason would
+   hide it -- `:no-boostagram` is counted and never narrated -- and for a bot
+   paid at a lightning address this is the path most boosts take, so it is
+   exactly where one going missing needs to say so."
   [ctx tx]
-  (let [result (nwc/transaction->boost tx)]
+  (let [;; nil only where a caller has stubbed transaction->boost
+        result (or (nwc/transaction->boost tx) {:skip :no-boostagram})
+        skip (fn [m] (assoc m :payment-hash (get tx "payment_hash")))]
     (if (:boostagram result)
       result
-      (or (when-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
-            (when-let [b (some-> (fetch-boost-metadata! url) bg/normalize)]
-              (when (bg/boost? b)
-                (u/log ::boost-from-link :url url)
+      (if-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
+        (let [b (some-> (fetch-boost-metadata! url) bg/normalize)]
+          (cond
+            (bg/boost? b)
+            (do (u/log ::boost-from-link :url url)
                 {:payment-hash (get tx "payment_hash")
                  :boostagram b
                  :received-msat (let [a (get tx "amount")] (when (number? a) (long a)))
@@ -302,10 +311,20 @@
                  ;; the record already exists at this URL -- publish-boost! must
                  ;; reuse it rather than POST a second copy of the same boost
                  :boost-url url
-                 :boost-id (bg/boost-id-from-url url)})))
-          ;; `result` is nil only where a caller has stubbed transaction->boost
-          (assoc (or result {:skip :no-boostagram})
-                 :payment-hash (get tx "payment_hash"))))))
+                 :boost-id (bg/boost-id-from-url url)})
+
+            ;; a TLV that was there and was not a boost says more than the link
+            (not= :no-boostagram (:skip result)) (skip result)
+
+            b (skip {:skip :not-a-boost :action (:action b) :url url})
+
+            :else (skip {:skip :boost-link-unreadable :url url})))
+        (skip result)))))
+
+(def skip-reasons
+  "Every reason tx->boost! can give for publishing nothing: whatever the
+   transaction's own metadata says, plus the one only a boost link can."
+  (conj nwc/skip-reasons :boost-link-unreadable))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Publishing ~~~~~~~~~~~~~~~~~~~
 
@@ -549,6 +568,42 @@
         acc
         (recur (+ offset transactions-page-size) acc)))))
 
+(defn- narrate-skip?
+  "Whether a skipped transaction earns a log line of its own, rather than only
+   a place in the poll line's `:skipped` count.
+
+   The ones that do are the ones someone looking for a missing boost needs to
+   find by payment hash: a TLV we could not read, a boost link that yielded
+   nothing, and an action we did not expect. An ordinary payment and a stream
+   are both constant, expected traffic on a wallet in a podcast's splits, so
+   narrating them would bury exactly those lines."
+  [{:keys [skip action]}]
+  (and (some? skip)
+       (not= :no-boostagram skip)
+       (not (and (= :not-a-boost skip) (= "stream" action)))))
+
+(def ^:private narrated-size
+  "Enough to cover any window a poll re-reads. Cleared rather than evicted when
+   full, exactly as feed-cache is: the worst a clear costs is one repeated line."
+  4096)
+
+(defonce ^:private narrated (atom #{}))
+
+(defn- first-sighting!
+  "True the first time this process is asked about a payment hash.
+
+   A poll re-reads transactions it has already seen -- the newest one when the
+   wallet treats `from` as inclusive, and everything behind a failed publish
+   while the cursor is held -- so without this one unreadable TLV is a fresh
+   log line every poll interval, indefinitely. A missing hash is always new:
+   there is nothing to de-duplicate it on."
+  [payment-hash]
+  (or (nil? payment-hash)
+      (let [[before _] (swap-vals! narrated
+                                   (fn [s] (conj (if (>= (count s) narrated-size) #{} s)
+                                                 payment-hash)))]
+        (not (contains? before payment-hash)))))
+
 (defn poll-once!
   "Fetch transactions since the cursor and publish any new boosts.
 
@@ -584,11 +639,17 @@
             (when (zero? backfill)
               (u/log ::no-cursor-window-dropped
                      :cursor c
+                     ;; Not "set BBN_BACKFILL_SEC to reach back": the
+                     ;; de-duplication set was in the same lost file, so a
+                     ;; backfill now republishes every boost in the window
+                     ;; that was already announced, as notes nobody can edit.
                      :note (str "No cursor was found, so the watermark starts at now and "
                                 "every boost received before it will never be published. "
                                 "That is correct for a new bot. After a restart it means "
-                                "the state was lost: use BB_STORAGE=S3 for durable state, "
-                                "or set BBN_BACKFILL_SEC to reach back over the gap.")))
+                                "the state was lost: use BB_STORAGE=S3 for durable state. "
+                                "Do not backfill over the gap unless nothing in it was "
+                                "already published -- the de-duplication set was lost "
+                                "with the cursor, so those boosts would be announced twice.")))
             (save-state! (:state-io ctx) s)
             [s c]))
         txs (fetch-transactions! session cursor)
@@ -596,17 +657,13 @@
         boosts (->> results (filter :boostagram) (sort-by #(or (:settled-at %) 0)))
         skipped (frequencies (keep :skip results))
         high-water (reduce max 0 (keep tx-settled-at txs))]
-    ;; A transaction that carried podcast metadata and still did not publish is
-    ;; worth a line of its own: it is either a stream (expected) or a TLV we
-    ;; could not read (a defect), and a count tells those apart from neither.
-    ;; An ordinary payment carrying no boostagram is the common case on any
-    ;; wallet that also takes normal payments, so it is counted, not narrated.
     (doseq [r results
-            :when (and (:skip r) (not= :no-boostagram (:skip r)))]
+            :when (and (narrate-skip? r) (first-sighting! (:payment-hash r)))]
       (u/log ::transaction-skipped
              :payment-hash (:payment-hash r)
              :reason (:skip r)
-             :action (:action r)))
+             :action (:action r)
+             :url (:url r)))
     (u/log ::poll :transactions (count txs) :boosts (count boosts)
            :skipped skipped :cursor cursor)
     (loop [state state

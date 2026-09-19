@@ -118,16 +118,23 @@
     (is (= :no-boostagram (:skip (nwc/transaction->boost {})))
         "an ordinary payment, and the common case on a wallet that also takes them")
 
-    (is (= :tlv-undecodable
+    (is (= :tlv-unreadable
            (:skip (nwc/transaction->boost
                    {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}})))
         "a TLV record was there and neither hex nor base64 read it")
 
-    (is (= :tlv-unparseable
+    (is (= :tlv-unreadable
            (:skip (nwc/transaction->boost
                    {"metadata" {"tlv_records"
                                 [{"type" 7629169 "value" (hex-tlv "[1,2,3]")}]}})))
-        "it decoded, and still did not normalize into a boostagram"))
+        "valid JSON that is not an object is no more a boostagram than garbage"))
+
+  (testing "an unreadable TLV still falls back to the wallet's parsed copy"
+    (let [r (nwc/transaction->boost
+             {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]
+                          "boostagram" {"action" "boost" "podcast" "P"}}})]
+      (is (nil? (:skip r)))
+      (is (= "P" (:podcast (:boostagram r))))))
 
   (testing "a TLV for some other record type is not a boostagram at all"
     (is (= :no-boostagram

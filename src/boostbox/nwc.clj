@@ -236,20 +236,26 @@
           (bg/normalize parsed)))))
 
 (def skip-reasons
-  "Why a transaction the poll saw is not a republishable boost.
+  "Why a transaction is not a republishable boost, as far as its own metadata
+   can say.
 
    `:no-boostagram` and `:not-a-boost` are ordinary and expected -- a wallet
    that also takes normal payments sees the first constantly, and the second is
-   a per-minute stream, which is filtered on purpose. The other two are
-   defects: a TLV record was there and could not be read."
-  #{:no-boostagram :not-a-boost :tlv-undecodable :tlv-unparseable})
+   normally a per-minute stream, which is filtered on purpose. `:tlv-unreadable`
+   is a defect: a TLV record was there and could not be read.
+
+   There is deliberately no separate \"decoded but did not parse\" reason.
+   decode-tlv-value only accepts a decoding that is a JSON object, and
+   bg/normalize turns any object into a boostagram, so that case cannot occur
+   and a reason for it would only ever be seen in a test."
+  #{:no-boostagram :not-a-boost :tlv-unreadable})
 
 (defn transaction->boost
   "Combine a transaction and its boostagram into everything downstream needs,
    or a `{:skip <reason>}` map saying why this payment is not a republishable
    boost.
 
-   The reason is not decoration. It used to be nil for all four cases below,
+   The reason is not decoration. It used to be nil for all three cases below,
    and `poll-once!` only counted transactions, so a boost that went missing
    left no trace anywhere -- working out why meant asking the payer to send
    their TLV by hand. Distinguishing an ordinary payment from a stream from a
@@ -270,10 +276,8 @@
       ;; a boostagram we could read, for something we do not republish
       b {:skip :not-a-boost :action (:action b)}
 
-      ;; a TLV record was present; neither hex nor base64 yielded JSON
-      (and raw (nil? (decode-tlv-value raw))) {:skip :tlv-undecodable}
-
-      ;; it decoded, and still did not normalize into a boostagram
-      raw {:skip :tlv-unparseable}
+      ;; a TLV record was present, neither hex nor base64 yielded a JSON
+      ;; object, and the wallet offered no parsed copy to fall back on
+      raw {:skip :tlv-unreadable}
 
       :else {:skip :no-boostagram})))
