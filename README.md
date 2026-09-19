@@ -241,14 +241,15 @@ java -cp boostbox.jar boostbox.nostrbot
 
 It is deliberately not part of the web server: it holds a Nostr signing key and
 a wallet credential, and it is a long-lived loop with at-least-once delivery.
-Deploy it as a separate service (on Railway, a second service from this same
-repo with the start command above and no healthcheck).
+Deploy it as a separate service (on Railway, a service from this same repo with
+the start command above and no healthcheck).
 
-On Railway, `railway.bot.toml` carries that start command along with JVM memory
-defaults (`-Xmx192m`, SerialGC); the web app's are in the Dockerfile `CMD`
-(`-Xmx512m`, G1). Railway bills memory by the minute and an uncapped JVM keeps
-whatever heap it grows into. Set `JAVA_OPTS` on a service to replace its
-defaults -- it replaces them outright, so include every flag you still want.
+Cap its memory: Railway bills memory by the minute, and an uncapped JVM keeps
+whatever heap it grows into. On Railway, set the service variable
+`JAVA_TOOL_OPTIONS` to `-Xms32m -Xmx192m -XX:+UseSerialGC
+-XX:+ExitOnOutOfMemoryError`; the JVM reads it directly, so the start command
+stays as above. Set the restart policy to Always. The web app's own caps are in
+the Dockerfile `CMD`; set `JAVA_OPTS` on that service to replace them.
 
 ### Bot Configuration
 
@@ -261,7 +262,9 @@ already seen; if it is lost, the bot restarts from a `now` watermark and every
 boost that arrived while it was down is silently dropped, unpublished. A second
 Railway service gets a fresh filesystem on every deploy, so `BB_STORAGE=FS` is
 refused outside `ENV=DEV` unless you set `BBN_ALLOW_EPHEMERAL_STATE=1` to say
-the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
+the filesystem really is a mounted volume. Use `BB_STORAGE=S3`, or attach a
+volume to the bot's service, point `BB_FS_ROOT_PATH` at it and set
+`BBN_ALLOW_EPHEMERAL_STATE=1`.
 
 | Variable                | Required | Default                                                    | Description                                                                                     |
 | ----------------------- | :------: | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
