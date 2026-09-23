@@ -1,5 +1,6 @@
 (ns boostbox.nostrbot-test
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest testing is]]
             [boostbox.boostagram :as bg]
             [boostbox.nostrbot :as bot]
             [boostbox.podcastindex]
@@ -165,7 +166,7 @@
                 ["r" "wss://nos.lol" "write"]]
                (:tags e))))
       (testing "the wallet relay is never in the list -- it is a credential"
-        (is (not (some #(clojure.string/includes? (str %) "getalby") (:tags e))))))))
+        (is (not (some #(str/includes? (str %) "getalby") (:tags e))))))))
 
 (deftest profile-event-is-kind-0-json-content
   (with-redefs [relay/publish-to-relays! (fn [_ _] {:ok? true :results []})]
@@ -560,3 +561,79 @@
             r (resolve-feed pi-creds {} b)]
         (is (nil? (:url (:boostagram r))))
         (is (= "https://cdn.example/a.jpg" (:artwork r)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Banner art fallback ~~~~~~~~~~~~~~~~~~~
+
+(defn- banner-of
+  "The banner URL a built note carries in its imeta tag."
+  [event]
+  (some (fn [[k v]] (when (= k "imeta") (subs v (count "url "))))
+        (:tags event)))
+
+(defn- note-with [feed-ctx opts b]
+  (with-redefs [bot/feed-context (fn [_ _] feed-ctx)]
+    (banner-of (bot/build-note (ctx (atom {}) :pi-key "K" :pi-secret "S") b opts))))
+
+(deftest banner-asks-the-api-when-the-feed-gives-no-cover
+  (let [b (bg/normalize {"action" "boost" "guid" show-guid "url" podhome
+                         "podcast" "These Four Walls"})
+        pi-art "https://cdn.example/a.jpg"
+        art-param (str "art=" (java.net.URLEncoder/encode pi-art "UTF-8"))]
+    (testing "an app sent a feed address that yielded no cover: the API's is used,
+              rather than a banner with no picture"
+      (with-redefs [boostbox.podcastindex/feed-by-guid (pi-returns {:url podhome :artwork pi-art})]
+        (is (str/includes? (note-with nil {} b) art-param))))
+
+    (testing "the feed's own cover still wins, and the API is not asked"
+      (with-redefs [boostbox.podcastindex/feed-by-guid
+                    (fn [& _] (throw (AssertionError. "must not call the API")))]
+        (is (str/includes?
+             (note-with {:art "https://feed.example/ep.png"} {} b)
+             (str "art=" (java.net.URLEncoder/encode "https://feed.example/ep.png" "UTF-8"))))))
+
+    (testing "resolve-feed already asked and got no cover: not asked twice"
+      (with-redefs [boostbox.podcastindex/feed-by-guid
+                    (fn [& _] (throw (AssertionError. "must not call the API")))]
+        (is (not (str/includes? (note-with nil {:pi-asked? true} b) "art=")))))
+
+    (testing "with no credentials the banner goes out without a picture, as before"
+      (with-redefs [bot/feed-context (fn [_ _] nil)
+                    boostbox.podcastindex/feed-by-guid
+                    (fn [& _] (throw (AssertionError. "must not call the API")))]
+        (is (not (str/includes?
+                  (banner-of (bot/build-note (ctx (atom {})) b {}))
+                  "art=")))))))
+
+(deftest publish-boost-carries-pi-asked-through-to-the-banner
+  (let [pi-art "https://cdn.example/a.jpg"
+        art-param (str "art=" (java.net.URLEncoder/encode pi-art "UTF-8"))
+        publish (fn [b pi-answer]
+               (let [calls (atom 0)
+                     published (atom [])]
+                 (with-redefs [bot/feed-context (fn [_ _] nil)
+                               boostbox.podcastindex/feed-by-guid
+                               (fn [_ _] (swap! calls inc) pi-answer)
+                               bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                               relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+                   (bot/publish-boost! (ctx (atom {}) :pi-key "K" :pi-secret "S") {}
+                                       {:payment-hash "h1" :settled-at 100
+                                        :received-msat 111000 :boostagram b}))
+                 {:calls @calls :banner (banner-of (first @published))}))]
+
+    (testing "the v4vmusic case: the app sent a feed address, the feed gave no
+              cover, and the API's cover lands on the banner of the published note"
+      (let [{:keys [calls banner]}
+            (publish (bg/normalize {"action" "boost" "guid" show-guid "url" podhome
+                                 "podcast" "These Four Walls"})
+                  {:url podhome :artwork pi-art})]
+        (is (str/includes? banner art-param))
+        (is (= 1 calls))))
+
+    (testing "resolve-feed already asked and the API had no cover: one call, not
+              two, and the banner goes out without a picture"
+      (let [{:keys [calls banner]}
+            (publish (bg/normalize {"action" "boost" "guid" show-guid
+                                 "podcast" "These Four Walls"})
+                  {:url podhome :artwork nil})]
+        (is (not (str/includes? banner "art=")))
+        (is (= 1 calls) "the answer from resolve-feed is not asked for twice")))))
