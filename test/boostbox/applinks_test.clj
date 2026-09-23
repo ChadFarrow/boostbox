@@ -113,3 +113,13 @@
         (is (str/starts-with? url "https://") (str label " must be https"))
         (is (not (str/includes? url "null")) (str label " has a nil segment"))
         (is (not (re-find #"//\s*$|/{3,}" url)) (str label " has an empty segment"))))))
+
+(deftest v4vmusic-links-to-its-front-page
+  (testing "v4vmusic's own links use internal ids a boost never carries, so its
+            boosts link the site itself -- with any key set, or none at all"
+    (doseq [b [{"action" "boost" "app_name" "v4vmusic-com"
+                "guid" "5aaac594-3b0a-561a-ab00-7043f7ed1cee"
+                "episode_guid" "1afa133f-973e-4e7c-8c0f-8a60dbdd772f"}
+               {"action" "boost" "app_name" "v4vmusic"}]]
+      (is (= {:label "V4V Music" :url "https://v4vmusic.com" :episode? false}
+             (al/app-link (bg/normalize b)))))))
