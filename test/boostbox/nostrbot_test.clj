@@ -603,3 +603,37 @@
         (is (not (str/includes?
                   (banner-of (bot/build-note (ctx (atom {})) b {}))
                   "art=")))))))
+
+(deftest publish-boost-carries-pi-asked-through-to-the-banner
+  (let [pi-art "https://cdn.example/a.jpg"
+        art-param (str "art=" (java.net.URLEncoder/encode pi-art "UTF-8"))
+        publish (fn [b pi-answer]
+               (let [calls (atom 0)
+                     published (atom [])]
+                 (with-redefs [bot/feed-context (fn [_ _] nil)
+                               boostbox.podcastindex/feed-by-guid
+                               (fn [_ _] (swap! calls inc) pi-answer)
+                               bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                               relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+                   (bot/publish-boost! (ctx (atom {}) :pi-key "K" :pi-secret "S") {}
+                                       {:payment-hash "h1" :settled-at 100
+                                        :received-msat 111000 :boostagram b}))
+                 {:calls @calls :banner (banner-of (first @published))}))]
+
+    (testing "the v4vmusic case: the app sent a feed address, the feed gave no
+              cover, and the API's cover lands on the banner of the published note"
+      (let [{:keys [calls banner]}
+            (publish (bg/normalize {"action" "boost" "guid" show-guid "url" podhome
+                                 "podcast" "These Four Walls"})
+                  {:url podhome :artwork pi-art})]
+        (is (str/includes? banner art-param))
+        (is (= 1 calls))))
+
+    (testing "resolve-feed already asked and the API had no cover: one call, not
+              two, and the banner goes out without a picture"
+      (let [{:keys [calls banner]}
+            (publish (bg/normalize {"action" "boost" "guid" show-guid
+                                 "podcast" "These Four Walls"})
+                  {:url podhome :artwork nil})]
+        (is (not (str/includes? banner "art=")))
+        (is (= 1 calls) "the answer from resolve-feed is not asked for twice")))))
