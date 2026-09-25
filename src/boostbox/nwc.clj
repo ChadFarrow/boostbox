@@ -114,7 +114,10 @@
                                (= response-kind (get (nth m 2 nil) "kind"))))
                   timeout-ms)]
          (when-not msg
-           (throw (ex-info "NWC request timed out" {:method method :timeout-ms timeout-ms})))
+           ;; :timeout? lets a caller tell silence -- which a wait can cure --
+           ;; from a refusal the wallet actually sent, which it cannot
+           (throw (ex-info "NWC request timed out"
+                           {:method method :timeout-ms timeout-ms :timeout? true})))
          (let [body (decrypt-from-wallet nwc (get (nth msg 2) "content"))]
            (when-let [err (get body "error")]
              (throw (ex-info (str "NWC error: " (get err "message"))
@@ -243,12 +246,15 @@
    that also takes normal payments sees the first constantly, and the second is
    normally a per-minute stream, which is filtered on purpose. `:tlv-unreadable`
    is a defect: a TLV record was there and could not be read.
+   `:other-recipient` only arises when a bot names the split it announces, and
+   on a wallet shared with other splits it is as constant as an ordinary
+   payment.
 
    There is deliberately no separate \"decoded but did not parse\" reason.
    decode-tlv-value only accepts a decoding that is a JSON object, and
    bg/normalize turns any object into a boostagram, so that case cannot occur
    and a reason for it would only ever be seen in a test."
-  #{:no-boostagram :not-a-boost :tlv-unreadable})
+  #{:no-boostagram :not-a-boost :tlv-unreadable :other-recipient})
 
 (defn transaction->boost
   "Combine a transaction and its boostagram into everything downstream needs,
@@ -263,21 +269,28 @@
    guessing.
 
    Callers test for `:boostagram`, never for nil."
-  [tx]
-  (let [raw (boostagram-tlv tx)
-        b (extract-boostagram tx)]
-    (cond
-      (and b (bg/boost? b))
-      {:payment-hash (get tx "payment_hash")
-       :boostagram b
-       :received-msat (->long (get tx "amount"))
-       :settled-at (->long (get tx "settled_at"))}
+  ([tx] (transaction->boost tx {}))
+  ([tx {:keys [actions recipient-names] :or {actions #{"boost"}}}]
+   (let [raw (boostagram-tlv tx)
+         b (extract-boostagram tx)]
+     (cond
+       ;; before the action check: on a wallet shared with other splits, a
+       ;; boost to somebody else is not "not a boost", and must not be narrated
+       ;; as one
+       (and b (not (bg/recipient-match? b recipient-names)))
+       {:skip :other-recipient}
 
-      ;; a boostagram we could read, for something we do not republish
-      b {:skip :not-a-boost :action (:action b)}
+       (and b (bg/boost? b actions))
+       {:payment-hash (get tx "payment_hash")
+        :boostagram b
+        :received-msat (->long (get tx "amount"))
+        :settled-at (->long (get tx "settled_at"))}
 
-      ;; a TLV record was present, neither hex nor base64 yielded a JSON
-      ;; object, and the wallet offered no parsed copy to fall back on
-      raw {:skip :tlv-unreadable}
+       ;; a boostagram we could read, for something we do not republish
+       b {:skip :not-a-boost :action (:action b)}
 
-      :else {:skip :no-boostagram})))
+       ;; a TLV record was present, neither hex nor base64 yielded a JSON
+       ;; object, and the wallet offered no parsed copy to fall back on
+       raw {:skip :tlv-unreadable}
+
+       :else {:skip :no-boostagram}))))

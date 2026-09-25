@@ -275,6 +275,8 @@ volume to the bot's service, point `BB_FS_ROOT_PATH` at it and set
 | `BBN_RELAYS`            |    No    | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net` | Comma-separated relays to publish to. One acceptance counts as success.                           |
 | `BBN_POLL_INTERVAL_SEC` |    No    | `60`                                                       | How often to poll the wallet. Notifications short-circuit the wait; polling guarantees delivery.  |
 | `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
+| `BBN_ACTIONS` | No | `boost` | Comma-separated blip-10 actions to publish. `boost,auto` adds v4vmusic's automatic per-song boosts. Streams are never worth a note. |
+| `BBN_RECIPIENT_NAMES` | No | *(empty)* | Only publish splits addressed to these recipient names (comma-separated, case-insensitive). Empty publishes every boost. For a wallet shared with other splits, e.g. `MSP 2.0`. |
 | `BBN_CLIENT_NAME`       |    No    | `Boostr_Bot`                                                   | NIP-89 `client` tag: the app that signed the note, which is this bot. Clients render it as "via ...". Never the paying app -- that gets its own `app` tag. |
 | `BBN_FEED_LOOKUP`       |    No    | `true`                                                     | Read the show's RSS feed to find its npubs and cover art. Off is supported: the note still publishes, with no picture and no `p` tags. |
 | `BBN_FEED_TIMEOUT_MS`   |    No    | `8000`                                                     | How long to wait on that feed read before giving up on it.                                        |

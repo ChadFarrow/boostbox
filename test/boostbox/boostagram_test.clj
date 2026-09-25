@@ -79,6 +79,23 @@
   (is (not (bg/boost? (bg/normalize (assoc fountain-tlv "action" "stream")))))
   (is (not (bg/boost? (bg/normalize {})))))
 
+(deftest the-actions-republished-can-be-widened
+  (let [auto (bg/normalize (assoc fountain-tlv "action" "auto"))]
+    (is (not (bg/boost? auto)) "the default is still manual boosts only")
+    (is (bg/boost? auto #{"boost" "auto"}) "v4vmusic's auto-boosts, when asked for")
+    (is (not (bg/boost? (bg/normalize (assoc fountain-tlv "action" "stream")) #{"boost" "auto"}))
+        "naming other actions does not let streams through")))
+
+(deftest recipient-names-pick-out-one-split
+  (let [msp (bg/normalize (assoc fountain-tlv "name" " MSP 2.0 "))]
+    (is (bg/recipient-match? msp nil) "no names means every recipient")
+    (is (bg/recipient-match? msp #{}) "no names means every recipient")
+    (is (bg/recipient-match? msp #{"msp 2.0"})
+        "trimmed and case-folded, as MSP-2.0's own isMspSplit reads it")
+    (is (not (bg/recipient-match? msp #{"boostr"})))
+    (is (not (bg/recipient-match? (bg/normalize (dissoc fountain-tlv "name")) #{"msp 2.0"}))
+        "a boostagram naming no recipient is nobody's split")))
+
 (deftest boost-payload-mapping
   (let [b (bg/normalize fountain-tlv)
         p (bg/->boost-payload b {:received-msat 21000 :settled-at 1757275200})]

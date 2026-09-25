@@ -183,6 +183,22 @@
 
 ;; ~~~~~~~~~~~~~~~~~~~ First-run safety ~~~~~~~~~~~~~~~~~~~
 
+;; A backfill publishes months of boosts in one sitting. Stamped "now", 289 of
+;; them landed in followers' feeds at once; stamped when they were paid, they
+;; slot into the bot's history in order.
+(deftest a-note-carries-the-time-the-boost-was-paid
+  (let [b (:boostagram (boost "h1" 0))
+        now (quot (System/currentTimeMillis) 1000)
+        note (fn [opts] (bot/build-note (ctx (atom {})) b (merge {:boost-url "u" :received-msat 21000} opts)))]
+    (testing "an old payment keeps its own time"
+      (let [e (note {:settled-at 1770336000})]
+        (is (= 1770336000 (:created-at e)))
+        (is (nostr/verify-event? e) "the id and signature cover the backdated time")))
+    (testing "no payment time means now"
+      (is (<= now (:created-at (note {})) (+ now 5))))
+    (testing "a wallet clock ahead of ours never dates a note in the future, which relays refuse"
+      (is (<= (:created-at (note {:settled-at (+ now 86400)})) (+ now 5))))))
+
 (deftest first-run-sets-a-watermark-instead-of-replaying-history
   (let [a (atom {"cursor" nil "recent" []})
         asked (atom nil)
@@ -242,7 +258,7 @@
                       [{"settled_at" 300}]))
                   nwc/transaction->boost (constantly nil)]
       (bot/poll-once! (ctx a) ::session)
-      (is (= [0 50] @offsets)
+      (is (= [0 bot/transactions-page-size] @offsets)
           "a page that came back full may have older transactions behind it")
       (is (= 300 (get @a "cursor"))
           "a window of ordinary payments still advances the cursor, or it would
@@ -392,11 +408,104 @@
         (is (contains? bot/skip-reasons (:skip (bot/tx->boost! (ctx (atom {})) tx)))
             (pr-str tx))))))
 
+(deftest a-boost-link-honours-the-recipient-and-action-filters
+  (let [msp (ctx (atom {}) :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"})]
+    (testing "a linked boost to another recipient is that recipient's"
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+        (let [r (bot/tx->boost! msp link-tx)]
+          (is (= :other-recipient (:skip r)))
+          (is (= "hL" (:payment-hash r))))))
+    (testing "a linked auto-boost on the named split publishes"
+      (with-redefs [bot/fetch-boost-metadata!
+                    (fn [_] (assoc linked-metadata "action" "auto" "name" "MSP 2.0"))]
+        (is (some? (:boostagram (bot/tx->boost! msp link-tx))))))
+    (testing "and the default bot still refuses it"
+      (with-redefs [bot/fetch-boost-metadata!
+                    (fn [_] (assoc linked-metadata "action" "auto" "name" "MSP 2.0"))]
+        (is (= :not-a-boost (:skip (bot/tx->boost! (ctx (atom {})) link-tx))))))))
+
+(deftest filter-env-vars-parse-to-case-folded-sets
+  (let [folded #'bot/folded-set]
+    (is (= #{"msp 2.0"} (folded "MSP 2.0")))
+    (is (= #{"boost" "auto"} (folded " Boost , AUTO ")))
+    (is (= #{} (folded "")))))
+
+;; A wallet in many shows' splits gets a boostagram on nearly every payment,
+;; about 2 KB each. relay.getalby.com passed a page of 20 (39 KB) and silently
+;; dropped a page of 50 -- the request just timed out, on every poll.
+(deftest transactions-are-read-in-pages-the-relay-will-carry
+  (let [wallet (vec (for [i (range 25)] {"payment_hash" (str "h" i) "settled_at" (- 1000 i)}))
+        limits (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ {:keys [limit offset]}]
+                                           (swap! limits conj limit)
+                                           (->> wallet (drop offset) (take limit) vec))]
+      (is (= wallet (bot/fetch-transactions! ::session 0)) "paging still reaches everything")
+      (is (every? #(<= % 10) @limits) (pr-str @limits)))))
+
+(defn- paged-wallet
+  "A fake list_transactions over `n` transactions, newest first."
+  [n]
+  (let [wallet (vec (for [i (range n)] {"payment_hash" (str "h" i) "settled_at" (- 100000 i)}))]
+    [wallet (fn [_ {:keys [limit offset]}] (->> wallet (drop offset) (take limit) vec))]))
+
+(def timed-out (ex-info "NWC request timed out" {:method "list_transactions" :timeout? true}))
+
+;; relay.getalby.com stops answering after about sixty requests a minute. A
+;; backfill walking hundreds of pages back to back hit it on the 61st, and a
+;; poll that fails there restarts the same walk and hits it again, forever.
+(deftest a-long-walk-is-paced-and-a-poll-is-not
+  (let [pauses (atom [])]
+    (testing "every page after the first waits its turn"
+      (let [[wallet list-txs] (paged-wallet 25)]
+        (with-redefs [nwc/list-transactions! list-txs
+                      bot/pause! (fn [ms] (swap! pauses conj ms))]
+          (is (= wallet (bot/fetch-transactions! ::session 0)))
+          (is (= 2 (count @pauses)) "three pages, two gaps")
+          (is (every? pos? @pauses)))))
+    (testing "an ordinary poll reads one page and never waits"
+      (reset! pauses [])
+      (let [[_ list-txs] (paged-wallet 3)]
+        (with-redefs [nwc/list-transactions! list-txs
+                      bot/pause! (fn [ms] (swap! pauses conj ms))]
+          (bot/fetch-transactions! ::session 0)
+          (is (empty? @pauses)))))))
+
+(deftest a-timed-out-page-is-waited-out-and-read-again
+  (let [[wallet list-txs] (paged-wallet 25)
+        calls (atom 0)
+        pauses (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [s {:keys [offset] :as p}]
+                                           (if (and (= 10 offset) (= 1 (swap! calls inc)))
+                                             (throw timed-out)
+                                             (list-txs s p)))
+                  bot/pause! (fn [ms] (swap! pauses conj ms))]
+      (is (= wallet (bot/fetch-transactions! ::session 0))
+          "the walk finishes rather than failing the whole poll")
+      (is (some #(>= % 30000) @pauses) "and it waited long enough for the limit to clear"))))
+
+(deftest a-page-that-never-answers-still-fails-the-poll
+  (let [attempts (atom 0)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] (swap! attempts inc) (throw timed-out))
+                  bot/pause! (fn [_])]
+      (is (thrown? clojure.lang.ExceptionInfo (bot/fetch-transactions! ::session 0))
+          "loud, so the cursor holds and the next poll starts again")
+      (is (< 1 @attempts 10) (str @attempts " attempts")))))
+
+(deftest a-wallet-error-is-not-retried
+  (let [attempts (atom 0)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] (swap! attempts inc)
+                                           (throw (ex-info "NWC error: RESTRICTED" {:code "RESTRICTED"})))
+                  bot/pause! (fn [_])]
+      (is (thrown? clojure.lang.ExceptionInfo (bot/fetch-transactions! ::session 0)))
+      (is (= 1 @attempts) "a refusal will not change by asking again"))))
+
 (deftest only-the-skips-worth-finding-are-narrated
   (let [narrate? #'bot/narrate-skip?]
     (testing "an ordinary payment and a stream are constant traffic, so only counted"
       (is (not (narrate? {:skip :no-boostagram})))
-      (is (not (narrate? {:skip :not-a-boost :action "stream"}))))
+      (is (not (narrate? {:skip :not-a-boost :action "stream"})))
+      (is (not (narrate? {:skip :other-recipient}))
+          "on a shared wallet every other split is another recipient's"))
     (testing "a defect, a dead link and an unexpected action each get a line"
       (is (narrate? {:skip :tlv-unreadable}))
       (is (narrate? {:skip :boost-link-unreadable}))

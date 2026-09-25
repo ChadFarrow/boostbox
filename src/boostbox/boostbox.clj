@@ -597,7 +597,7 @@
    #_[:id {:optional true} :string]
    ;; provided by boost client
    [:action {:decode/json str/lower-case
-             :decode/string str/lower-case} [:enum "boost" "stream"]]
+             :decode/string str/lower-case} [:enum "boost" "stream" "auto"]]
    [:split {:json-schema/default 1.0} [:double {:min 0.0}]]
    [:value_msat {:json-schema/default 2222000} [:int {:min 1}]]
    [:value_msat_total {:json-schema/default 2222000} [:int {:min 1}]]

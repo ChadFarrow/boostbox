@@ -146,10 +146,27 @@
      :value-msat-total (->int (get* m "value_msat_total"))}))
 
 (defn boost?
-  "Only manual boosts are worth republishing. Per-minute streaming sats would
-   flood the relays with near-empty notes."
-  [b]
-  (= "boost" (:action b)))
+  "Only manual boosts are worth republishing by default. Per-minute streaming
+   sats would flood the relays with near-empty notes.
+
+   `actions` widens that for a bot that asks: v4vmusic sends \"auto\" for the
+   automatic boost it makes on each song, and on the MSP 2.0 split those are
+   most of what arrives."
+  ([b] (boost? b #{"boost"}))
+  ([b actions] (contains? actions (:action b))))
+
+(defn recipient-match?
+  "Whether this boostagram was addressed to one of `names`, or `names` is empty.
+
+   On a wallet shared with other splits the recipient name is the only thing
+   saying which split a payment was -- the feed cannot, since the MSP 2.0
+   support split rides on feeds hosted anywhere. Trimmed and case-folded, which
+   is exactly how MSP-2.0's own `isMspSplit` reads it: the paying app copies
+   the name out of the feed's value block, and a stray space must not drop a
+   real split. `names` is expected already lower-cased."
+  [b names]
+  (or (empty? names)
+      (contains? names (some-> (:recipient-name b) str/trim str/lower-case))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
 ;;
