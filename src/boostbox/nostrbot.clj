@@ -40,6 +40,11 @@
 (defn- csv [s]
   (->> (str/split (str s) #",") (map str/trim) (remove str/blank?) vec))
 
+(defn- folded-set
+  "A csv env var as a set of trimmed, lower-cased entries."
+  [s]
+  (into #{} (map str/lower-case) (csv s)))
+
 (defn config
   "BBN_-prefixed so nothing here can collide with the web app's BB_ vars.
    Storage config is shared with the web app and read via bb/config."
@@ -84,6 +89,15 @@
      :feed-timeout-ms (Long/parseLong (bb/get-env "BBN_FEED_TIMEOUT_MS" "8000"))
      :poll-interval-ms (* 1000 (Long/parseLong (bb/get-env "BBN_POLL_INTERVAL_SEC" "60")))
      :min-sats (Long/parseLong (bb/get-env "BBN_MIN_SATS" "0"))
+     ;; Which blip-10 actions to republish. v4vmusic sends "auto" for its
+     ;; per-song automatic boosts; streams are never worth a note.
+     :actions (let [named (folded-set (bb/get-env "BBN_ACTIONS" "boost"))]
+                (if (seq named) named #{"boost"}))
+     ;; Only splits addressed to these recipient names; empty means every
+     ;; boost the wallet sees. For a bot on a wallet shared with other shows,
+     ;; which is how the MSP 2.0 support split arrives -- see
+     ;; bg/recipient-match?.
+     :recipient-names (folded-set (bb/get-env "BBN_RECIPIENT_NAMES" ""))
      ;; how far back to reach on the very first run; 0 means "start from now"
      :backfill-sec (Long/parseLong (bb/get-env "BBN_BACKFILL_SEC" "0"))
      :dry-run? (truthy? (bb/get-env "BBN_DRY_RUN" "false"))
@@ -295,14 +309,21 @@
    exactly where one going missing needs to say so."
   [ctx tx]
   (let [;; nil only where a caller has stubbed transaction->boost
-        result (or (nwc/transaction->boost tx) {:skip :no-boostagram})
+        result (or (nwc/transaction->boost tx (select-keys ctx [:actions :recipient-names]))
+                   {:skip :no-boostagram})
+        actions (:actions ctx #{"boost"})
         skip (fn [m] (assoc m :payment-hash (get tx "payment_hash")))]
     (if (:boostagram result)
       result
       (if-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
         (let [b (some-> (fetch-boost-metadata! url) bg/normalize)]
           (cond
-            (bg/boost? b)
+            ;; same order as the TLV path: another recipient's split is that,
+            ;; whatever its action
+            (and b (not (bg/recipient-match? b (:recipient-names ctx))))
+            (skip {:skip :other-recipient :url url})
+
+            (bg/boost? b actions)
             (do (u/log ::boost-from-link :url url)
                 {:payment-hash (get tx "payment_hash")
                  :boostagram b
@@ -395,15 +416,23 @@
 
    `fallback-art` is the Podcast Index's cover for the show, used only when the
    feed read finds none. The feed is preferred because it can carry the art of
-   the episode that was actually boosted; the API only knows the show."
+   the episode that was actually boosted; the API only knows the show.
+
+   The note is dated when the boost was paid (`settled-at`), not when it was
+   published. For a live boost those are a minute apart; for a backfill they
+   are months apart, and stamping months of boosts \"now\" lands all of them in
+   followers' feeds in one burst. Never later than now: a wallet clock running
+   ahead would otherwise date a note in the future, which relays refuse."
   [{:keys [seckey client-name] :as ctx} boostagram
-   {:keys [boost-url received-msat fallback-art]}]
-  (let [ctxt (feed-context ctx boostagram)
+   {:keys [boost-url received-msat fallback-art settled-at]}]
+  (let [now (quot (System/currentTimeMillis) 1000)
+        ctxt (feed-context ctx boostagram)
         total (bg/note-total-msat boostagram received-msat)
         banner (bg/banner-url (:boostbox-url ctx) boostagram
                               (or (:art ctxt) fallback-art) total)]
     (nostr/sign-event seckey
                       {:kind 1
+                       :created-at (if settled-at (min (long settled-at) now) now)
                        :content (bg/->note-content boostagram
                                                    {:boost-url boost-url
                                                     :received-msat received-msat
@@ -505,6 +534,7 @@
             _ (save-state! (:state-io ctx) state)
             event (build-note ctx boostagram {:boost-url (:url stored)
                                               :received-msat received-msat
+                                              :settled-at settled-at
                                               :fallback-art pi-artwork})]
         (if dry-run?
           (do (u/log ::dry-run-note :boost-url (:url stored)
@@ -531,7 +561,14 @@
 
 ;; ~~~~~~~~~~~~~~~~~~~ Poll ~~~~~~~~~~~~~~~~~~~
 
-(def transactions-page-size 50)
+(def transactions-page-size
+  "Small because the whole page has to fit in one encrypted NWC reply event, and
+   the relay silently drops one that is too big -- the request then just times
+   out, on every poll, forever. A wallet in many shows' splits carries a
+   boostagram on nearly every payment, about 2 KB each: relay.getalby.com passed
+   a page of 20 (39 KB) and dropped a page of 50. A keysend's TLV is bounded by
+   the onion, so ten of even the largest stay well clear."
+  10)
 
 (def max-transactions-per-poll
   "A runaway guard, not a limit. Pages come back newest-first, so *truncating*
@@ -545,6 +582,43 @@
   (let [v (get tx "settled_at")]
     (when (number? v) (long v))))
 
+(def page-interval-ms
+  "The gap between pages on a walk longer than one. relay.getalby.com stops
+   answering after about sixty requests a minute -- measured: a walk at ~2.5
+   pages a second went silent on its 61st request, and single reads of the very
+   same transactions went through once the minute had passed. Forty a minute
+   stays clear. An ordinary poll reads one page and never waits."
+  1500)
+
+(def timeout-retry-ms
+  "How long to wait out a page that timed out before asking for it again: long
+   enough for the relay's rate window to pass, which a few seconds is not."
+  60000)
+
+(def page-attempts
+  "Tries per page before the walk fails and the poll leaves its cursor alone."
+  3)
+
+(defn- pause! [ms] (Thread/sleep (long ms)))
+
+(defn- read-page!
+  "One page, waiting out a timeout and asking again. Only a timeout: a wallet
+   error is a refusal, and it will not change by asking again."
+  [session params]
+  (loop [attempt 1]
+    (let [result (try
+                   (nwc/list-transactions! session params)
+                   (catch clojure.lang.ExceptionInfo e
+                     (if (and (:timeout? (ex-data e)) (< attempt page-attempts))
+                       (do (u/log ::transactions-page-timed-out
+                                  :offset (:offset params) :attempt attempt
+                                  :retry-in-ms timeout-retry-ms)
+                           ::retry)
+                       (throw e))))]
+      (if (= ::retry result)
+        (do (pause! timeout-retry-ms) (recur (inc attempt)))
+        result))))
+
 (defn fetch-transactions!
   "Every incoming transaction since the cursor, paged to exhaustion.
 
@@ -553,13 +627,19 @@
    back only the newest page. Advancing the cursor past that page would strand
    everything older permanently, unread. Once the cursor is current a poll
    interval rarely holds even one full page; the long walk only happens on a
-   deliberate backfill, and it is a one-time cost."
+   deliberate backfill, and it is a one-time cost.
+
+   That long walk is paced (`page-interval-ms`) and rides out a timed-out page
+   (`read-page!`). Without both, a backfill runs into the relay's rate limit,
+   fails the poll, and the next poll restarts the same walk from the same
+   cursor and hits the same limit -- a bot that never publishes anything."
   [session from]
   (loop [offset 0
          acc []]
-    (let [page (nwc/list-transactions! session {:from from
-                                                :limit transactions-page-size
-                                                :offset offset})
+    (when (pos? offset) (pause! page-interval-ms))
+    (let [page (read-page! session {:from from
+                                    :limit transactions-page-size
+                                    :offset offset})
           acc (into acc page)]
       (when (> (count acc) max-transactions-per-poll)
         (throw (ex-info "list_transactions paging did not terminate; is the wallet ignoring offset?"
@@ -576,10 +656,12 @@
    find by payment hash: a TLV we could not read, a boost link that yielded
    nothing, and an action we did not expect. An ordinary payment and a stream
    are both constant, expected traffic on a wallet in a podcast's splits, so
-   narrating them would bury exactly those lines."
+   narrating them would bury exactly those lines. So is a split to another
+   recipient, on a bot reading a wallet shared with other shows."
   [{:keys [skip action]}]
   (and (some? skip)
        (not= :no-boostagram skip)
+       (not= :other-recipient skip)
        (not (and (= :not-a-boost skip) (= "stream" action)))))
 
 (def ^:private narrated-size

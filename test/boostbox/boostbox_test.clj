@@ -271,6 +271,20 @@
                    ;; Check we received our sent payload plus id.
                    (is (= expected decoded-json))))))))))))
 
+;; v4vmusic sends "auto" for its automatic per-song boosts, and the bot stores
+;; them. A schema that knew only boost|stream refused them with a 400, which
+;; held the bot's cursor on the first one.
+(deftest an-auto-boost-is-stored
+  (run-with-storage
+   (fn [{test-config :config}]
+     (let [resp (http/post (str (:base-url test-config) "/boost")
+                           {:headers {"x-api-key" (-> test-config :allowed-keys first)
+                                      "Content-Type" "application/json"}
+                            :body (json/write-value-as-string
+                                   (assoc (minimal-boost-payload) :action "auto"))
+                            :throw false})]
+       (is (= 201 (:status resp)) (:body resp))))))
+
 (deftest test-oscar-fountain-boost
   (run-with-storage
    ["FS" "S3"]
