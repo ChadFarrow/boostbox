@@ -492,3 +492,76 @@
         (finally
           (doseq [f (reverse (file-seq (io/file root)))]
             (.delete f)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Homepage cache ~~~~~~~~~~~~~~~~~~~
+;; The homepage reads and parses every stored boost, so a crawler burst of
+;; uncached renders is what drove the web app's memory peak.
+
+(deftest concurrent-misses-share-one-render
+  (let [pages (bb/page-cache 60000)
+        renders (atom 0)
+        render (fn [] (swap! renders inc) (Thread/sleep 100) "page")
+        results (->> (range 16)
+                     (mapv (fn [_] (future (bb/cached-page pages "date" render))))
+                     (mapv deref))]
+    (is (every? #{"page"} results))
+    (is (= 1 @renders) "a burst on an empty cache renders once, not once per request")))
+
+(deftest a-cached-page-is-rendered-again-after-invalidation
+  (let [pages (bb/page-cache 60000)
+        renders (atom 0)
+        render #(swap! renders inc)]
+    (is (= 1 (bb/cached-page pages "date" render)))
+    (is (= 1 (bb/cached-page pages "date" render)) "served from the cache")
+    (bb/invalidate-pages! pages)
+    (is (= 2 (bb/cached-page pages "date" render)))))
+
+(deftest a-cached-page-expires-after-its-ttl
+  (let [pages (bb/page-cache 0)
+        renders (atom 0)
+        render #(swap! renders inc)]
+    (bb/cached-page pages "date" render)
+    (bb/cached-page pages "date" render)
+    (is (= 2 @renders))))
+
+(deftest a-failed-render-is-not-cached
+  (testing "a storage error is retried by the next request, not served until the ttl runs out"
+    (let [pages (bb/page-cache 60000)
+          calls (atom 0)
+          render #(if (= 1 (swap! calls inc)) (throw (ex-info "storage down" {})) "page")]
+      (is (thrown? Exception (bb/cached-page pages "date" render)))
+      (is (= "page" (bb/cached-page pages "date" render))))))
+
+(deftest unknown-sort-orders-share-the-date-page
+  (testing "the cache is keyed by sort order, so a caller-chosen value must not become a key"
+    (doseq [s ["date" "amount" "podcast" "from"]]
+      (is (= s (bb/homepage-sort s))))
+    (doseq [s [nil "" "garbage" "DATE" ["amount" "from"]]]
+      (is (= "date" (bb/homepage-sort s)) (pr-str s)))))
+
+(deftest homepage-is-cached-until-a-boost-is-posted
+  (run-with-storage
+   ["FS" "S3"]
+   (fn [{test-config :config storage :storage :as data}]
+     (testing (str "[" (:test-storage-impl data) "]")
+       (let [base-url (:base-url test-config)
+             homepage #(http/get base-url {:throw false})
+             _ (is (= 200 (:status (homepage))))
+             ;; Written behind the app's back, so only a re-read would see it.
+             side-id (bb/gen-ulid)
+             _ (bb/store storage side-id (assoc (minimal-boost-payload) :id side-id))
+             cached (homepage)]
+         (is (= 200 (:status cached)))
+         (is (str/starts-with? (get-in cached [:headers "content-type"]) "text/html"))
+         (is (not (str/includes? (:body cached) side-id))
+             "served from the cache, not re-read from storage")
+         (let [post-resp (http/post (str base-url "/boost")
+                                    {:headers {"x-api-key" (-> test-config :allowed-keys first)
+                                               "Content-Type" "application/json"}
+                                     :body (json/write-value-as-string (minimal-boost-payload))
+                                     :throw false})
+               posted-id (get (json/read-value (:body post-resp)) "id")
+               body (:body (homepage))]
+           (is (= 201 (:status post-resp)))
+           (is (str/includes? body posted-id) "a POST clears the cache")
+           (is (str/includes? body side-id))))))))
