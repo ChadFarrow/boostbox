@@ -639,8 +639,7 @@
               {"id" (ulid-at 1 "1") "group" "g1" "recipient_address" "reed@getalby.com"
                "value_msat" 105000}
               {"id" (ulid-at 2 "1") "group" "g1" "value_msat" 3000}]
-        page (html/html (bb/boost-card (first (bb/one-card-per-boost (reverse legs)))))
-        solo {"id" (ulid-at 5 "1") "group" "g2" "sender_name" "Permanerd"}]
+        page (html/html (bb/boost-card (first (bb/one-card-per-boost (reverse legs)))))]
     (is (str/includes? page "Legs recorded (3)"))
     (doseq [leg legs]
       (is (str/includes? page (str "href=\"/boost/" (get leg "id") "\""))))
@@ -648,11 +647,20 @@
     (is (str/includes? page "reed@getalby.com") "or by its address, when it has no name")
     (is (str/includes? page "(unnamed)") "or says it has neither")
     (is (str/includes? page "3 sats"))
-    (is (not (re-find #"(?s)<a [^>]*>(?:(?!</a>).)*<a " page)) "no link inside a link")
-    (is (= (html/html [:a.boost-card-link {:href (str "/boost/" (get solo "id"))}
-                       (into [:div.boost-card] (bb/boost-detail-rows solo))])
-           (html/html (bb/boost-card solo)))
-        "a boost of one record renders exactly as before")))
+    (is (not (re-find #"(?s)<a [^>]*>(?:(?!</a>).)*<a " page)) "no link inside a link")))
+
+(deftest every-card-says-who-its-record-paid
+  ;; Half of tardbox's cards are one record of a split boost whose other legs
+  ;; went by keysend. The card's amount is the whole boost's, so without its
+  ;; leg line it never says who this record paid, or how much.
+  (let [solo {"id" (ulid-at 5 "1") "group" "g2" "recipient_name" "candr show"
+              "value_msat" 33000 "value_msat_total" 100000}
+        page (html/html (bb/boost-card (first (bb/one-card-per-boost [solo]))))]
+    (is (str/includes? page "Legs recorded (1)"))
+    (is (str/includes? page "candr show"))
+    (is (str/includes? page "33 sats"))
+    (is (str/includes? page (str "href=\"/boost/" (get solo "id") "\"")))
+    (is (not (re-find #"(?s)<a [^>]*>(?:(?!</a>).)*<a " page)) "no link inside a link")))
 
 (deftest homepage-counts-a-split-boost-once
   (run-with-storage

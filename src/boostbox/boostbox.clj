@@ -530,19 +530,18 @@
            [:span.boost-leg-sats (if sats (str "⚡ " sats " sats") "–")]])))
 
 (defn boost-card
-  "Renders a single boost as a card for the homepage overlay"
+  "Renders a single boost as a card for the homepage overlay. Every card lists
+   its legs -- a boost of one record as its one leg -- because the card's
+   amount is the whole boost's: half of tardbox's cards are one record of a
+   split boost, and only the leg line says who that record paid, and how much."
   [boost]
-  (let [href (str "/boost/" (get boost "id"))
-        rows (boost-detail-rows boost)]
-    (if-let [legs (seq (::legs boost))]
-      ;; Links cannot nest, so a card with legs is a box of links: its rows
-      ;; open the first leg, and each leg line opens its own record.
-      [:div.boost-card-link
-       [:div.boost-card
-        (into [:a.boost-card-main {:href href}] rows)
-        (boost-legs legs)]]
-      [:a.boost-card-link {:href href}
-       (into [:div.boost-card] rows)])))
+  ;; Links cannot nest, so a card is a box of links: its rows open the first
+  ;; leg, and each leg line opens its own record.
+  [:div.boost-card-link
+   [:div.boost-card
+    (into [:a.boost-card-main {:href (str "/boost/" (get boost "id"))}]
+          (boost-detail-rows boost))
+    (boost-legs (or (seq (::legs boost)) [boost]))]])
 
 (defn homepage-head []
   (html/html
