@@ -575,13 +575,77 @@
       [:script (html/raw npub-resolve-js)]])))
 
 
-(defn homepage [storage]
+;; ~~~~~~~~~~~~~~~~~~~ Homepage cache ~~~~~~~~~~~~~~~~~~~
+(def homepage-ttl-ms
+  "How long a rendered homepage is served before it is rendered again. POST
+   /boost clears the cache at once, so this only bounds how long a write that
+   did not come through this process -- a hand edit on the volume, another
+   writer to the bucket -- takes to show."
+  60000)
+
+(defn page-cache
+  "Rendered pages, each kept for `ttl-ms`. Built by `serve`, outside the
+   handler factory: in DEV that factory runs on every request, and a cache
+   built inside it would never be hit."
+  [ttl-ms]
+  {:ttl-ms ttl-ms :pages (atom {})})
+
+(defn invalidate-pages! [{:keys [pages]}]
+  (reset! pages {}))
+
+(defn cached-page
+  "The page cached under `k`, rendered by `render` when there is none or it
+   is older than the cache's ttl.
+
+   The homepage reads and parses every stored boost, and a crawler burst of
+   those renders, all at once, was the web app's memory peak -- one that grew
+   with the boost count. Concurrent misses therefore share one render: the
+   entry is a delay, installed before anything is read, so a burst arriving on
+   an empty cache waits on a single read of storage. Installing first is also
+   what makes invalidation safe: an entry that exists when the cache is
+   cleared is dropped with it, and one installed after reads after the write.
+
+   A render that throws is dropped rather than kept, so a storage error is
+   retried by the next request instead of being served until the ttl runs out."
+  [{:keys [ttl-ms pages]} k render]
+  (let [now (System/currentTimeMillis)
+        entry (-> (swap! pages
+                         (fn [m]
+                           (let [e (get m k)]
+                             (if (and e (< (- now (long (:at e))) (long ttl-ms)))
+                               m
+                               (assoc m k {:at now :page (delay (render))})))))
+                  (get k))]
+    (try
+      @(:page entry)
+      (catch Exception e
+        (swap! pages #(if (identical? entry (get % k)) (dissoc % k) %))
+        (throw e)))))
+
+(defn homepage-sort
+  "The `sort` parameter as one of the four orders the page offers. The page is
+   cached per order, so anything else -- a typo, a repeated parameter, a
+   crawler's garbage -- must fold into the default rather than become a cache
+   entry of its own."
+  [param]
+  (get #{"date" "amount" "podcast" "from"} param "date"))
+
+(defn render-homepage ^bytes [boosts sort-param]
+  (.getBytes (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts sort-param) "</html>")
+             "UTF-8"))
+
+(defn homepage [storage pages]
   (fn [request]
-    (let [boosts (try (.list-all storage) (catch Exception _ []))
-          sort-param (get (:query-params request) "sort" "date")]
+    (let [sort-param (homepage-sort (get (:query-params request) "sort"))
+          ^bytes page (try
+                        (cached-page pages sort-param
+                                     #(render-homepage (.list-all storage) sort-param))
+                        ;; The empty state, as before, but never cached.
+                        (catch Exception _ (render-homepage [] sort-param)))]
       {:status 200
-       :headers {"content-type" "text/html; charset=utf-8"}
-       :body (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts sort-param) "</html>")})))
+       :headers {"content-type" "text/html; charset=utf-8"
+                 "content-length" (str (alength page))}
+       :body (java.io.ByteArrayInputStream. page)})))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Boost Schemas ~~~~~~~~~~~~~~~~~~~
 
@@ -754,7 +818,7 @@
       (str "rss::payment::" action " " url separator new-message))
     (str "rss::payment::" action " " url)))
 
-(defn add-boost [cfg storage]
+(defn add-boost [cfg storage pages]
   (fn [{{body-params :body} :parameters :as request}]
     (let [id (gen-ulid)
           url (str (:base-url cfg) "/boost/" id)
@@ -769,7 +833,10 @@
         (catch Exception e
           {:status 500
            ::exception e
-           :body {:error "error during boost storage"}})))))
+           :body {:error "error during boost storage"}})
+        ;; Even a store that threw may have written the boost.
+        (finally
+          (invalidate-pages! pages))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ GET /boosts ~~~~~~~~~~~~~~~~~~~
 (defn list-boosts [cfg storage]
@@ -851,8 +918,8 @@
                "cache-control" "public, max-age=31536000, immutable"}
      :body (java.io.ByteArrayInputStream. bytes)}))
 
-(defn routes [cfg storage]
-  [["/" {:get {:no-doc true :handler (homepage storage)}}]
+(defn routes [cfg storage pages]
+  [["/" {:get {:no-doc true :handler (homepage storage pages)}}]
    ["/og/boost.png" {:get {:no-doc true :handler (boost-banner cfg)}}]
    [(:path images/v4vbox) {:get {:no-doc true :handler (asset-handler images/v4vbox)}}]
    [(:path images/favicon) {:get {:no-doc true :handler (asset-handler images/favicon)}}]
@@ -876,7 +943,7 @@
                      :summary "List all boosts"
                      :swagger {:security [{"auth" []}]}
                      :responses {200 {:body [:vector :map]}}}}]
-   ["/boost" {:post {:handler (add-boost cfg storage)
+   ["/boost" {:post {:handler (add-boost cfg storage pages)
                      :tags #{"boosts"}
                      :middleware [(auth-middleware (:allowed-keys cfg))]
                      :summary "Store boost metadata"
@@ -930,10 +997,10 @@
           {:status 413 :body {:error "payload too large"}}
           (handler request))))))
 
-(defn http-handler [cfg storage]
+(defn http-handler [cfg storage pages]
   (ring/ring-handler
    (ring/router
-    (routes cfg storage)
+    (routes cfg storage pages)
     {:data {:muuntaja muuntaja/instance
             :coercion (reitit.coercion.malli/create
                        {:error-keys #{:in :humanized}
@@ -1013,7 +1080,8 @@
   [cfg storage]
   (let [env (:env cfg)
         dev (= env "DEV")
-        handler-factory (fn [] (runner (http-handler cfg storage)))
+        pages (page-cache homepage-ttl-ms)
+        handler-factory (fn [] (runner (http-handler cfg storage pages)))
         handler (if dev (ring/reloading-ring-handler handler-factory) (handler-factory))]
     (httpd/start-server
      handler
