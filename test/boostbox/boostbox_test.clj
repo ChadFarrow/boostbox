@@ -565,3 +565,50 @@
            (is (= 201 (:status post-resp)))
            (is (str/includes? body posted-id) "a POST clears the cache")
            (is (str/includes? body side-id))))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ One card per boost ~~~~~~~~~~~~~~~~~~~
+;; BoostBox stores a record per payment leg, and a boost split five ways over
+;; LNURL is five records sharing one `group`. On 2026-09-26 tardbox held 2,983
+;; records for 1,463 boosts, and the homepage drew a card for every record.
+
+(deftest the-homepage-shows-one-card-per-boost
+  (let [leg (fn [id group recipient]
+              {"id" id "group" group "recipient_name" recipient
+               "sender_name" "Permanerd" "value_msat_total" 321000})
+        first-leg (leg "01A" "g1" "candr show")
+        ;; list-all's order: newest first
+        boosts [(assoc (leg "01C" "g1" "boostr") "message" "written by a later leg")
+                (leg "01B" "g1" "Reed")
+                {"id" "01AA" "sender_name" "no group"}
+                (leg "019" "" "blank group")
+                (leg "018" "" "blank group")
+                (leg "017" " " "blank group")
+                first-leg]
+        cards (bb/one-card-per-boost boosts)]
+    (is (= ["01AA" "019" "018" "017" "01A"] (map #(get % "id") cards))
+        "a group keeps its first leg, and the order is kept")
+    (is (= first-leg (last cards))
+        "the card is the first leg as stored: a later leg cannot rewrite it")))
+
+(deftest homepage-counts-a-split-boost-once
+  (run-with-storage
+   (fn [{test-config :config}]
+     (let [base-url (:base-url test-config)
+           post! (fn [recipient]
+                   (-> (http/post (str base-url "/boost")
+                                  {:headers {"x-api-key" (-> test-config :allowed-keys first)
+                                             "Content-Type" "application/json"}
+                                   :body (json/write-value-as-string
+                                          (assoc (minimal-boost-payload)
+                                                 :group "48964d4a-51d1-4328-a1b2-02a6bb4aed97"
+                                                 :recipient_name recipient))
+                                   :throw false})
+                       :body json/read-value (get "id")))
+           first-id (post! "candr show")
+           second-id (post! "boostr")
+           body (:body (http/get base-url {:throw false}))]
+       (is (str/includes? body first-id))
+       (is (not (str/includes? body second-id)))
+       (is (= "1 boost" (second (re-find #"class=\"boost-count\">([^<]*)" body))))
+       (is (= 200 (:status (http/get (str base-url "/boost/" second-id) {:throw false})))
+           "the other leg's own page still answers")))))

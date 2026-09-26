@@ -110,6 +110,18 @@
     (is (= "d98d189b-dc7b-45b1-8720-d4b98690f31f" (get p "item_guid")))
     (is (not (contains? p "value_usd")) "absent fields are omitted, not sent as null")))
 
+;; BoostBox stores one record per payment leg and ties a boost's legs together
+;; with `group`; blip-10 calls the same id `uuid`, and BoostMeBitch sends it on
+;; every leg. A keysend leg stored without it is a boost of its own on the
+;; homepage, beside the LNURL legs the app stored itself.
+(deftest a-stored-leg-keeps-its-boost-group
+  (let [uuid "48964d4a-51d1-4328-a1b2-02a6bb4aed97"
+        payload #(bg/->boost-payload (bg/normalize %) {})]
+    (is (= uuid (get (payload (assoc fountain-tlv "uuid" uuid)) "group")))
+    (is (= uuid (get (payload (assoc fountain-tlv "group" uuid)) "group"))
+        "BoostBox's own spelling")
+    (is (not (contains? (payload fountain-tlv) "group")))))
+
 (deftest received-amount-beats-the-apps-claim
   (let [b (bg/normalize (assoc fountain-tlv "value_msat" 999999))
         p (bg/->boost-payload b {:received-msat 21000 :settled-at 0})]

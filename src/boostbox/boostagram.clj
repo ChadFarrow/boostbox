@@ -136,6 +136,10 @@
      :item-guid (->str (get* m "episode_guid" "item_guid"))
      :remote-feed-guid (->str (get* m "remote_feed_guid"))
      :remote-item-guid (->str (get* m "remote_item_guid"))
+     ;; One id shared by every leg of a split boost. blip-10 calls it "uuid";
+     ;; BoostBox stores it as "group", and the homepage draws one card per
+     ;; group -- a leg stored without it is a boost of its own there.
+     :group (clean (get* m "uuid" "group") max-name-length)
      ;; "ts" is seconds into the episode, NOT a wall clock. "time" is a
      ;; human "HH:MM:SS" of the same thing. Neither is when the boost happened.
      ;; BoostBox's own schema calls the same thing "position".
@@ -296,7 +300,8 @@
            "item_guid" (:item-guid b)
            "item_title" (:episode b)
            "remote_feed_guid" (:remote-feed-guid b)
-           "remote_item_guid" (:remote-item-guid b)})))
+           "remote_item_guid" (:remote-item-guid b)
+           "group" (:group b)})))
 
 ;; ~~~~~~~~~~~~~~~~~~~ NIP-73 tags ~~~~~~~~~~~~~~~~~~~
 
