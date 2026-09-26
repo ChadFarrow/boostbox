@@ -630,6 +630,32 @@
   [param]
   (get #{"date" "amount" "podcast" "from"} param "date"))
 
+(defn one-card-per-boost
+  "`boosts` with every leg of a split boost but the first dropped.
+
+   BoostBox stores a record per payment leg, and the legs of one boost share a
+   `group`: a boost split five ways over LNURL is five records, and drawing a
+   card for each counted it five times -- on 2026-09-26 the homepage showed
+   2,983 cards for 1,463 boosts, and every count and section total with them.
+
+   The card is the first leg exactly as stored, never a merge: each leg is
+   written by whoever paid, so letting a later one fill in a field would let
+   any payer who learns a group id write onto someone else's card. A record
+   with no group is its own boost. Order is kept."
+  [boosts]
+  (let [group-of (fn [b] (let [g (get b "group")]
+                           (when (and (string? g) (not (str/blank? g))) g)))
+        first-leg (reduce (fn [m b]
+                            (if-let [g (group-of b)]
+                              (update m g #(if (and % (neg? (compare (get % "id") (get b "id"))))
+                                             %
+                                             b))
+                              m))
+                          {}
+                          boosts)]
+    (filter #(let [g (group-of %)] (or (nil? g) (identical? % (first-leg g))))
+            boosts)))
+
 (defn render-homepage ^bytes [boosts sort-param]
   (.getBytes (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts sort-param) "</html>")
              "UTF-8"))
@@ -639,7 +665,8 @@
     (let [sort-param (homepage-sort (get (:query-params request) "sort"))
           ^bytes page (try
                         (cached-page pages sort-param
-                                     #(render-homepage (.list-all storage) sort-param))
+                                     #(render-homepage (one-card-per-boost (.list-all storage))
+                                                       sort-param))
                         ;; The empty state, as before, but never cached.
                         (catch Exception _ (render-homepage [] sort-param)))]
       {:status 200
