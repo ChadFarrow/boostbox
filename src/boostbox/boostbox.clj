@@ -452,6 +452,16 @@
        ".boost-card .boost-label { color: rgba(255,255,255,0.4); font-size: 0.75rem; }"
        ".boost-card .boost-value { color: rgba(255,255,255,0.9); font-size: 0.85rem; }"
        ".boost-card .boost-value.sats { color: #f7931a; font-weight: 600; }"
+       ;; A split boost's leg list, under its card's rows
+       ".boost-card-main { text-decoration: none; color: inherit; display: block; }"
+       ".boost-legs { margin-top: 0.6rem; padding-top: 0.5rem; border-top: 1px solid rgba(255,255,255,0.08); }"
+       ".boost-legs-title { color: rgba(255,255,255,0.4); font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; "
+       "text-transform: uppercase; margin-bottom: 0.2rem; }"
+       ".boost-leg { display: flex; justify-content: space-between; gap: 0.75rem; padding: 0.3rem 0.5rem; margin: 0 -0.5rem; "
+       "border-radius: 6px; color: rgba(255,255,255,0.85); font-size: 0.82rem; text-decoration: none; }"
+       ".boost-leg:hover { background: rgba(247,147,26,0.1); color: #fff; }"
+       ".boost-leg-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"
+       ".boost-leg-sats { color: #f7931a; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }"
 
        ;; Empty state
        ".empty-state { color: rgba(255,255,255,0.4); font-size: 1rem; padding: 3rem 2rem; "
@@ -496,11 +506,43 @@
        "main { padding: 0 0.75rem; } "
        "}"))
 
+(defn- leg-name
+  "Who a leg paid: its recipient's name, else its address. Both are written by
+   the app that POSTed, and render as escaped text."
+  [leg]
+  (or (some #(let [v (get leg %)] (when (and (string? v) (not (str/blank? v))) v))
+            ["recipient_name" "recipient_address"])
+      "(unnamed)"))
+
+(defn boost-legs
+  "One line per leg of a split boost, each linking to its own record.
+   \"Recorded\", not \"paid\": an app POSTs before it pays, so a record is not
+   proof a payment settled, and a keysend leg the app never POSTed is missing
+   from the list without anything being wrong."
+  [legs]
+  (into [:div.boost-legs
+         [:div.boost-legs-title (str "Legs recorded (" (count legs) ")")]]
+        (for [leg legs
+              :let [v (get leg "value_msat")
+                    sats (when (number? v) (format-sats v))]]
+          [:a.boost-leg {:href (str "/boost/" (get leg "id"))}
+           [:span.boost-leg-name (leg-name leg)]
+           [:span.boost-leg-sats (if sats (str "⚡ " sats " sats") "–")]])))
+
 (defn boost-card
   "Renders a single boost as a card for the homepage overlay"
   [boost]
-  [:a.boost-card-link {:href (str "/boost/" (get boost "id"))}
-   (into [:div.boost-card] (boost-detail-rows boost))])
+  (let [href (str "/boost/" (get boost "id"))
+        rows (boost-detail-rows boost)]
+    (if-let [legs (seq (::legs boost))]
+      ;; Links cannot nest, so a card with legs is a box of links: its rows
+      ;; open the first leg, and each leg line opens its own record.
+      [:div.boost-card-link
+       [:div.boost-card
+        (into [:a.boost-card-main {:href href}] rows)
+        (boost-legs legs)]]
+      [:a.boost-card-link {:href href}
+       (into [:div.boost-card] rows)])))
 
 (defn homepage-head []
   (html/html
@@ -630,8 +672,26 @@
   [param]
   (get #{"date" "amount" "podcast" "from"} param "date"))
 
+(def leg-window-ms
+  "How long after a boost's first leg another leg may still join its card.
+   On 2026-09-26 the slowest of tardbox's 699 split boosts landed its last leg
+   54 minutes after its first (median 14 s, 95th percentile 67 s). The bound
+   exists because a group id is not proof of anything: the bot files a keysend
+   under whatever `uuid` its payer wrote, so a few sats can claim any group,
+   and a leg claiming an older boost would otherwise be listed under it."
+  (* 60 60 1000))
+
+(defn- leg-time
+  "When the server minted this record's id, in epoch ms, or nil if the id is
+   not a ULID. The id is the one field no app writes, so it dates a leg."
+  [b]
+  (let [id (get b "id")]
+    (when (and (string? id) (= 26 (count id)))
+      (try (ulid/ulid->timestamp id) (catch Exception _ nil)))))
+
 (defn one-card-per-boost
-  "`boosts` with every leg of a split boost but the first dropped.
+  "`boosts` with one card per split boost: the first leg, carrying every leg
+   in order under `::legs` when there is more than one.
 
    BoostBox stores a record per payment leg, and the legs of one boost share a
    `group`: a boost split five ways over LNURL is five records, and drawing a
@@ -640,11 +700,13 @@
 
    The card is the first leg exactly as stored, never a merge: each leg is
    written by whoever paid, so letting a later one fill in a field would let
-   any payer who learns a group id write onto someone else's card. A record
-   with no group is its own boost. Order is kept."
+   any payer who learns a group id write onto someone else's card. The legs
+   are listed, not merged, and only those within `leg-window-ms` of the first.
+   A record with no group, a blank one, or an id that is not a ULID is its
+   own boost, and so is a leg outside the window. Order is kept."
   [boosts]
   (let [group-of (fn [b] (let [g (get b "group")]
-                           (when (and (string? g) (not (str/blank? g))) g)))
+                           (when (and (string? g) (not (str/blank? g)) (leg-time b)) g)))
         first-leg (reduce (fn [m b]
                             (if-let [g (group-of b)]
                               (update m g #(if (and % (neg? (compare (get % "id") (get b "id"))))
@@ -652,9 +714,22 @@
                                              b))
                               m))
                           {}
-                          boosts)]
-    (filter #(let [g (group-of %)] (or (nil? g) (identical? % (first-leg g))))
-            boosts)))
+                          boosts)
+        joins? (fn [b] (when-let [g (group-of b)]
+                         (let [f (first-leg g)]
+                           (and (not (identical? b f))
+                                (<= (- (leg-time b) (leg-time f)) leg-window-ms)))))
+        more-legs (group-by group-of (filter joins? boosts))]
+    (keep (fn [b]
+            (let [g (group-of b)]
+              (cond
+                (and g (identical? b (first-leg g)))
+                (if-let [more (seq (more-legs g))]
+                  (assoc b ::legs (vec (sort-by #(get % "id") (cons b more))))
+                  b)
+                (joins? b) nil
+                :else b)))
+          boosts)))
 
 (defn render-homepage ^bytes [boosts sort-param]
   (.getBytes (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts sort-param) "</html>")

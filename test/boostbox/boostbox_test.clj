@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.boostbox :as bb]
             [boostbox.images :as images]
+            [boostbox.ulid :as ulid]
+            [dev.onionpancakes.chassis.core :as html]
             [babashka.http-client :as http]
             [cognitect.aws.client.protocol :as aws-proto]
             [jsonista.core :as json]
@@ -571,24 +573,86 @@
 ;; LNURL is five records sharing one `group`. On 2026-09-26 tardbox held 2,983
 ;; records for 1,463 boosts, and the homepage drew a card for every record.
 
+(defn- ulid-at
+  "A ULID minted `minutes` after a fixed instant; `tail` tells apart ULIDs
+   minted in the same millisecond. The id is what dates a leg, because the
+   server mints it -- every other field is written by the app that POSTed."
+  [minutes tail]
+  (str (ulid/encode (+ 1790397000000 (* minutes 60000)) 10)
+       (subs (str tail "0000000000000000") 0 16)))
+
 (deftest the-homepage-shows-one-card-per-boost
   (let [leg (fn [id group recipient]
               {"id" id "group" group "recipient_name" recipient
                "sender_name" "Permanerd" "value_msat_total" 321000})
-        first-leg (leg "01A" "g1" "candr show")
+        first-leg (leg (ulid-at 0 "1") "g1" "candr show")
+        no-group {"id" (ulid-at 1 "2") "sender_name" "no group"}
+        blanks [(leg (ulid-at 3 "3") "" "blank group")
+                (leg (ulid-at 3 "2") "" "blank group")
+                (leg (ulid-at 3 "1") " " "blank group")]
         ;; list-all's order: newest first
-        boosts [(assoc (leg "01C" "g1" "boostr") "message" "written by a later leg")
-                (leg "01B" "g1" "Reed")
-                {"id" "01AA" "sender_name" "no group"}
-                (leg "019" "" "blank group")
-                (leg "018" "" "blank group")
-                (leg "017" " " "blank group")
-                first-leg]
+        boosts (concat [(assoc (leg (ulid-at 2 "1") "g1" "boostr") "message" "written by a later leg")
+                        (leg (ulid-at 1 "1") "g1" "Reed")
+                        no-group]
+                       blanks
+                       [first-leg])
         cards (bb/one-card-per-boost boosts)]
-    (is (= ["01AA" "019" "018" "017" "01A"] (map #(get % "id") cards))
+    (is (= (map #(get % "id") (concat [no-group] blanks [first-leg]))
+           (map #(get % "id") cards))
         "a group keeps its first leg, and the order is kept")
-    (is (= first-leg (last cards))
+    (is (= first-leg (dissoc (last cards) ::bb/legs))
         "the card is the first leg as stored: a later leg cannot rewrite it")))
+
+(deftest a-split-boost-card-lists-every-leg
+  (let [leg (fn [minutes recipient]
+              {"id" (ulid-at minutes "1") "group" "a37b242b-73f8-4886-b481-1ed12dc5a936"
+               "recipient_name" recipient "value_msat" 105000})
+        legs [(leg 0 "candr show") (leg 2 "Reed") (leg 4 "boostr")]
+        [card & more] (bb/one-card-per-boost (reverse legs))]
+    (is (nil? more) "one card")
+    (is (= (map #(get % "id") legs) (map #(get % "id") (::bb/legs card)))
+        "every leg, the first included, oldest first")
+    (is (nil? (::bb/legs (first (bb/one-card-per-boost [{"id" (ulid-at 0 "9") "group" "solo"}]))))
+        "a boost of one record has no leg list")))
+
+(deftest a-leg-an-hour-after-the-first-is-its-own-boost
+  ;; The bot files a keysend under whatever `uuid` its payer wrote, so a few
+  ;; sats can claim any group id. The slowest real boost on tardbox took 54
+  ;; minutes to land every leg; a leg claiming an older boost gets its own card.
+  (let [first-leg {"id" (ulid-at 0 "1") "group" "g1" "recipient_name" "ChadF"}
+        slowest-real {"id" (ulid-at 54 "1") "group" "g1" "recipient_name" "Reed"}
+        late {"id" (ulid-at 61 "1") "group" "g1" "recipient_name" "not a leg"}
+        cards (bb/one-card-per-boost [late slowest-real first-leg])]
+    (is (= [(get late "id") (get first-leg "id")] (map #(get % "id") cards)))
+    (is (= [(get first-leg "id") (get slowest-real "id")]
+           (map #(get % "id") (::bb/legs (last cards)))))))
+
+(deftest a-leg-whose-time-cannot-be-read-is-its-own-boost
+  (let [first-leg {"id" (ulid-at 0 "1") "group" "g1"}
+        odd {"id" "not-a-ulid" "group" "g1"}]
+    (is (= ["not-a-ulid" (get first-leg "id")]
+           (map #(get % "id") (bb/one-card-per-boost [odd first-leg]))))))
+
+(deftest a-split-boost-card-links-each-leg
+  (let [legs [{"id" (ulid-at 0 "1") "group" "g1" "recipient_name" "candr show"
+               "value_msat" 105000 "value_msat_total" 321000 "sender_name" "Permanerd"}
+              {"id" (ulid-at 1 "1") "group" "g1" "recipient_address" "reed@getalby.com"
+               "value_msat" 105000}
+              {"id" (ulid-at 2 "1") "group" "g1" "value_msat" 3000}]
+        page (html/html (bb/boost-card (first (bb/one-card-per-boost (reverse legs)))))
+        solo {"id" (ulid-at 5 "1") "group" "g2" "sender_name" "Permanerd"}]
+    (is (str/includes? page "Legs recorded (3)"))
+    (doseq [leg legs]
+      (is (str/includes? page (str "href=\"/boost/" (get leg "id") "\""))))
+    (is (str/includes? page "candr show") "a leg is named by its recipient")
+    (is (str/includes? page "reed@getalby.com") "or by its address, when it has no name")
+    (is (str/includes? page "(unnamed)") "or says it has neither")
+    (is (str/includes? page "3 sats"))
+    (is (not (re-find #"(?s)<a [^>]*>(?:(?!</a>).)*<a " page)) "no link inside a link")
+    (is (= (html/html [:a.boost-card-link {:href (str "/boost/" (get solo "id"))}
+                       (into [:div.boost-card] (bb/boost-detail-rows solo))])
+           (html/html (bb/boost-card solo)))
+        "a boost of one record renders exactly as before")))
 
 (deftest homepage-counts-a-split-boost-once
   (run-with-storage
@@ -608,7 +672,9 @@
            second-id (post! "boostr")
            body (:body (http/get base-url {:throw false}))]
        (is (str/includes? body first-id))
-       (is (not (str/includes? body second-id)))
+       (is (= 1 (count (re-seq #"class=\"boost-card\"" body))) "one card")
+       (is (str/includes? body (str "href=\"/boost/" second-id "\""))
+           "which links the other leg")
        (is (= "1 boost" (second (re-find #"class=\"boost-count\">([^<]*)" body))))
        (is (= 200 (:status (http/get (str base-url "/boost/" second-id) {:throw false})))
            "the other leg's own page still answers")))))
