@@ -491,6 +491,8 @@
 
        ;; Section headers
        ".section { margin-bottom: 0.25rem; }"
+       ;; the same space .overlay-middle's gap puts between unsectioned cards
+       ".section .boost-card-link + .boost-card-link { margin-top: 0.75rem; }"
        ".section-header { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.25rem; }"
        ".section-line { flex: 1; height: 1px; background: rgba(255,255,255,0.1); }"
        ".section-title { color: rgba(255,255,255,0.7); font-size: 0.8rem; font-weight: 600; white-space: nowrap; }"
