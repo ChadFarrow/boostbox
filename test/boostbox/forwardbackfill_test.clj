@@ -38,3 +38,16 @@
                   bot/tx->boost! (fn [_ tx] (result (str "h" tx) "boost"))
                   fwd/send! (fn [_ _] {:ok? (= 2 (swap! calls inc)) :status 200})]
       (is (= {:read 30 :forwardable 30 :sent 5 :failed 25} (bf/backfill! ctx ::session 0))))))
+
+(deftest backfill-sends-the-oldest-payments-first
+  (let [sent (atom [])]
+    ;; the wallet answers newest first
+    (with-redefs [bot/fetch-transactions! (fn [_ _] (vec (range 29 -1 -1)))
+                  bot/tx->boost! (fn [_ tx] (assoc (result (str "h" tx) "boost") :settled-at (+ 1790000000 tx)))
+                  fwd/send! (fn [_ batch] (swap! sent conj (mapv #(get % "payment_hash") batch)) {:ok? true :status 200})]
+      (bf/backfill! ctx ::session 0)
+      (is (= [(mapv #(str "h" %) (range 25)) (mapv #(str "h" %) (range 25 30))] @sent)))))
+
+(deftest backfill-exits-non-zero-when-a-batch-failed
+  (is (= 0 (bf/exit-status {:read 30 :forwardable 30 :sent 30 :failed 0})))
+  (is (= 1 (bf/exit-status {:read 30 :forwardable 30 :sent 5 :failed 25}))))
