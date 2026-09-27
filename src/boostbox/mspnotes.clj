@@ -192,12 +192,15 @@
 
 (defn deletion-events
   "NIP-09 requests for `ids`, fifty notes to a request so no one event nears a
-   relay's size limit."
-  [seckey ids]
-  (for [batch (partition-all notes-per-deletion ids)]
-    (nostr/sign-event seckey {:kind 5
-                              :content delete-reason
-                              :tags (conj (mapv (fn [id] ["e" id]) batch) ["k" "1"])})))
+   relay's size limit -- or `per-request`. relay.fountain.fm answers OK to a
+   request of fifty and deletes only the first note it names, so that relay
+   needs one note per request."
+  ([seckey ids] (deletion-events seckey ids notes-per-deletion))
+  ([seckey ids per-request]
+   (for [batch (partition-all (max 1 per-request) ids)]
+     (nostr/sign-event seckey {:kind 5
+                               :content delete-reason
+                               :tags (conj (mapv (fn [id] ["e" id]) batch) ["k" "1"])}))))
 
 (defn repost-key?
   "Re-posting under the key that published them would move nothing."
@@ -329,24 +332,26 @@
             (println (- (count todo) failed) "posted," failed "refused by every relay")
             (if (pos? failed) 1 0)))))))
 
-(defn- delete! [{:keys [relays file seckey apply?]}]
+(defn- delete! [{:keys [relays file seckey apply? interval-ms per-request]}]
   (let [notes (read-notes file)]
     (if-not (delete-key? seckey notes)
       (do (println "that key is not the exported notes' author -- paste Boostr_Bot's nsec") 2)
-      (let [events (deletion-events seckey (map :id notes))]
+      (let [events (vec (deletion-events seckey (map :id notes) per-request))]
         (println (count notes) "notes in" (str file) "->" (count events) "deletion requests to" (str/join " " relays))
         (if-not apply?
           (do (println "dry run: nothing sent. Add --apply to send them.") 0)
-          (let [failed (count (for [e events
-                                    :let [r (relay/publish-to-relays! relays e)
-                                          _ (println (:id e) (accepted-by r))]
-                                    :when (not (:ok? r))]
-                                e))]
+          (let [failed (reduce (fn [failed [i e]]
+                                 (when (pos? i) (Thread/sleep (long interval-ms)))
+                                 (let [r (relay/publish-to-relays! relays e)]
+                                   (println (inc i) "/" (count events) (:id e) (accepted-by r))
+                                   (cond-> failed (not (:ok? r)) inc)))
+                               0 (map-indexed vector events))]
             (println (- (count events) failed) "sent," failed "refused by every relay")
             (if (pos? failed) 1 0)))))))
 
 (defn -main
   "java -cp boostbox.jar boostbox.mspnotes export|repost|delete [--apply] [--interval <sec>]
+                                                              [--per-request <n>]
    Reads BBN_RELAYS, BBN_NOSTR_SECKEY (repost: MSP 2.0's; delete: Boostr_Bot's),
    BBN_PUBLISH_FEED_GUIDS, BBN_CLIENT_NAME, and BBN_PI_KEY/BBN_PI_SECRET (repost,
    to find each album's artist); MSP_NOTES_FILE moves the export."
@@ -359,7 +364,10 @@
               :apply? (boolean (some #{"--apply"} flags))
               :interval-ms (if-let [sec (second (drop-while #(not= "--interval" %) flags))]
                              (* 1000 (Long/parseLong sec))
-                             default-interval-ms)}
+                             default-interval-ms)
+              :per-request (if-let [n (second (drop-while #(not= "--per-request" %) flags))]
+                             (Long/parseLong n)
+                             notes-per-deletion)}
         key! #(nostr/decode-key (bb/get-env "BBN_NOSTR_SECKEY") "nsec")
         status (case cmd
                  "export" (export! (assoc opts :author (nostr/bytes->hex (nostr/decode-key boostr-npub "npub"))))
@@ -370,7 +378,7 @@
                                           :pi-secret (bb/get-env "BBN_PI_SECRET" nil)
                                           :guids (bot/feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))))
                  "delete" (delete! (assoc opts :seckey (key!)))
-                 (do (println "usage: boostbox.mspnotes export|repost|delete [--apply] [--interval <sec>]")
+                 (do (println "usage: boostbox.mspnotes export|repost|delete [--apply] [--interval <sec>] [--per-request <n>]")
                      2))]
     (shutdown-agents)
     (System/exit status)))
