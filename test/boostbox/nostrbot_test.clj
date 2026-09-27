@@ -1,11 +1,13 @@
 (ns boostbox.nostrbot-test
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.boostagram :as bg]
+            [boostbox.forward :as fwd]
             [boostbox.nostrbot :as bot]
             [boostbox.podcastindex]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
             [boostbox.relay :as relay]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [jsonista.core :as json]))
 
 (def seckey (nostr/hex->bytes (apply str (repeat 64 "9"))))
@@ -301,6 +303,10 @@
       (is (= "01LINKED" (:boost-id b)))
       (is (= "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf" (-> b :boostagram :feed-guid))
           "so the note can still carry NIP-73 tags"))))
+
+(deftest a-linked-boost-carries-the-metadata-the-link-returned
+  (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+    (is (= linked-metadata (:link-metadata (bot/tx->boost! (ctx (atom {})) link-tx))))))
 
 (deftest a-linked-boost-is-never-stored-twice
   (let [a (atom {"cursor" 50 "recent" []})
@@ -669,3 +675,198 @@
             r (resolve-feed pi-creds {} b)]
         (is (nil? (:url (:boostagram r))))
         (is (= "https://cdn.example/a.jpg" (:artwork r)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Forwarding to MSP ~~~~~~~~~~~~~~~~~~~
+
+(defn- stream [hash settled-at]
+  {:payment-hash hash :settled-at settled-at :received-msat 1000
+   :boostagram (bg/normalize {"action" "stream" "name" "MSP 2.0"
+                              "guid" "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"})})
+
+(defn- fwd-ctx [a & {:as overrides}]
+  (merge (ctx a
+              :forward-url "https://msp.example/api/boosts/ingest"
+              :forward-token "tok"
+              :forward-actions #{"boost" "auto" "stream"}
+              :recipient-names #{"msp 2.0"}
+              :actions #{"boost" "auto"})
+         overrides))
+
+(defn- hashes [records] (mapv #(get % "payment_hash") records))
+
+(deftest a-stream-is-forwarded-and-never-published
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (empty? @published))
+      (is (= ["s1"] (hashes @sent))))))
+
+(deftest a-boost-is-forwarded-once-its-note-is-out
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["h1"] (hashes @sent)))
+      (is (fwd/forwarded? @a "h1") "and the saved state says so"))))
+
+(deftest a-boost-whose-note-failed-is-not-forwarded-yet
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? false :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (empty? @sent)))))
+
+(deftest msp-being-down-queues-without-holding-the-cursor
+  (let [a (atom {"cursor" 50 "recent" []})]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? false :status 503})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= 100 (get @a "cursor")) "the note went out, so the cursor moves on")
+      (is (= ["h1"] (hashes (get @a "forward-pending")))))))
+
+(deftest nothing-is-forwarded-without-a-recipient-filter
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :recipient-names #{}) ::session)
+      (is (empty? @sent)))))
+
+;; The five tests above stub nwc/transaction->boost as a map, which ignores its
+;; second argument (the opts) whenever the key is present -- so they would all
+;; still pass even if poll-once! passed plain `ctx` instead of the widened
+;; `read-ctx`. These two use a real function stub that honours `opts` the way
+;; nwc/transaction->boost actually does, so they are the ones that catch a
+;; regression in that wiring.
+(defn- honest-stream-stub [result]
+  (fn [_tx opts]
+    (if (contains? (:actions opts) "stream")
+      result
+      {:skip :not-a-boost :action "stream"})))
+
+(deftest a-forwarding-bot-reads-a-stream-it-would-otherwise-skip
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost (honest-stream-stub (stream "s1" 100))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["s1"] (hashes @sent)) "forwarding is on, so :actions was widened to include \"stream\"")
+      (is (empty? @published)))))
+
+(deftest a-bot-without-forwarding-still-skips-streams
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost (honest-stream-stub (stream "s1" 100))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (empty? @sent) "forwarding is off, so :actions was never widened and the stream stays a skip")
+      (is (empty? @published)))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Forwarding survives a crash ~~~~~~~~~~~~~~~~~~~
+
+;; A transaction the wallet hands back, carrying the time the cursor moves to.
+(defn- tx [hash settled-at] {"payment_hash" hash "settled_at" settled-at})
+
+(defn- wallet-after
+  "list_transactions over `txs`, answering only what settled after `from` -- so a
+   poll whose cursor has moved past a payment never reads it again."
+  [txs]
+  (fn [_ {:keys [from]}] (filterv #(> (get % "settled_at") from) txs)))
+
+(deftest a-stream-is-saved-in-the-queue-before-it-is-sent
+  (let [a (atom {"cursor" 50 "recent" []})
+        at-send (atom nil)
+        t1 (tx "s1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (stream "s1" 100)}
+                  fwd/send! (fn [_ _] (reset! at-send @a) (throw (ex-info "killed mid-send" {})))]
+      (is (thrown? Exception (bot/poll-once! (fwd-ctx a) ::session)))
+      (is (= ["s1"] (hashes (get @at-send "forward-pending")))
+          "the saved state held the stream before any send began")
+      (is (= 100 (get @at-send "cursor")) "in the same save that moved the cursor past it"))))
+
+(deftest a-published-boost-is-saved-in-the-queue-before-it-is-sent
+  (let [a (atom {"cursor" 50 "recent" []})
+        at-send (atom nil)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ _] (reset! at-send @a) (throw (ex-info "killed mid-send" {})))]
+      (is (thrown? Exception (bot/poll-once! (fwd-ctx a) ::session)))
+      (is (= ["h1"] (hashes (get @at-send "forward-pending"))))
+      (is (= 100 (get @at-send "cursor"))))))
+
+(deftest the-poll-after-a-crash-sends-what-was-queued
+  (let [a (atom {"cursor" 50 "recent" []})
+        crash? (atom true)
+        sent (atom [])
+        t1 (tx "s1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch]
+                              (when @crash? (throw (ex-info "killed mid-send" {})))
+                              (swap! sent into batch)
+                              {:ok? true :status 200})]
+      (is (thrown? Exception (bot/poll-once! (fwd-ctx a) ::session)))
+      (reset! crash? false)
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["s1"] (hashes @sent)) "sent from the queue, though the wallet no longer returns it")
+      (is (fwd/forwarded? @a "s1"))
+      (is (empty? (get @a "forward-pending"))))))
+
+(deftest a-dry-run-bot-forwards-nothing
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1 ::tx1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100) ::tx1 (boost "h1" 200)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] (throw (AssertionError. "dry run must not publish")))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :dry-run? true) ::session)
+      (is (empty? @sent) "a dry run never records event_id, so it must not forward either")
+      (is (empty? (get @a "forward-pending")) "nor queue anything to send later"))))
+
+(deftest a-full-queue-says-which-payments-it-dropped
+  (let [old (mapv #(fwd/->record (stream (str "q" %) (+ 1000 %))) (range fwd/max-pending))
+        a (atom {"cursor" 50 "recent" [] "forward-pending" old})
+        logs (atom [])
+        t1 (tx "s1" 5000)
+        t2 (tx "s2" 5001)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t2 t1])
+                  nwc/transaction->boost {t1 (stream "s1" 5000) t2 (stream "s2" 5001)}
+                  fwd/send! (fn [_ _] {:ok? false :status 503})
+                  mulog-core/log* (fn [_ event pairs]
+                                    (swap! logs conj (assoc (apply hash-map pairs) :event event)))]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (let [dropped (filter #(= ::bot/forward-pending-dropped (:event %)) @logs)]
+        (is (= 1 (count dropped)) "one line for the poll")
+        (is (= {:dropped 2 :oldest-dropped-time 1000 :newest-dropped-time 1001}
+               (select-keys (first dropped) [:dropped :oldest-dropped-time :newest-dropped-time]))
+            "the times a backfill must reach back to"))
+      (is (= fwd/max-pending (count (get @a "forward-pending"))))
+      (is (= ["s1" "s2"] (take-last 2 (hashes (get @a "forward-pending"))))
+          "queued oldest first, whatever order the wallet answered in"))))
