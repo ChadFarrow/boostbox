@@ -1,6 +1,7 @@
 (ns boostbox.nostrbot-test
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.boostagram :as bg]
+            [boostbox.forward :as fwd]
             [boostbox.nostrbot :as bot]
             [boostbox.podcastindex]
             [boostbox.nostr :as nostr]
@@ -673,3 +674,76 @@
             r (resolve-feed pi-creds {} b)]
         (is (nil? (:url (:boostagram r))))
         (is (= "https://cdn.example/a.jpg" (:artwork r)))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Forwarding to MSP ~~~~~~~~~~~~~~~~~~~
+
+(defn- stream [hash settled-at]
+  {:payment-hash hash :settled-at settled-at :received-msat 1000
+   :boostagram (bg/normalize {"action" "stream" "name" "MSP 2.0"
+                              "guid" "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"})})
+
+(defn- fwd-ctx [a & {:as overrides}]
+  (merge (ctx a
+              :forward-url "https://msp.example/api/boosts/ingest"
+              :forward-token "tok"
+              :forward-actions #{"boost" "auto" "stream"}
+              :recipient-names #{"msp 2.0"}
+              :actions #{"boost" "auto"})
+         overrides))
+
+(defn- hashes [records] (mapv #(get % "payment_hash") records))
+
+(deftest a-stream-is-forwarded-and-never-published
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (empty? @published))
+      (is (= ["s1"] (hashes @sent))))))
+
+(deftest a-boost-is-forwarded-once-its-note-is-out
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["h1"] (hashes @sent)))
+      (is (fwd/forwarded? @a "h1") "and the saved state says so"))))
+
+(deftest a-boost-whose-note-failed-is-not-forwarded-yet
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? false :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (empty? @sent)))))
+
+(deftest msp-being-down-queues-without-holding-the-cursor
+  (let [a (atom {"cursor" 50 "recent" []})]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? false :status 503})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= 100 (get @a "cursor")) "the note went out, so the cursor moves on")
+      (is (= ["h1"] (hashes (get @a "forward-pending")))))))
+
+(deftest nothing-is-forwarded-without-a-recipient-filter
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :recipient-names #{}) ::session)
+      (is (empty? @sent)))))

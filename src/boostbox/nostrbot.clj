@@ -17,6 +17,7 @@
             [com.brunobonacci.mulog :as u]
             [boostbox.boostbox :as bb]
             [boostbox.boostagram :as bg]
+            [boostbox.forward :as fwd]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
             [boostbox.safefetch :as sf]
@@ -53,64 +54,67 @@
         nwc-uri (bb/get-env "BBN_NWC_URI")
         nwc (nwc/parse-uri nwc-uri)
         seckey (nostr/decode-key (bb/get-env "BBN_NOSTR_SECKEY") "nsec")]
-    {:bb-cfg bb-cfg
-     :nwc nwc
-     :seckey seckey
-     :pubkey (nostr/bytes->hex (nostr/x-only-pubkey seckey))
-     :npub (nostr/->npub (nostr/x-only-pubkey seckey))
-     :relays (csv (bb/get-env "BBN_RELAYS" default-relays))
-     :boostbox-url (str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
-                                #"/+$" "")
-     :boostbox-api-key (bb/get-env "BBN_BOOSTBOX_API_KEY")
+    ;; BBN_FORWARD_* -- see boostbox.forward; only msp-bot sets them
+    (merge
+     {:bb-cfg bb-cfg
+      :nwc nwc
+      :seckey seckey
+      :pubkey (nostr/bytes->hex (nostr/x-only-pubkey seckey))
+      :npub (nostr/->npub (nostr/x-only-pubkey seckey))
+      :relays (csv (bb/get-env "BBN_RELAYS" default-relays))
+      :boostbox-url (str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
+                                 #"/+$" "")
+      :boostbox-api-key (bb/get-env "BBN_BOOSTBOX_API_KEY")
      ;; Origins the bot will fetch a boost link from. Empty means "any https
      ;; origin, subject to the address check at fetch time" -- the default,
      ;; because apps POST to whichever BoostBox they run and a podcaster cannot
      ;; enumerate those in advance. Naming origins here locks the bot down to
      ;; those plus our own.
-     :boost-link-origins (let [named (csv (bb/get-env "BBN_BOOST_LINK_ORIGINS" ""))]
-                           (when (seq named)
-                             (into [(str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
-                                                 #"/+$" "")]
-                                   named)))
+      :boost-link-origins (let [named (csv (bb/get-env "BBN_BOOST_LINK_ORIGINS" ""))]
+                            (when (seq named)
+                              (into [(str/replace (bb/get-env "BBN_BOOSTBOX_URL" "https://tardbox.com")
+                                                  #"/+$" "")]
+                                    named)))
      ;; NIP-89's `client` tag: the app that created and signed the note, which
      ;; is this bot. Never the app that paid -- that goes in the `app` tag, and
      ;; a client renders `client` as "via ..." under the note.
-     :client-name (bb/get-env "BBN_CLIENT_NAME" bg/default-client-name)
+      :client-name (bb/get-env "BBN_CLIENT_NAME" bg/default-client-name)
      ;; Reading the show's feed is what gives a note its picture and its p
      ;; tags. Off is a supported way to run: the note still publishes, without
      ;; either.
-     :feed-lookup? (truthy? (bb/get-env "BBN_FEED_LOOKUP" "true"))
+      :feed-lookup? (truthy? (bb/get-env "BBN_FEED_LOOKUP" "true"))
      ;; Optional. Without them the feed address memo is the only way a boost
      ;; that carries no address finds its feed, which needs another app to have
      ;; sent one for that show first.
-     :pi-key (bb/get-env "BBN_PI_KEY" nil)
-     :pi-secret (bb/get-env "BBN_PI_SECRET" nil)
-     :pi-timeout-ms (Long/parseLong (bb/get-env "BBN_PI_TIMEOUT_MS" "8000"))
-     :feed-timeout-ms (Long/parseLong (bb/get-env "BBN_FEED_TIMEOUT_MS" "8000"))
-     :poll-interval-ms (* 1000 (Long/parseLong (bb/get-env "BBN_POLL_INTERVAL_SEC" "60")))
-     :min-sats (Long/parseLong (bb/get-env "BBN_MIN_SATS" "0"))
+      :pi-key (bb/get-env "BBN_PI_KEY" nil)
+      :pi-secret (bb/get-env "BBN_PI_SECRET" nil)
+      :pi-timeout-ms (Long/parseLong (bb/get-env "BBN_PI_TIMEOUT_MS" "8000"))
+      :feed-timeout-ms (Long/parseLong (bb/get-env "BBN_FEED_TIMEOUT_MS" "8000"))
+      :poll-interval-ms (* 1000 (Long/parseLong (bb/get-env "BBN_POLL_INTERVAL_SEC" "60")))
+      :min-sats (Long/parseLong (bb/get-env "BBN_MIN_SATS" "0"))
      ;; Which blip-10 actions to republish. v4vmusic sends "auto" for its
      ;; per-song automatic boosts; streams are never worth a note.
-     :actions (let [named (folded-set (bb/get-env "BBN_ACTIONS" "boost"))]
-                (if (seq named) named #{"boost"}))
+      :actions (let [named (folded-set (bb/get-env "BBN_ACTIONS" "boost"))]
+                 (if (seq named) named #{"boost"}))
      ;; Only splits addressed to these recipient names; empty means every
      ;; boost the wallet sees. For a bot on a wallet shared with other shows,
      ;; which is how the MSP 2.0 support split arrives -- see
      ;; bg/recipient-match?.
-     :recipient-names (folded-set (bb/get-env "BBN_RECIPIENT_NAMES" ""))
+      :recipient-names (folded-set (bb/get-env "BBN_RECIPIENT_NAMES" ""))
      ;; how far back to reach on the very first run; 0 means "start from now"
-     :backfill-sec (Long/parseLong (bb/get-env "BBN_BACKFILL_SEC" "0"))
-     :dry-run? (truthy? (bb/get-env "BBN_DRY_RUN" "false"))
-     :state-key (bb/get-env "BBN_STATE_KEY" "nostrbot/state.json")
-     :publish-profile? (truthy? (bb/get-env "BBN_PUBLISH_PROFILE" "false"))
-     :profile {:name (bb/get-env "BBN_PROFILE_NAME" nil)
-               :display_name (bb/get-env "BBN_PROFILE_NAME" nil)
-               :about (bb/get-env "BBN_PROFILE_ABOUT" nil)
-               :picture (bb/get-env "BBN_PROFILE_PICTURE" nil)
-               :nip05 (bb/get-env "BBN_PROFILE_NIP05" nil)
+      :backfill-sec (Long/parseLong (bb/get-env "BBN_BACKFILL_SEC" "0"))
+      :dry-run? (truthy? (bb/get-env "BBN_DRY_RUN" "false"))
+      :state-key (bb/get-env "BBN_STATE_KEY" "nostrbot/state.json")
+      :publish-profile? (truthy? (bb/get-env "BBN_PUBLISH_PROFILE" "false"))
+      :profile {:name (bb/get-env "BBN_PROFILE_NAME" nil)
+                :display_name (bb/get-env "BBN_PROFILE_NAME" nil)
+                :about (bb/get-env "BBN_PROFILE_ABOUT" nil)
+                :picture (bb/get-env "BBN_PROFILE_PICTURE" nil)
+                :nip05 (bb/get-env "BBN_PROFILE_NIP05" nil)
                ;; default the lightning address to the sub-wallet the NWC
                ;; connection already points at, so the bot is boostable back
-               :lud16 (or (bb/get-env "BBN_PROFILE_LUD16" nil) (:lud16 nwc))}}))
+                :lud16 (or (bb/get-env "BBN_PROFILE_LUD16" nil) (:lud16 nwc))}}
+     (fwd/env-config bb/get-env))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ State ~~~~~~~~~~~~~~~~~~~
 ;;
@@ -255,7 +259,6 @@
   "Whether a boost link is safe to request. See boostbox.safefetch -- the
    address check, not the shape check, is the half that matters."
   sf/fetchable-url?)
-
 
 (defn fetch-boost-metadata!
   "Read a boost back out of a BoostBox permalink's x-rss-payment header.
@@ -689,6 +692,27 @@
                                                  payment-hash)))]
         (not (contains? before payment-hash)))))
 
+(defn- forward-poll!
+  "Send this poll's forwardable payments -- and anything still queued -- to MSP.
+   A publishable boost goes once its note is out or it was deliberately skipped,
+   so the chart never holds a boost the bot may still fail on; a stream, which is
+   never published, goes as soon as it is read."
+  [ctx state results publishable?]
+  (let [idx (seen-index state)
+        settled? (fn [r] (let [e (get idx (:payment-hash r))]
+                           (or (get e "event_id") (get e "skipped"))))
+        ready (filter #(and (:boostagram %)
+                            (bg/boost? (:boostagram %) (:forward-actions ctx))
+                            (or (not (publishable? %)) (settled? %)))
+                      results)
+        {:keys [state sent queued dropped]} (fwd/forward! ctx state ready)]
+    (when (pos? dropped)
+      (u/log ::forward-pending-dropped :dropped dropped :limit fwd/max-pending))
+    (when (or (pos? sent) (pos? queued) (pos? dropped))
+      (u/log ::forwarded :sent sent :queued queued)
+      (save-state! (:state-io ctx) state))
+    state))
+
 (defn poll-once!
   "Fetch transactions since the cursor and publish any new boosts.
 
@@ -737,9 +761,16 @@
                                 "with the cursor, so those boosts would be announced twice.")))
             (save-state! (:state-io ctx) s)
             [s c]))
+        forwarding? (fwd/enabled? ctx)
+        ;; a stream MSP wants must be read as a boostagram, not skipped as
+        ;; :not-a-boost; what is *published* is still decided by :actions alone
+        read-ctx (cond-> ctx
+                   forwarding? (update :actions (fnil into #{"boost"}) (:forward-actions ctx)))
         txs (fetch-transactions! session cursor)
-        results (mapv #(tx->boost! ctx %) txs)
-        boosts (->> results (filter :boostagram) (sort-by #(or (:settled-at %) 0)))
+        results (mapv #(tx->boost! read-ctx %) txs)
+        publishable? #(and (:boostagram %) (bg/boost? (:boostagram %) (:actions ctx #{"boost"})))
+        boosts (->> results (filter publishable?) (sort-by #(or (:settled-at %) 0)))
+        forward-only (count (remove publishable? (filter :boostagram results)))
         skipped (frequencies (keep :skip results))
         high-water (reduce max 0 (keep tx-settled-at txs))]
     (doseq [r results
@@ -750,32 +781,35 @@
              :action (:action r)
              :url (:url r)))
     (u/log ::poll :transactions (count txs) :boosts (count boosts)
-           :skipped skipped :cursor cursor)
-    (loop [state state
-           [b & more] boosts]
-      (if-not b
-        (let [state (cond-> state
-                      (> high-water (or (get state "cursor") 0))
-                      (assoc "cursor" high-water))]
-          (save-state! (:state-io ctx) state)
-          state)
-        (let [next-state (try
-                           (publish-boost! ctx state b)
-                           (catch Exception e
-                             (u/log ::boost-publish-failed
-                                    :payment-hash (:payment-hash b)
-                                    :error (ex-message e))
-                             ::failed))]
-          (if (= ::failed next-state)
-            ;; Stop here. Do NOT re-save `state`: publish-boost! has already
-            ;; persisted the BoostBox record for this payment, and writing the
-            ;; pre-publish state back over it would lose that and mint a
-            ;; duplicate record on the retry. The cursor still points before
-            ;; this boost, so the next pass picks it up again.
-            (load-state (:state-io ctx))
-            (recur (cond-> next-state
-                     (:settled-at b) (assoc "cursor" (:settled-at b)))
-                   more)))))))
+           :forward-only forward-only :skipped skipped :cursor cursor)
+    (let [state (loop [state state
+                       [b & more] boosts]
+                  (if-not b
+                    (let [state (cond-> state
+                                  (> high-water (or (get state "cursor") 0))
+                                  (assoc "cursor" high-water))]
+                      (save-state! (:state-io ctx) state)
+                      state)
+                    (let [next-state (try
+                                       (publish-boost! ctx state b)
+                                       (catch Exception e
+                                         (u/log ::boost-publish-failed
+                                                :payment-hash (:payment-hash b)
+                                                :error (ex-message e))
+                                         ::failed))]
+                      (if (= ::failed next-state)
+                        ;; Stop here. Do NOT re-save `state`: publish-boost! has already
+                        ;; persisted the BoostBox record for this payment, and writing the
+                        ;; pre-publish state back over it would lose that and mint a
+                        ;; duplicate record on the retry. The cursor still points before
+                        ;; this boost, so the next pass picks it up again.
+                        (load-state (:state-io ctx))
+                        (recur (cond-> next-state
+                                 (:settled-at b) (assoc "cursor" (:settled-at b)))
+                               more)))))]
+      (if forwarding?
+        (forward-poll! ctx state results publishable?)
+        state))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Main ~~~~~~~~~~~~~~~~~~~
 
@@ -805,6 +839,10 @@
                         "and de-duplication set live here and must survive a restart; "
                         "if this path is not a mounted volume, every boost received "
                         "while the bot is down will be dropped unpublished.")))
+    ;; a URL without a recipient filter would forward every split on the node
+    (when (and (:forward-url cfg) (not (fwd/enabled? cfg)))
+      (u/log ::forwarding-needs-recipient-names
+             :note "BBN_FORWARD_URL is set but forwarding is off: it also needs BBN_FORWARD_TOKEN and BBN_RECIPIENT_NAMES."))
     (println "boost bot identity:" (:npub cfg))
     (.addShutdownHook (Runtime/getRuntime)
                       (Thread. (fn []
