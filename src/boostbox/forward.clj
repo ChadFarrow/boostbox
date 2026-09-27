@@ -119,6 +119,36 @@
 (defn forwarded? [state hash]
   (boolean (some #{hash} (get state "forwarded" []))))
 
+(defn- fresh-records
+  "Records for `boosts` that are neither forwarded nor in `pending`, in the order
+   given, each payment once."
+  [state pending boosts]
+  (let [queued (set (map #(get % "payment_hash") pending))]
+    (->> boosts
+         (remove #(or (forwarded? state (:payment-hash %))
+                      (contains? queued (:payment-hash %))))
+         (reduce (fn [[seen acc] b]
+                   (if (contains? seen (:payment-hash b))
+                     [seen acc]
+                     [(conj seen (:payment-hash b)) (conj acc (->record b))]))
+                 [#{} []])
+         second)))
+
+(defn enqueue
+  "Append the record of each of `boosts` that is neither forwarded nor already
+   queued to \"forward-pending\", in the order given, dropping the oldest past
+   `max-pending`. Returns {:state :dropped}, `:dropped` being the records
+   themselves, so the caller can log which payments a backfill must resend.
+
+   The poll queues a payment in the same state that moves its cursor past it, and
+   sends only from the queue: a crash mid-send then leaves it queued, not lost."
+  [state boosts]
+  (let [pending (vec (get state "forward-pending" []))
+        all (into pending (fresh-records state pending boosts))
+        n (max 0 (- (count all) max-pending))]
+    {:state (assoc state "forward-pending" (vec (drop n all)))
+     :dropped (subvec all 0 n)}))
+
 (defn- mark-forwarded [state hashes]
   (let [hashes (vec hashes)
         kept (vec (remove (set hashes) (get state "forwarded" [])))]
@@ -134,7 +164,9 @@
     (let [resp (http/post forward-url {:headers {"authorization" (str "Bearer " forward-token)
                                                  "content-type" "application/json"}
                                        :body (json/write-value-as-string (vec records))
-                                       :timeout 30000
+                                       ;; past MSP's 60 s function limit, so a slow
+                                       ;; ingest is not mistaken for a failed one
+                                       :timeout 65000
                                        :throw false})]
       {:ok? (= 200 (:status resp)) :status (:status resp)})
     (catch Exception e
@@ -147,11 +179,7 @@
    Returns {:state :sent :queued :dropped}."
   [ctx state boosts]
   (let [pending (vec (get state "forward-pending" []))
-        queued (set (map #(get % "payment_hash") pending))
-        fresh (->> boosts
-                   (remove #(or (forwarded? state (:payment-hash %))
-                                (contains? queued (:payment-hash %))))
-                   (map ->record))]
+        fresh (fresh-records state pending boosts)]
     (loop [[batch & more] (partition-all batch-size (into pending fresh))
            sent []
            failed []]

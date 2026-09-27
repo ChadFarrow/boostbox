@@ -77,7 +77,8 @@
       (let [[url opts] @seen]
         (is (= "https://msp.example/i" url))
         (is (= "Bearer tok" (get-in opts [:headers "authorization"])))
-        (is (= [{"a" 1}] (json/read-value (:body opts))))))
+        (is (= [{"a" 1}] (json/read-value (:body opts))))
+        (is (= 65000 (:timeout opts)) "longer than MSP's 60 s function limit")))
     (with-redefs [http/post (fn [_ _] {:status 201})]
       (is (not (:ok? (fwd/send! {:forward-url "u" :forward-token "t"} [{}]))) "only exactly 200 counts"))
     (with-redefs [http/post (fn [_ _] (throw (ex-info "connection refused" {})))]
@@ -131,3 +132,23 @@
       (is (= 10 dropped))
       (is (= fwd/max-pending (count (get state "forward-pending"))))
       (is (= "h10" (get (first (get state "forward-pending")) "payment_hash"))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Queueing before a send ~~~~~~~~~~~~~~~~~~~
+
+(deftest enqueue-appends-what-is-neither-sent-nor-queued-in-order
+  (let [state {"forwarded" ["f"] "forward-pending" [(fwd/->record (boost "q"))]}
+        {:keys [state dropped]} (fwd/enqueue state [(boost "f") (boost "q") (boost "n1") (boost "n2") (boost "n1")])]
+    (is (= ["q" "n1" "n2"] (mapv #(get % "payment_hash") (get state "forward-pending"))))
+    (is (= [] dropped))
+    (is (= ["f"] (get state "forwarded")) "enqueueing marks nothing as sent")))
+
+(deftest enqueue-drops-the-oldest-past-the-cap-and-returns-them
+  (let [full {"forward-pending" (mapv #(fwd/->record (boost (str "h" %) :settled-at (+ 1000 %)))
+                                      (range fwd/max-pending))}
+        {:keys [state dropped]} (fwd/enqueue full [(boost "a") (boost "b")])
+        pending (get state "forward-pending")]
+    (is (= fwd/max-pending (count pending)))
+    (is (= ["h0" "h1"] (mapv #(get % "payment_hash") dropped)) "the records, not a count")
+    (is (= [1000 1001] (mapv #(get % "time") dropped)))
+    (is (= "h2" (get (first pending) "payment_hash")))
+    (is (= ["a" "b"] (mapv #(get % "payment_hash") (take-last 2 pending))))))

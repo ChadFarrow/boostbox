@@ -693,22 +693,22 @@
         (not (contains? before payment-hash)))))
 
 (defn- forward-poll!
-  "Send this poll's forwardable payments -- and anything still queued -- to MSP.
-   A publishable boost goes once its note is out or it was deliberately skipped,
-   so the chart never holds a boost the bot may still fail on; a stream, which is
-   never published, goes as soon as it is read."
-  [ctx state results publishable?]
-  (let [idx (seen-index state)
-        settled? (fn [r] (let [e (get idx (:payment-hash r))]
-                           (or (get e "event_id") (get e "skipped"))))
-        ready (filter #(and (:boostagram %)
-                            (bg/boost? (:boostagram %) (:forward-actions ctx))
-                            (or (not (publishable? %)) (settled? %)))
-                      results)
-        {:keys [state sent queued dropped]} (fwd/forward! ctx state ready)]
-    (when (pos? dropped)
-      (u/log ::forward-pending-dropped :dropped dropped :limit fwd/max-pending))
-    (when (or (pos? sent) (pos? queued) (pos? dropped))
+  "Send the queue to MSP. poll-once! has already queued every forwardable payment
+   it read, in the same saved state that moved the cursor past it, so this only
+   drains: a crash or a SIGTERM mid-send leaves those payments queued for the next
+   poll instead of behind the cursor. `dropped` is the records the poll's queueing
+   pushed out past `fwd/max-pending`."
+  [ctx state dropped]
+  (let [{:keys [state sent queued]} (fwd/forward! ctx state [])]
+    (when (seq dropped)
+      ;; the payment times say where a backfill must reach back to
+      (let [times (keep #(get % "time") dropped)]
+        (u/log ::forward-pending-dropped
+               :dropped (count dropped)
+               :oldest-dropped-time (when (seq times) (reduce min times))
+               :newest-dropped-time (when (seq times) (reduce max times))
+               :limit fwd/max-pending)))
+    (when (or (pos? sent) (pos? queued))
       (u/log ::forwarded :sent sent :queued queued)
       (save-state! (:state-io ctx) state))
     state))
@@ -725,7 +725,12 @@
    Once the whole window is published the cursor jumps to the newest
    *transaction* seen, not the newest boost: a wallet taking ordinary payments
    would otherwise pin the cursor forever while the paging walk got longer on
-   every poll."
+   every poll.
+
+   With forwarding on (never in a dry run), every payment MSP wants is queued in
+   `forward-pending` in the same state that moves the cursor past it -- a stream
+   before the loop, a boost once its publish did not fail -- and only then does
+   forward-poll! send, from the queue alone."
   [ctx session]
   (let [state0 (load-state (:state-io ctx))
         ;; First run: start from now rather than from the beginning of the
@@ -761,7 +766,9 @@
                                 "with the cursor, so those boosts would be announced twice.")))
             (save-state! (:state-io ctx) s)
             [s c]))
-        forwarding? (fwd/enabled? ctx)
+        ;; A dry run never records a note's event_id, so a publishable boost would
+        ;; never be sent while every stream was -- and the sends are real.
+        forwarding? (and (fwd/enabled? ctx) (not (:dry-run? ctx)))
         ;; a stream MSP wants must be read as a boostagram, not skipped as
         ;; :not-a-boost; what is *published* is still decided by :actions alone
         read-ctx (cond-> ctx
@@ -772,7 +779,17 @@
         boosts (->> results (filter publishable?) (sort-by #(or (:settled-at %) 0)))
         forward-only (count (remove publishable? (filter :boostagram results)))
         skipped (frequencies (keep :skip results))
-        high-water (reduce max 0 (keep tx-settled-at txs))]
+        high-water (reduce max 0 (keep tx-settled-at txs))
+        forwardable? #(and (:boostagram %) (bg/boost? (:boostagram %) (:forward-actions ctx)))
+        ;; Every forwardable payment is queued in the state that moves the cursor
+        ;; past it, and saved with it; forward-poll! then sends from the queue.
+        dropped (volatile! [])
+        enqueue (fn [state bs]
+                  (if-not forwarding?
+                    state
+                    (let [{:keys [state] ds :dropped} (fwd/enqueue state (filter forwardable? bs))]
+                      (vswap! dropped into ds)
+                      state)))]
     (doseq [r results
             :when (and (narrate-skip? r) (first-sighting! (:payment-hash r)))]
       (u/log ::transaction-skipped
@@ -782,7 +799,12 @@
              :url (:url r)))
     (u/log ::poll :transactions (count txs) :boosts (count boosts)
            :forward-only forward-only :skipped skipped :cursor cursor)
-    (let [state (loop [state state
+    ;; A payment that is forwarded but never published (a stream, with the default
+    ;; actions) goes into the state the loop starts from, so its first save --
+    ;; inside publish-boost!, or at the end -- persists it with the cursor.
+    (let [state (loop [state (enqueue state (->> results
+                                                 (remove publishable?)
+                                                 (sort-by #(or (:settled-at %) 0))))
                        [b & more] boosts]
                   (if-not b
                     (let [state (cond-> state
@@ -804,11 +826,15 @@
                         ;; duplicate record on the retry. The cursor still points before
                         ;; this boost, so the next pass picks it up again.
                         (load-state (:state-io ctx))
-                        (recur (cond-> next-state
+                        ;; Its publish did not fail -- published, already published,
+                        ;; or skipped below the threshold -- so it is queued for MSP
+                        ;; now. A boost whose note failed never gets here, so the
+                        ;; chart never holds a boost the bot may still fail on.
+                        (recur (cond-> (enqueue next-state [b])
                                  (:settled-at b) (assoc "cursor" (:settled-at b)))
                                more)))))]
       (if forwarding?
-        (forward-poll! ctx state results publishable?)
+        (forward-poll! ctx state @dropped)
         state))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Main ~~~~~~~~~~~~~~~~~~~
