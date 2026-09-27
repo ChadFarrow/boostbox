@@ -4,14 +4,20 @@
 #   clojure -T:build uber                                  # once
 #   scripts/msp-notes.sh export                            # read-only
 #   BBN_PUBLISH_FEED_GUIDS=<guid>,<guid> \
-#     scripts/msp-notes.sh repost [--apply] [--interval 15]  # MSP 2.0's nsec
+#     scripts/msp-notes.sh repost [--apply] [--interval 15]  # MSP 2.0's nsec,
+#                                                          # Podcast Index key
 #   scripts/msp-notes.sh delete [--apply]                  # Boostr_Bot's nsec
 #
 # export reads Boostr_Bot's MSP notes from the relays into
 # ~/.config/boostbox/msp/boostr-msp-notes.json; repost and delete read only that
 # file. Run export after the msp-bot has its own key, so it holds every note.
 # repost and delete print what they would do and send nothing without --apply.
-# The key is read with echo off, so it never lands in shell history or `ps`.
+# BBN_PUBLISH_FEED_GUIDS takes album guids and artist (publisher feed) guids, as
+# the bot does. An artist is found by reading each album's feed, and the notes
+# carry no feed address, so repost asks for the Podcast Index key and secret the
+# bot uses (BBN_PI_KEY / BBN_PI_SECRET); press Enter to skip, and only album
+# guids match. Keys are read with echo off, so they never land in shell history
+# or `ps`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -38,6 +44,14 @@ repost | delete)
 		exit 1
 	}
 	export BBN_NOSTR_SECKEY
+	if [ "$1" = repost ] && [ -z "${BBN_PI_KEY:-}" ]; then
+		printf 'Podcast Index key (input hidden, Enter to skip): '
+		read -rs BBN_PI_KEY || true
+		printf '\nPodcast Index secret (input hidden, Enter to skip): '
+		read -rs BBN_PI_SECRET || true
+		printf '\n\n'
+		export BBN_PI_KEY BBN_PI_SECRET
+	fi
 	;;
 *)
 	echo "usage: scripts/msp-notes.sh export|repost|delete [--apply] [--interval <sec>]" >&2

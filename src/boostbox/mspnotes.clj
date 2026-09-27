@@ -17,6 +17,7 @@
             [boostbox.boostbox :as bb]
             [boostbox.nostr :as nostr]
             [boostbox.nostrbot :as bot]
+            [boostbox.podcastindex :as pi]
             [boostbox.relay :as relay]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -90,18 +91,40 @@
        vec))
 
 (defn- feed-guids
-  "The `podcast:guid` i tags: the feed, and the remote feed when there was one."
+  "The `podcast:guid` i tags, in order: the feed, then the remote feed when
+   there was one."
   [e]
-  (into #{} (for [[k v] (:tags e)
-                  :when (and (= "i" k) (str/starts-with? (str v) "podcast:guid:"))]
-              (str/lower-case (subs v (count "podcast:guid:"))))))
+  (vec (distinct (for [[k v] (:tags e)
+                       :when (and (= "i" k) (str/starts-with? (str v) "podcast:guid:"))]
+                   (str/lower-case (subs v (count "podcast:guid:")))))))
+
+(defn publishers-of
+  "The artists the note's feeds name, from `resolved` (feed guid -> the
+   publisher guid its feed names; see resolve-publishers!)."
+  [resolved e]
+  (vec (distinct (keep resolved (feed-guids e)))))
 
 (defn listed?
-  "Whether the note names one of `guids` as its feed or remote feed. Unlike
-   bg/feed-listed?, an empty list matches nothing: here it can only be an
-   operator who forgot to set it."
-  [guids e]
-  (boolean (some guids (feed-guids e))))
+  "Whether the note names one of `guids` as its feed or remote feed, or as the
+   artist either feed names -- the rule bg/feed-listed? applies to a new boost.
+   Unlike it, an empty list matches nothing: here it can only be an operator
+   who forgot to set it."
+  ([guids e] (listed? guids {} e))
+  ([guids resolved e]
+   (boolean (some guids (concat (feed-guids e) (publishers-of resolved e))))))
+
+(defn resolve-publishers!
+  "Feed guid -> the artist that feed names in its `<podcast:publisher>`, for
+   every guid the Podcast Index can find a feed for and the feed answers. The
+   old notes carry no feed address, and the index is how the bot itself finds
+   one from a guid. A guid missing from the answer names no artist."
+  [ctx guids]
+  (let [ctx (assoc ctx :feed-lookup? true)]
+    (into {} (for [g (distinct guids)
+                   :let [url (:url (pi/feed-by-guid ctx g))
+                         publisher (when url (:publisher-guid (bot/read-feed-at ctx url nil)))]
+                   :when publisher]
+               [g publisher]))))
 
 (def ^:private banner-re #"https?://\S+/og/boost\.png(?:\?\S*)?")
 
@@ -111,6 +134,23 @@
     (str url (if (str/includes? url "?") "&" "?")
          "by=" (java.net.URLEncoder/encode (str by) "UTF-8"))))
 
+(defn- with-publishers
+  "`tags` plus the NIP-73 publisher id of each artist, placed after the feed
+   and item ids with one `k`, as bg/->nip73-tags emits them for a new note."
+  [tags publishers]
+  (let [have (set (for [[k v] tags :when (= "i" k)] v))
+        ids (vec (for [g publishers
+                       :when (bg/valid-feed-guid? g)
+                       :let [v (str "podcast:publisher:guid:" (str/lower-case (str/trim g)))]
+                       :when (not (have v))]
+                   ["i" v]))
+        kind ["k" "podcast:publisher:guid"]
+        add (if (or (empty? ids) (some #{kind} tags))
+              ids
+              (into [(first ids) kind] (rest ids)))
+        at (inc (or (last (keep-indexed (fn [i [k]] (when (#{"i" "k"} k) i)) tags)) -1))]
+    (-> (subvec tags 0 at) (into add) (into (subvec tags at)))))
+
 (defn resign
   "The same note, published by `seckey` under `client-name`.
 
@@ -118,26 +158,28 @@
    permalink and the feed's p tags included. Two things change, so the note
    and its picture both name the account that now publishes it: the `client`
    tag, and `by` on the banner URL, in the body and in imeta alike, exactly as
-   bg/banner-url adds it for a new note."
-  [seckey client-name e]
-  (let [old (re-find banner-re (:content e))
-        by? (and old (not (str/blank? (str client-name)))
-                 (not= client-name bg/default-client-name))
-        swap (fn [s] (if by? (str/replace s old (with-by old client-name)) s))
-        tags (->> (:tags e)
-                  (keep (fn [[k :as t]]
-                          (case k
-                            "client" ["client" client-name]
-                            "imeta" (let [t (mapv swap t)]
+   bg/banner-url adds it for a new note. `publishers` adds the artist's NIP-73
+   publisher id, which the old notes never carried."
+  ([seckey client-name e] (resign seckey client-name e nil))
+  ([seckey client-name e publishers]
+   (let [old (re-find banner-re (:content e))
+         by? (and old (not (str/blank? (str client-name)))
+                  (not= client-name bg/default-client-name))
+         swap (fn [s] (if by? (str/replace s old (with-by old client-name)) s))
+         tags (->> (:tags e)
+                   (keep (fn [[k :as t]]
+                           (case k
+                             "client" ["client" client-name]
+                             "imeta" (let [t (mapv swap t)]
                                       ;; dropped, as bg/->nip73-tags drops it,
                                       ;; rather than refused by a relay
-                                      (when (every? #(<= (count %) bg/max-tag-item-length) t) t))
-                            t)))
-                  vec)]
-    (nostr/sign-event seckey {:kind 1
-                              :created-at (:created-at e)
-                              :content (swap (:content e))
-                              :tags tags})))
+                                       (when (every? #(<= (count %) bg/max-tag-item-length) t) t))
+                             t)))
+                   vec)]
+     (nostr/sign-event seckey {:kind 1
+                               :created-at (:created-at e)
+                               :content (swap (:content e))
+                               :tags (with-publishers tags publishers)}))))
 
 (defn permalinks
   "The BoostBox permalinks, the `r` tag, of notes already published. A
@@ -145,8 +187,8 @@
   [events]
   (into #{} (keep #(tag % "r")) events))
 
-(defn to-repost [guids posted notes]
-  (filterv #(and (listed? guids %) (not (contains? posted (tag % "r")))) notes))
+(defn to-repost [guids resolved posted notes]
+  (filterv #(and (listed? guids resolved %) (not (contains? posted (tag % "r")))) notes))
 
 (defn deletion-events
   "NIP-09 requests for `ids`, fifty notes to a request so no one event nears a
@@ -251,7 +293,7 @@
       (do (println "Some relays did not answer in full. Run export again; it only adds.") 1)
       0)))
 
-(defn- repost! [{:keys [relays file seckey client-name guids apply? interval-ms]}]
+(defn- repost! [{:keys [relays file seckey client-name guids apply? interval-ms] :as opts}]
   (let [author (nostr/bytes->hex (nostr/decode-key boostr-npub "npub"))
         me (pubkey-of seckey)]
     (cond
@@ -263,17 +305,24 @@
 
       :else
       (let [notes (read-notes file)
+            all-feeds (distinct (mapcat feed-guids notes))
+            resolved (if (pi/configured? opts)
+                       (resolve-publishers! opts all-feeds)
+                       (do (println "No Podcast Index key: artists cannot be matched, only album guids.")
+                           {}))
+            _ (println (count all-feeds) "feeds in the notes;" (count resolved) "name an artist")
             posted (permalinks (map wire->event
                                     (mapcat :events (fetch-from-all! relays {"kinds" [1] "authors" [me]}))))
-            todo (to-repost guids posted notes)]
-        (println (count notes) "exported;" (count (filter #(listed? guids %) notes)) "on the listed albums;"
+            todo (to-repost guids resolved posted notes)]
+        (println (count notes) "exported;" (count (filter #(listed? guids resolved %) notes)) "listed;"
                  (count todo) "not yet posted by" (nostr/->npub (nostr/hex->bytes me)))
         (doseq [e todo] (println " " (describe e)))
         (if-not apply?
           (do (println "dry run: nothing published. Add --apply to post these.") 0)
           (let [failed (reduce (fn [failed [i e]]
                                  (when (pos? i) (Thread/sleep (long interval-ms)))
-                                 (let [r (relay/publish-to-relays! relays (resign seckey client-name e))]
+                                 (let [r (relay/publish-to-relays!
+                                          relays (resign seckey client-name e (publishers-of resolved e)))]
                                    (println (inc i) "/" (count todo) (describe e) (accepted-by r))
                                    (cond-> failed (not (:ok? r)) inc)))
                                0 (map-indexed vector todo))]
@@ -299,7 +348,8 @@
 (defn -main
   "java -cp boostbox.jar boostbox.mspnotes export|repost|delete [--apply] [--interval <sec>]
    Reads BBN_RELAYS, BBN_NOSTR_SECKEY (repost: MSP 2.0's; delete: Boostr_Bot's),
-   BBN_PUBLISH_FEED_GUIDS and BBN_CLIENT_NAME; MSP_NOTES_FILE moves the export."
+   BBN_PUBLISH_FEED_GUIDS, BBN_CLIENT_NAME, and BBN_PI_KEY/BBN_PI_SECRET (repost,
+   to find each album's artist); MSP_NOTES_FILE moves the export."
   [& [cmd & flags]]
   (let [opts {:relays (->> (str/split (bb/get-env "BBN_RELAYS" default-relays) #",")
                            (map str/trim) (remove str/blank?) vec)
@@ -316,6 +366,8 @@
                  "repost" (repost! (assoc opts
                                           :seckey (key!)
                                           :client-name (bb/get-env "BBN_CLIENT_NAME" "MSP 2.0")
+                                          :pi-key (bb/get-env "BBN_PI_KEY" nil)
+                                          :pi-secret (bb/get-env "BBN_PI_SECRET" nil)
                                           :guids (bot/feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))))
                  "delete" (delete! (assoc opts :seckey (key!)))
                  (do (println "usage: boostbox.mspnotes export|repost|delete [--apply] [--interval <sec>]")

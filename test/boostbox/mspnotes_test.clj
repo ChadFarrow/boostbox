@@ -5,6 +5,7 @@
             [boostbox.mspnotes :as ms]
             [boostbox.nostr :as nostr]
             [boostbox.nostrbot :as bot]
+            [boostbox.podcastindex :as pi]
             [boostbox.relay :as relay]
             [jsonista.core :as json]
             [manifold.stream :as s]))
@@ -78,7 +79,7 @@
         b (note {:guid album :id "01B"})
         c (note {:guid other-album :id "01C"})
         posted (ms/permalinks [(ms/resign msp-key "MSP 2.0" a)])]
-    (is (= [b] (ms/to-repost #{album} posted [a b c])))))
+    (is (= [b] (ms/to-repost #{album} {} posted [a b c])))))
 
 (deftest deletion-requests-name-every-note-once
   (let [ids (mapv #(format "%064x" %) (range 120))
@@ -170,3 +171,37 @@
           (let [r (#'ms/fetch-all! "wss://r" {"kinds" [1]})]
             (is (= [e] (:events r)))
             (is (:error r))))))))
+
+(def artist "1a197bac-95ae-53bd-bf6d-40ba8b551088")
+
+(deftest an-artist-is-listed-through-the-feeds-a-note-names
+  (let [resolved {album artist}]
+    (is (ms/listed? #{artist} resolved (note {:guid album})))
+    (is (ms/listed? #{artist} resolved (note {:guid music-show :remote album}))
+        "a music show's boost, through the song's album")
+    (is (not (ms/listed? #{artist} {} (note {:guid album})))
+        "an album whose feed could not be read names no artist")
+    (is (= [artist] (ms/publishers-of resolved (note {:guid music-show :remote album}))))))
+
+(deftest a-re-posted-note-names-the-artist
+  (let [old (note {:guid music-show :remote album :id "01A"})
+        e (ms/resign msp-key "MSP 2.0" old [artist])
+        ids (vec (for [[k :as t] (:tags e) :when (#{"i" "k"} k)] t))]
+    (is (nostr/verify-event? e))
+    (is (= [["i" (str "podcast:publisher:guid:" artist)] ["k" "podcast:publisher:guid"]]
+           (subvec ids (- (count ids) 2)))
+        "after the feed and item ids, as the bot emits it")
+    (is (= (count (:tags old)) (- (count (:tags e)) 2)) "and nothing else is added")
+    (is (= (:tags e) (:tags (ms/resign msp-key "MSP 2.0" e [artist])))
+        "named once, however often it is re-signed")))
+
+(deftest each-albums-artist-is-read-from-its-own-feed
+  (with-redefs [pi/feed-by-guid (fn [_ guid] (when (= guid album) {:url "https://x.example/album.xml"}))
+                bot/read-feed-at (fn [_ url _] (when (= url "https://x.example/album.xml") {:publisher-guid artist}))]
+    (is (= {album artist} (ms/resolve-publishers! {:pi-key "k" :pi-secret "s"} [album other-album]))
+        "an album the index does not know is simply absent")))
+
+(deftest a-second-run-skips-by-artist-too
+  (let [a (note {:guid album :id "01A"})
+        b (note {:guid album :id "01B"})]
+    (is (= [b] (ms/to-repost #{artist} {album artist} (ms/permalinks [a]) [a b])))))
