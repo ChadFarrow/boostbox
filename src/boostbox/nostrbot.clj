@@ -46,7 +46,7 @@
   [s]
   (into #{} (map str/lower-case) (csv s)))
 
-(defn- feed-guid-set
+(defn feed-guid-set
   "BBN_PUBLISH_FEED_GUIDS as a set of lower-cased `<podcast:guid>`s. Throws on
    an entry that is not one: the list names the albums whose artists agreed to
    be announced, and a typo would otherwise match nothing and say nothing."
