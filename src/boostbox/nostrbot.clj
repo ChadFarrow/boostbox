@@ -454,6 +454,16 @@
       (let [{state :state {url :url} :boostagram} (resolve-feed ctx state {:feed-guid guid})]
         {:state state :ctxt (read-feed-at ctx url (:remote-item-guid b))}))))
 
+(defn- note-npubs
+  "The people a note tags: the album's first, then the show's, each once and
+   no more than one feed may name. On a music show's boost the album's are the
+   artist's, and the cap truncates, so the order is what keeps them."
+  [remote-ctx host-ctx]
+  (->> (concat (:npubs remote-ctx) (:npubs host-ctx))
+       (reduce (fn [acc n] (if (some #(= (:pubkey %) (:pubkey n)) acc) acc (conj acc n))) [])
+       (take feed/max-feed-npubs)
+       vec))
+
 (defn build-note
   "The signed kind:1 event for a boost.
 
@@ -470,13 +480,14 @@
    followers' feeds in one burst. Never later than now: a wallet clock running
    ahead would otherwise date a note in the future, which relays refuse."
   [{:keys [seckey client-name] :as ctx} boostagram
-   {:keys [boost-url received-msat fallback-art settled-at feed-ctx publisher-guids]}]
+   {:keys [boost-url received-msat fallback-art settled-at feed-ctx remote-ctx publisher-guids]}]
   (let [now (quot (System/currentTimeMillis) 1000)
         ctxt (or feed-ctx (feed-context ctx boostagram))
-        publisher-guids (or publisher-guids (keep :publisher-guid [ctxt]))
+        publisher-guids (or publisher-guids (keep :publisher-guid [ctxt remote-ctx]))
         total (bg/note-total-msat boostagram received-msat)
+        ;; the album that was boosted before the show it was played in
         banner (bg/banner-url (:boostbox-url ctx) boostagram
-                              (or (:art ctxt) fallback-art) total client-name)]
+                              (or (:art remote-ctx) (:art ctxt) fallback-art) total client-name)]
     (nostr/sign-event seckey
                       {:kind 1
                        :created-at (if settled-at (min (long settled-at) now) now)
@@ -486,7 +497,7 @@
                                                     :banner-url banner})
                        :tags (bg/->nip73-tags boostagram
                                               {:boost-url boost-url
-                                               :npubs (:npubs ctxt)
+                                               :npubs (note-npubs remote-ctx ctxt)
                                                :banner-url banner
                                                :client-name client-name
                                                :total-msat total
@@ -604,6 +615,7 @@
                                                   :settled-at settled-at
                                                   :fallback-art pi-artwork
                                                   :feed-ctx host
+                                                  :remote-ctx remote
                                                   :publisher-guids publishers})]
             (if dry-run?
               (do (u/log ::dry-run-note :boost-url (:url stored)

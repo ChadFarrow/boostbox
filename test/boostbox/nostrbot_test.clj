@@ -214,6 +214,29 @@
     (is (not (clojure.string/includes? (:content (tags-of bg/default-client-name)) "by="))
         "the default bot's banner URL is unchanged")))
 
+(deftest a-music-show-boost-shows-the-albums-cover-and-names-its-artist
+  ;; The show's feed describes the show. The song, its cover and its artist
+  ;; are in the album the remote item points at, which the bot reads anyway.
+  (let [person (fn [c] {:npub (str "npub-" c) :pubkey (apply str (repeat 64 c))})
+        b (bg/normalize {"action" "boost" "podcast" "Homegrown Hits" "value_msat_total" 21000})
+        note (fn [host remote]
+               (bot/build-note (ctx (atom {}) :feed-lookup? false) b
+                               {:boost-url "u" :received-msat 21000 :feed-ctx host :remote-ctx remote}))
+        p-tags (fn [e] (vec (for [[k v] (:tags e) :when (= "p" k)] v)))
+        host {:art "https://show.example/cover.png" :npubs [(person "a") (person "b")]}
+        album {:art "https://album.example/cover.png" :npubs [(person "c") (person "a")]}]
+    (let [e (note host album)]
+      (is (clojure.string/includes? (:content e) "art=https%3A%2F%2Falbum.example%2Fcover.png")
+          "the banner shows the album that was boosted, not the show")
+      (is (= [(apply str (repeat 64 "c")) (apply str (repeat 64 "a")) (apply str (repeat 64 "b"))]
+             (p-tags e))
+          "the artist first, then the show's people, each once"))
+    (let [tags (p-tags (note {:npubs (mapv person ["a" "b" "d" "e"])} album))]
+      (is (= 4 (count tags)) "still no more than one feed may name")
+      (is (= (apply str (repeat 64 "c")) (first tags)) "and the artist survives the cap"))
+    (is (clojure.string/includes? (:content (note host nil)) "art=https%3A%2F%2Fshow.example%2Fcover.png")
+        "with no album read, the show's cover as before")))
+
 (deftest first-run-sets-a-watermark-instead-of-replaying-history
   (let [a (atom {"cursor" nil "recent" []})
         asked (atom nil)
