@@ -1,6 +1,7 @@
 (ns boostbox.feed
-  "The two things a boost note needs out of an RSS feed and nothing else: the
-   npubs the feed declares for its people, and a cover image.
+  "The three things a boost note needs out of an RSS feed and nothing else: the
+   npubs the feed declares for its people, a cover image, and the guid of the
+   publisher feed it names -- for music, the artist.
 
    Modelled on boostmebitch's lib/feed-xml.ts so the two apps agree about what
    a feed says. Two rules carry over from there, and both are load-bearing:
@@ -17,6 +18,7 @@
    number of items walked, the number of npubs returned, and the length of any
    URL handed back."
   (:require [clojure.string :as str]
+            [boostbox.boostagram :as bg]
             [boostbox.nostr :as nostr]))
 
 (def max-feed-npubs
@@ -267,17 +269,37 @@
   (or (item-art xml item-guid)
       (image-in (channel-slice xml))))
 
+;; ~~~~~~~~~~~~~~~~~~~ Publisher ~~~~~~~~~~~~~~~~~~~
+
+(defn publisher-guid
+  "The `<podcast:guid>` of the publisher feed this feed names, lower-cased, or
+   nil. For music that publisher is the artist: every album carries
+   `<podcast:publisher><podcast:remoteItem medium=\"publisher\" feedGuid=…>`,
+   so it is the one guid an artist's albums share.
+
+   Read only inside `<podcast:publisher>`, and only from a remoteItem whose
+   medium says publisher: a podroll lists other people's feeds with the same
+   tag, and one of those read as this feed's artist would name a stranger."
+  [^String xml]
+  (first (for [{:keys [inner]} (find-blocks xml "podcast:publisher")
+               {:keys [attrs]} (find-tags inner "podcast:remoteItem")
+               :when (= "publisher" (some-> (read-attr attrs "medium") str/lower-case))
+               :let [guid (read-attr attrs "feedGuid")]
+               :when (bg/valid-feed-guid? guid)]
+           (str/lower-case guid))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Entry point ~~~~~~~~~~~~~~~~~~~
 
 (defn read-feed
-  "{:npubs :art} for one feed document. Returns nil for anything unusable, so
-   a caller has one thing to test rather than several."
+  "{:npubs :art :publisher-guid} for one feed document. Returns nil for
+   anything unusable, so a caller has one thing to test rather than several."
   [^String xml item-guid]
   (try
     (when-not (str/blank? xml)
       (let [clean (strip-comments xml)
             npubs (feed-npubs clean)
-            art (feed-art clean item-guid)]
-        (when (or (seq npubs) art)
-          {:npubs npubs :art art})))
+            art (feed-art clean item-guid)
+            publisher (publisher-guid clean)]
+        (when (or (seq npubs) art publisher)
+          {:npubs npubs :art art :publisher-guid publisher})))
     (catch Exception _ nil)))

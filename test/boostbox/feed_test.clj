@@ -106,6 +106,41 @@
                           (apply str (repeat 700 "a")) ".png\"/></channel></rss>")
                      nil))))))
 
+(deftest the-publisher-feed-names-the-artist
+  ;; From a real MSP album: Matt Finlay's "Various & Assorted" names his
+  ;; publisher feed, which is the one guid all of his albums share.
+  (let [album (fn [publisher]
+                (str "<rss><channel><title>Various &amp; Assorted</title>"
+                     "<podcast:guid>fe17f4f6-074f-4b2c-a450-611faccfaea2</podcast:guid>"
+                     publisher
+                     "<item><guid>s1</guid></item></channel></rss>"))
+        artist "1a197bac-95ae-53bd-bf6d-40ba8b551088"]
+    (is (= artist (:publisher-guid
+                   (feed/read-feed (album (str "<podcast:publisher>"
+                                               "<podcast:remoteItem medium=\"publisher\" feedGuid=\""
+                                               (str/upper-case artist) "\" feedUrl=\"https://x/a.xml\" />"
+                                               "</podcast:publisher>"))
+                                   nil)))
+        "lower-cased like every podcast:guid, and enough on its own for a result")
+    (testing "only a publisher, only inside podcast:publisher, only its own attribute"
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:publisher><podcast:remoteItem medium=\"music\" feedGuid=\""
+                                             artist "\"/></podcast:publisher>"))
+                                 nil))))
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:podroll><podcast:remoteItem medium=\"publisher\" feedGuid=\""
+                                             artist "\"/></podcast:podroll>"))
+                                 nil))))
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:publisher><podcast:remoteItem medium=\"publisher\" x-feedGuid=\""
+                                             artist "\"/></podcast:publisher>"))
+                                 nil)))))
+    (testing "a guid that is not a podcast:guid names nobody"
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:publisher><podcast:remoteItem medium=\"publisher\" "
+                                             "feedGuid=\"matt-finlay\"/></podcast:publisher>"))
+                                 nil)))))))
+
 (deftest a-feed-that-says-nothing-answers-nil
   (is (nil? (feed/read-feed "<rss></rss>" nil)))
   (is (nil? (feed/read-feed "" nil)))

@@ -46,6 +46,18 @@
   [s]
   (into #{} (map str/lower-case) (csv s)))
 
+(defn feed-guid-set
+  "BBN_PUBLISH_FEED_GUIDS as a set of lower-cased `<podcast:guid>`s. Throws on
+   an entry that is not one: the list names the albums and artists who agreed
+   to be announced, and a typo would otherwise match nothing and say nothing."
+  [s]
+  (let [guids (folded-set s)]
+    (when-let [bad (seq (remove bg/valid-feed-guid? guids))]
+      (throw (ex-info (str "BBN_PUBLISH_FEED_GUIDS: not a podcast:guid: "
+                           (str/join ", " bad))
+                      {:invalid (vec bad)})))
+    guids))
+
 (defn config
   "BBN_-prefixed so nothing here can collide with the web app's BB_ vars.
    Storage config is shared with the web app and read via bb/config."
@@ -101,6 +113,10 @@
      ;; which is how the MSP 2.0 support split arrives -- see
      ;; bg/recipient-match?.
       :recipient-names (folded-set (bb/get-env "BBN_RECIPIENT_NAMES" ""))
+     ;; Only boosts on these albums, or by these artists (their publisher
+     ;; feed's guid), are published; empty means every album. Publishing
+     ;; only: an unlisted boost is still forwarded. See bg/feed-listed?.
+      :publish-feed-guids (feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))
      ;; how far back to reach on the very first run; 0 means "start from now"
       :backfill-sec (Long/parseLong (bb/get-env "BBN_BACKFILL_SEC" "0"))
       :dry-run? (truthy? (bb/get-env "BBN_DRY_RUN" "false"))
@@ -380,6 +396,29 @@
                (fn [m] (assoc (if (>= (count m) feed-cache-size) {} m) url v)))
         v))))
 
+(defn read-feed-at
+  "boostbox.feed/read-feed of the document at `url`, fetched through safefetch
+   and cached; nil for any failure. See feed-context."
+  [{:keys [feed-lookup? feed-timeout-ms]} url item-guid]
+  (when feed-lookup?
+    ;; `:url` is one of the few fields normalize passes through without
+    ;; bounding, because nothing used to read it. Longer than this is not a
+    ;; feed address, and it is also the cache key below.
+    (let [url (some-> url str str/trim not-empty)
+          url (when (and url (<= (count url) 2048)) url)]
+      (when (and url (sf/fetchable-url? url))
+        (cached-feed-read
+         url
+         (fn []
+           (try
+             (when-let [{:keys [body]} (sf/fetch-pinned!
+                                        url {:max-bytes max-feed-bytes
+                                             :timeout-ms (or feed-timeout-ms 8000)})]
+               (feed/read-feed (String. ^bytes body "UTF-8") item-guid))
+             (catch Exception e
+               (u/log ::feed-read-failed :error (ex-message e))
+               nil))))))))
+
 (defn feed-context
   "The show's npubs and cover art, read from the feed the boostagram names.
 
@@ -394,25 +433,36 @@
    Any failure at all answers nil. A feed being slow, moved or malformed must
    not stop a boost being announced -- the note simply goes out with no picture
    and no p tags, which is what every note looked like before this existed."
-  [{:keys [feed-lookup? feed-timeout-ms]} boostagram]
-  (when feed-lookup?
-    ;; `:url` is one of the few fields normalize passes through without
-    ;; bounding, because nothing used to read it. Longer than this is not a
-    ;; feed address, and it is also the cache key below.
-    (let [url (some-> (:url boostagram) str str/trim not-empty)
-          url (when (and url (<= (count url) 2048)) url)]
-      (when (and url (sf/fetchable-url? url))
-        (cached-feed-read
-         url
-         (fn []
-           (try
-             (when-let [{:keys [body]} (sf/fetch-pinned!
-                                        url {:max-bytes max-feed-bytes
-                                             :timeout-ms (or feed-timeout-ms 8000)})]
-               (feed/read-feed (String. ^bytes body "UTF-8") (:item-guid boostagram)))
-             (catch Exception e
-               (u/log ::feed-read-failed :error (ex-message e))
-               nil))))))))
+  [ctx boostagram]
+  (read-feed-at ctx (:url boostagram) (:item-guid boostagram)))
+
+(defn remote-feed-context
+  "The feed of the remote item a music show's boost was sent for -- the song's
+   album -- when it is not the feed the boost names. Returns {:state :ctxt}.
+
+   It is read for one thing: the `<podcast:publisher>` naming the artist. The
+   show's own feed names the show's publisher, so without this read a boost
+   from a music show is nobody's, however well known the song. blip-10 carries
+   no address for a remote feed, so it is found the way a guid-only boost's
+   feed is: the memo, then the Podcast Index."
+  [ctx state b]
+  (let [guid (some-> (:remote-feed-guid b) str str/trim str/lower-case)]
+    (if (or (not (:feed-lookup? ctx))
+            (not (bg/valid-feed-guid? guid))
+            (= guid (some-> (:feed-guid b) str str/trim str/lower-case)))
+      {:state state :ctxt nil}
+      (let [{state :state {url :url} :boostagram} (resolve-feed ctx state {:feed-guid guid})]
+        {:state state :ctxt (read-feed-at ctx url (:remote-item-guid b))}))))
+
+(defn- note-npubs
+  "The people a note tags: the album's first, then the show's, each once and
+   no more than one feed may name. On a music show's boost the album's are the
+   artist's, and the cap truncates, so the order is what keeps them."
+  [remote-ctx host-ctx]
+  (->> (concat (:npubs remote-ctx) (:npubs host-ctx))
+       (reduce (fn [acc n] (if (some #(= (:pubkey %) (:pubkey n)) acc) acc (conj acc n))) [])
+       (take feed/max-feed-npubs)
+       vec))
 
 (defn build-note
   "The signed kind:1 event for a boost.
@@ -430,12 +480,14 @@
    followers' feeds in one burst. Never later than now: a wallet clock running
    ahead would otherwise date a note in the future, which relays refuse."
   [{:keys [seckey client-name] :as ctx} boostagram
-   {:keys [boost-url received-msat fallback-art settled-at]}]
+   {:keys [boost-url received-msat fallback-art settled-at feed-ctx remote-ctx publisher-guids]}]
   (let [now (quot (System/currentTimeMillis) 1000)
-        ctxt (feed-context ctx boostagram)
+        ctxt (or feed-ctx (feed-context ctx boostagram))
+        publisher-guids (or publisher-guids (keep :publisher-guid [ctxt remote-ctx]))
         total (bg/note-total-msat boostagram received-msat)
+        ;; the album that was boosted before the show it was played in
         banner (bg/banner-url (:boostbox-url ctx) boostagram
-                              (or (:art ctxt) fallback-art) total)]
+                              (or (:art remote-ctx) (:art ctxt) fallback-art) total client-name)]
     (nostr/sign-event seckey
                       {:kind 1
                        :created-at (if settled-at (min (long settled-at) now) now)
@@ -445,10 +497,11 @@
                                                     :banner-url banner})
                        :tags (bg/->nip73-tags boostagram
                                               {:boost-url boost-url
-                                               :npubs (:npubs ctxt)
+                                               :npubs (note-npubs remote-ctx ctxt)
                                                :banner-url banner
                                                :client-name client-name
-                                               :total-msat total})})))
+                                               :total-msat total
+                                               :publisher-guids publisher-guids})})))
 
 (defn publish-profile!
   "Publish the bot's own kind:0 metadata, so clients render a name instead of a
@@ -487,6 +540,8 @@
         (u/log ::relay-list-published :accepted ok? :results results)))
     event))
 
+(declare first-sighting!)
+
 (defn publish-boost!
   "Store, then publish, then record. Returns the updated state.
 
@@ -518,52 +573,72 @@
           (remember state {"payment_hash" payment-hash "skipped" "below-threshold"}))
 
       :else
-      (let [stored (cond
-                     ;; already stored on an earlier attempt
-                     (get seen "url")
-                     {:id (get seen "boost_id") :url (get seen "url")}
-
-                     ;; the boostagram came from a boost link, so the record it
-                     ;; points at is the boost -- POSTing would mint a second
-                     ;; copy of something BoostBox already holds
-                     boost-url
-                     {:id boost-id :url boost-url}
-
-                     :else
-                     (store-boost! ctx (bg/->boost-payload
-                                        boostagram
-                                        {:received-msat received-msat
-                                         :settled-at settled-at})))
-            state (remember state {"payment_hash" payment-hash
-                                   "boost_id" (:id stored)
-                                   "url" (:url stored)})
-            _ (save-state! (:state-io ctx) state)
-            event (build-note ctx boostagram {:boost-url (:url stored)
-                                              :received-msat received-msat
-                                              :settled-at settled-at
-                                              :fallback-art pi-artwork})]
-        (if dry-run?
-          (do (u/log ::dry-run-note :boost-url (:url stored)
-                     :event (nostr/event->json event))
+      (let [;; the artist is named in the album's own feed, not in the boost,
+            ;; so the list can only be checked once the feeds are read -- and
+            ;; must be checked before the store, because tardbox's homepage is
+            ;; public too
+            host (feed-context ctx boostagram)
+            {state :state remote :ctxt} (remote-feed-context ctx state boostagram)
+            publishers (vec (distinct (keep :publisher-guid [host remote])))]
+        (if-not (bg/feed-listed? boostagram (:publish-feed-guids ctx) publishers)
+          ;; not remembered: add the artist and a re-read of this payment
+          ;; publishes it. Logged once, with what would have to be listed.
+          (do (when (first-sighting! payment-hash)
+                (u/log ::boost-not-listed :payment-hash payment-hash
+                       :podcast (:podcast boostagram)
+                       :feed-guid (:feed-guid boostagram)
+                       :remote-feed-guid (:remote-feed-guid boostagram)
+                       :publisher-guids publishers))
               state)
-          (let [{:keys [ok? results]} (relay/publish-to-relays! relays event)]
-            (when-not ok?
-              (throw (ex-info "no relay accepted the note"
-                              {:payment-hash payment-hash :results results})))
-            (u/log ::boost-published :payment-hash payment-hash
-                   :boost-url (:url stored) :event-id (:id event))
-            ;; Persist the event_id right here rather than leaving it to the
-            ;; caller's end-of-loop save. If a *later* boost in the same window
-            ;; fails before its own save-state!, poll-once! reloads from disk to
-            ;; recover -- and an unpersisted event_id would make this boost look
-            ;; stored-but-unpublished, so the next poll would mint a second note
-            ;; for it on the relays.
-            (let [state (remember state {"payment_hash" payment-hash
-                                         "boost_id" (:id stored)
-                                         "url" (:url stored)
-                                         "event_id" (:id event)})]
-              (save-state! (:state-io ctx) state)
-              state)))))))
+          (let [stored (cond
+                         ;; already stored on an earlier attempt
+                         (get seen "url")
+                         {:id (get seen "boost_id") :url (get seen "url")}
+
+                         ;; the boostagram came from a boost link, so the record it
+                         ;; points at is the boost -- POSTing would mint a second
+                         ;; copy of something BoostBox already holds
+                         boost-url
+                         {:id boost-id :url boost-url}
+
+                         :else
+                         (store-boost! ctx (bg/->boost-payload
+                                            boostagram
+                                            {:received-msat received-msat
+                                             :settled-at settled-at})))
+                state (remember state {"payment_hash" payment-hash
+                                       "boost_id" (:id stored)
+                                       "url" (:url stored)})
+                _ (save-state! (:state-io ctx) state)
+                event (build-note ctx boostagram {:boost-url (:url stored)
+                                                  :received-msat received-msat
+                                                  :settled-at settled-at
+                                                  :fallback-art pi-artwork
+                                                  :feed-ctx host
+                                                  :remote-ctx remote
+                                                  :publisher-guids publishers})]
+            (if dry-run?
+              (do (u/log ::dry-run-note :boost-url (:url stored)
+                         :event (nostr/event->json event))
+                  state)
+              (let [{:keys [ok? results]} (relay/publish-to-relays! relays event)]
+                (when-not ok?
+                  (throw (ex-info "no relay accepted the note"
+                                  {:payment-hash payment-hash :results results})))
+                (u/log ::boost-published :payment-hash payment-hash
+                       :boost-url (:url stored) :event-id (:id event))
+                ;; Persist the event_id right here rather than leaving it to the
+                ;; caller's end-of-loop save. If a *later* boost in the same window
+                ;; fails before its own save-state!, poll-once! reloads from disk to
+                ;; recover -- and an unpersisted event_id would make this boost look
+                ;; stored-but-unpublished, so the next poll would mint a second note
+                ;; for it on the relays.
+                (let [state (remember state {"payment_hash" payment-hash
+                                             "boost_id" (:id stored)
+                                             "url" (:url stored)
+                                             "event_id" (:id event)})]
+                  (save-state! (:state-io ctx) state)
+                  state)))))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Poll ~~~~~~~~~~~~~~~~~~~
 
@@ -851,6 +926,7 @@
            :relays (:relays cfg)
            :boostbox (:boostbox-url cfg)
            :wallet-relay (first (:relays (:nwc cfg)))
+           :publish-feed-guids (count (:publish-feed-guids cfg))
            :dry-run (:dry-run? cfg))
     ;; check-state-durability! let this through, so someone asserted the
     ;; filesystem is a mounted volume. Say so once at startup: if it is not,

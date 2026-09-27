@@ -172,7 +172,7 @@ Configuration is handled via environment variables.
 | `BB_BASE_URL`     |    No    | `http://localhost:8080` | The public base URL of the service (e.g., `https://my-boostbox.com`). Used to construct response URLs.             |
 | `BB_ALLOWED_KEYS` |    No    | `v4v4me`                | Comma-separated list of API keys clients must provide in the `X-Api-Key` header to use the `POST /boost` endpoint. |
 | `BB_MAX_BODY`     |    No    | `102400`                | Maximum allowed size for request bodies in bytes (approximately 100KB by default).                                 |
-| `BB_BANNER_WORDMARK` |  No   | `Boostr_Bot`                | What the boost banner (`/og/boost.png`) signs itself with. The banner only ever appears on the bot's notes, so it carries the bot's name, not this host's. Set it to empty to fall back to the host in `BB_BASE_URL`. |
+| `BB_BANNER_WORDMARK` |  No   | `Boostr_Bot`                | What the boost banner (`/og/boost.png`) signs itself with. The banner only ever appears on the bot's notes, so it carries the bot's name, not this host's. Set it to empty to fall back to the host in `BB_BASE_URL`. A banner URL carrying `by=` names its own account instead: a bot with a `BBN_CLIENT_NAME` of its own adds it. |
 | `BB_STORAGE`      |    No    | `FS`                    | The backend for storing metadata: `FS` (filesystem) or `S3`.                                                       |
 
 ### Filesystem Storage Configuration
@@ -277,10 +277,11 @@ volume to the bot's service, point `BB_FS_ROOT_PATH` at it and set
 | `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
 | `BBN_ACTIONS` | No | `boost` | Comma-separated blip-10 actions to publish. `boost,auto` adds v4vmusic's automatic per-song boosts. Streams are never worth a note. |
 | `BBN_RECIPIENT_NAMES` | No | *(empty)* | Only publish splits addressed to these recipient names (comma-separated, case-insensitive). Empty publishes every boost. For a wallet shared with other splits, e.g. `MSP 2.0`. |
+| `BBN_PUBLISH_FEED_GUIDS` | No | *(empty)* | Only publish boosts whose feed or remote feed is one of these `<podcast:guid>`s, or whose feed names one of them as its `<podcast:publisher>` -- for music, the artist (comma-separated). Empty publishes every album. Publishing only: an unlisted boost is still forwarded. An entry that is not a guid stops the bot. |
 | `BBN_FORWARD_URL` | No | *(unset)* | MSP-2.0's `/api/boosts/ingest`. With a token and `BBN_RECIPIENT_NAMES`, every matching split payment is forwarded to MSP's chart. |
 | `BBN_FORWARD_TOKEN` | No | *(unset)* | Bearer token for that ingest; equals MSP-2.0's `MSP_BOT_INGEST_TOKEN`. |
 | `BBN_FORWARD_ACTIONS` | No | `boost,auto,stream` | Which blip-10 actions are forwarded. Streams are forwarded but never published. |
-| `BBN_CLIENT_NAME`       |    No    | `Boostr_Bot`                                                   | NIP-89 `client` tag: the app that signed the note, which is this bot. Clients render it as "via ...". Never the paying app -- that gets its own `app` tag. |
+| `BBN_CLIENT_NAME`       |    No    | `Boostr_Bot`                                                   | NIP-89 `client` tag: the app that signed the note, which is this bot. Clients render it as "via ...". Never the paying app -- that gets its own `app` tag. Any name but the default also goes on the banner as `by`, so the picture and the tag agree. |
 | `BBN_FEED_LOOKUP`       |    No    | `true`                                                     | Read the show's RSS feed to find its npubs and cover art. Off is supported: the note still publishes, with no picture and no `p` tags. |
 | `BBN_FEED_TIMEOUT_MS`   |    No    | `8000`                                                     | How long to wait on that feed read before giving up on it.                                        |
 | `BBN_PI_KEY`            |    No    | —                                                          | Podcast Index API key. With it, a boost that names a feed guid but no feed address resolves on its first boost instead of waiting for some other app to send the address. |
