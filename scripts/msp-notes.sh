@@ -6,12 +6,16 @@
 #   BBN_PUBLISH_FEED_GUIDS=<guid>,<guid> \
 #     scripts/msp-notes.sh repost [--apply] [--interval 15]  # MSP 2.0's nsec,
 #                                                          # Podcast Index key
-#   scripts/msp-notes.sh delete [--apply]                  # Boostr_Bot's nsec
+#   scripts/msp-notes.sh delete [--apply] [--interval 15]  # Boostr_Bot's nsec
+#   BBN_RELAYS=wss://relay.fountain.fm \
+#     scripts/msp-notes.sh delete --per-request 1 --interval 3 --apply
 #
 # export reads Boostr_Bot's MSP notes from the relays into
 # ~/.config/boostbox/msp/boostr-msp-notes.json; repost and delete read only that
 # file. Run export after the msp-bot has its own key, so it holds every note.
 # repost and delete print what they would do and send nothing without --apply.
+# A delete names fifty notes per request; relay.fountain.fm deletes only the
+# first note a request names, so send it one per request, on its own.
 # BBN_PUBLISH_FEED_GUIDS takes album guids and artist (publisher feed) guids, as
 # the bot does. An artist is found by reading each album's feed, and the notes
 # carry no feed address, so repost asks for the Podcast Index key and secret the
@@ -54,7 +58,7 @@ repost | delete)
 	fi
 	;;
 *)
-	echo "usage: scripts/msp-notes.sh export|repost|delete [--apply] [--interval <sec>]" >&2
+	echo "usage: scripts/msp-notes.sh export|repost|delete [--apply] [--interval <sec>] [--per-request <n>]" >&2
 	exit 2
 	;;
 esac

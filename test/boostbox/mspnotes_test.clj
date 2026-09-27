@@ -90,6 +90,14 @@
     (is (every? nostr/verify-event? events))
     (is (= ids (for [e events [k id] (:tags e) :when (= "e" k)] id)))))
 
+(deftest a-relay-that-reads-one-note-per-request-gets-one
+  ;; relay.fountain.fm answered OK to seven requests of fifty and deleted
+  ;; seven notes: the first each one named.
+  (let [ids (mapv #(format "%064x" %) (range 120))
+        events (ms/deletion-events boostr-key ids 1)]
+    (is (= 120 (count events)))
+    (is (= (mapv (fn [id] [["e" id] ["k" "1"]]) ids) (mapv :tags events)))))
+
 (deftest the-wrong-key-is-refused
   (let [notes [(note {:guid album :id "01A"})]]
     (testing "re-posting under Boostr_Bot's own key would move nothing"
