@@ -1,7 +1,7 @@
 (ns boostbox.forward
   "Send MSP's split payments to MSP-2.0's /api/boosts/ingest, where they feed the
    music chart. Since 2026-09-26 this bot is the chart's only live source; Helipad's
-   webhook is retired. See MSP-2.0's
+   webhook is turned off at the end of the rollout. See MSP-2.0's
    docs/superpowers/specs/2026-09-26-msp-bot-boost-ingest-design.md.
 
    Record building and queue bookkeeping are pure; `send!` is the one network call.
@@ -50,10 +50,22 @@
 
 (def ^:private boostbox->blip10
   "BoostBox's metadata names, as a boost link returns them, and the blip-10 names
-   MSP's parser reads. `boost_link` is deliberately not here: in BoostBox it is a
-   permalink, and MSP reads it as the song's own URL."
+   MSP's parser reads.
+
+   `boost_link` is deliberately not here. In BoostBox metadata it is not the song's
+   own URL: apps put a BoostBox permalink there (StableKraft's is another boost's
+   tardbox permalink) or the feed address (BoostMeBitch), while MSP keys songs on
+   it. So it is never forwarded.
+
+   `position` is not renamed to blip-10's `ts` either. MSP resolves any record with
+   `ts` and a guid on its `timesplit` rung, which gives no key and ignores the
+   listener's message -- and a boost link's metadata (v4vmusic, Castamatic) carries
+   `feed_guid`, `item_guid` and `position` but no remote guids, so every such boost
+   would count and never chart. Under its own name it leaves MSP to resolve the
+   record on `message`, joining its keysend twin, while raw storage keeps the
+   playback position for a later resolver."
   {"feed_guid" "guid" "item_guid" "episode_guid" "feed_title" "podcast"
-   "item_title" "episode" "recipient_name" "name" "position" "ts" "group" "uuid"})
+   "item_title" "episode" "recipient_name" "name" "group" "uuid"})
 
 (defn link-metadata->tlv
   "A boost link's metadata as a blip-10 map. Keys already in blip-10 form win over
@@ -71,12 +83,14 @@
    :sender-name "sender_name" :sender-id "sender_id" :recipient-name "name"
    :podcast "podcast" :episode "episode" :url "url" :feed-guid "guid"
    :item-guid "episode_guid" :remote-feed-guid "remote_feed_guid"
-   :remote-item-guid "remote_item_guid" :group "uuid" :position "ts"
+   :remote-item-guid "remote_item_guid" :group "uuid"
+   ;; not "ts", for the reason given at boostbox->blip10
+   :position "position"
    :value-msat "value_msat" :value-msat-total "value_msat_total"})
 
 (defn- boostagram->tlv
   "Last resort, when no original metadata survived: the normalized boostagram under
-   blip-10 names."
+   blip-10 names, `position` excepted."
   [b]
   (into {} (keep (fn [[k v]] (when-some [name (normalized->blip10 k)] (when (some? v) [name v])))) b))
 

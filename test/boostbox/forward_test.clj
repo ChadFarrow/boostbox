@@ -29,8 +29,10 @@
                 "boost_link" "https://tardbox.com/boost/01X" "message" "hi"}
         tlv (json/read-value (get (fwd/->record (boost "h2" :tlv-json nil :link-metadata linked)) "tlv"))]
     (is (= {"action" "boost" "name" "MSP 2.0" "guid" "fg" "episode_guid" "ig" "podcast" "Show"
-            "episode" "Ep" "ts" 42 "uuid" "u1" "message" "hi"}
-           tlv))))
+            "episode" "Ep" "position" 42 "uuid" "u1" "message" "hi"}
+           tlv))
+    (is (not (contains? tlv "ts"))
+        "with `ts` and a guid MSP would resolve it on `timesplit`, with no key and no song name")))
 
 (deftest blip10-names-win-over-boostbox-names
   (is (= "blip" (get (fwd/link-metadata->tlv {"guid" "blip" "feed_guid" "bb"}) "guid"))))
@@ -44,6 +46,12 @@
     (is (= "MSP 2.0" (get tlv "name")))
     (is (= "auto" (get tlv "action")))
     (is (= 100000 (get tlv "value_msat_total")))))
+
+(deftest a-rebuilt-record-keeps-the-position-under-its-own-name
+  (let [b (bg/normalize {"action" "boost" "name" "MSP 2.0" "guid" "fg" "position" 42})
+        tlv (json/read-value (get (fwd/->record (boost "h5" :tlv-json nil :boostagram b)) "tlv"))]
+    (is (= 42 (get tlv "position")))
+    (is (not (contains? tlv "ts")))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Config ~~~~~~~~~~~~~~~~~~~
 
