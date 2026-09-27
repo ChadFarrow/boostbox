@@ -272,7 +272,10 @@
   ([tx] (transaction->boost tx {}))
   ([tx {:keys [actions recipient-names] :or {actions #{"boost"}}}]
    (let [raw (boostagram-tlv tx)
-         b (extract-boostagram tx)]
+         b (extract-boostagram tx)
+         ;; the payer's own bytes, for boostbox.forward: MSP must see what Helipad saw
+         tlv-json (some-> raw decode-tlv-value)
+         wallet (get-in tx ["metadata" "boostagram"])]
      (cond
        ;; before the action check: on a wallet shared with other splits, a
        ;; boost to somebody else is not "not a boost", and must not be narrated
@@ -281,10 +284,12 @@
        {:skip :other-recipient}
 
        (and b (bg/boost? b actions))
-       {:payment-hash (get tx "payment_hash")
-        :boostagram b
-        :received-msat (->long (get tx "amount"))
-        :settled-at (->long (get tx "settled_at"))}
+       (cond-> {:payment-hash (get tx "payment_hash")
+                :boostagram b
+                :received-msat (->long (get tx "amount"))
+                :settled-at (->long (get tx "settled_at"))}
+         tlv-json (assoc :tlv-json tlv-json)
+         (and (nil? tlv-json) (map? wallet)) (assoc :wallet-boostagram wallet))
 
        ;; a boostagram we could read, for something we do not republish
        b {:skip :not-a-boost :action (:action b)}

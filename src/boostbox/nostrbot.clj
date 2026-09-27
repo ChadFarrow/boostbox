@@ -316,7 +316,8 @@
     (if (:boostagram result)
       result
       (if-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
-        (let [b (some-> (fetch-boost-metadata! url) bg/normalize)]
+        (let [linked (fetch-boost-metadata! url)
+              b (some-> linked bg/normalize)]
           (cond
             ;; same order as the TLV path: another recipient's split is that,
             ;; whatever its action
@@ -332,7 +333,9 @@
                  ;; the record already exists at this URL -- publish-boost! must
                  ;; reuse it rather than POST a second copy of the same boost
                  :boost-url url
-                 :boost-id (bg/boost-id-from-url url)})
+                 :boost-id (bg/boost-id-from-url url)
+                 ;; the link's own map, before normalizing, for boostbox.forward
+                 :link-metadata linked})
 
             ;; a TLV that was there and was not a boost says more than the link
             (not= :no-boostagram (:skip result)) (skip result)

@@ -302,6 +302,10 @@
       (is (= "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf" (-> b :boostagram :feed-guid))
           "so the note can still carry NIP-73 tags"))))
 
+(deftest a-linked-boost-carries-the-metadata-the-link-returned
+  (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+    (is (= linked-metadata (:link-metadata (bot/tx->boost! (ctx (atom {})) link-tx))))))
+
 (deftest a-linked-boost-is-never-stored-twice
   (let [a (atom {"cursor" 50 "recent" []})
         posted (atom [])

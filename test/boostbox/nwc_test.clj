@@ -1,7 +1,8 @@
 (ns boostbox.nwc-test
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.nwc :as nwc]
-            [boostbox.nostr :as nostr]))
+            [boostbox.nostr :as nostr]
+            [jsonista.core :as json]))
 
 (def wallet-pubkey (apply str (repeat 64 "a")))
 (def secret (apply str (repeat 64 "b")))
@@ -112,6 +113,26 @@
 
   (testing "a payment with no boostagram is not a boost"
     (is (= :no-boostagram (:skip (nwc/transaction->boost {"payment_hash" "x" "amount" 1000}))))))
+
+(deftest a-boost-carries-its-tlv-exactly-as-the-payer-wrote-it
+  ;; bg/normalize folds boost_link into :url; MSP's song resolver keys on boost_link,
+  ;; so the forwarder needs the original, not the normalized map
+  (let [tlv (json/write-value-as-string {"action" "boost" "name" "MSP 2.0"
+                                         "boost_link" "https://v4vmusic.com/songs/x"
+                                         "value_msat_total" 2100000})
+        tx {"payment_hash" "h" "amount" 21000 "settled_at" 1
+            "metadata" {"tlv_records" [{"type" 7629169
+                                        "value" (nostr/bytes->hex (.getBytes tlv "UTF-8"))}]}}
+        b (nwc/transaction->boost tx)]
+    (is (= tlv (:tlv-json b)) "byte for byte, boost_link included")
+    (is (nil? (:wallet-boostagram b)))))
+
+(deftest a-wallet-parsed-boost-carries-the-wallets-map
+  (let [parsed {"action" "boost" "podcast" "Show" "name" "MSP 2.0"}
+        b (nwc/transaction->boost {"payment_hash" "h" "amount" 1 "settled_at" 1
+                                   "metadata" {"boostagram" parsed}})]
+    (is (= parsed (:wallet-boostagram b)))
+    (is (nil? (:tlv-json b)))))
 
 (deftest a-skipped-transaction-says-why
   (testing "the reasons are distinct, because a count cannot tell a stream from a defect"
