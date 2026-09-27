@@ -4,7 +4,10 @@
             [boostbox.boostagram :as bg]
             [boostbox.mspnotes :as ms]
             [boostbox.nostr :as nostr]
-            [boostbox.nostrbot :as bot]))
+            [boostbox.nostrbot :as bot]
+            [boostbox.relay :as relay]
+            [jsonista.core :as json]
+            [manifold.stream :as s]))
 
 (def boostr-key (nostr/hex->bytes (apply str (repeat 64 "9"))))
 (def msp-key (nostr/hex->bytes (apply str (repeat 64 "7"))))
@@ -103,3 +106,67 @@
       (ms/write-notes! f notes)
       (is (= notes (ms/read-notes f)))
       (finally (io/delete-file f true)))))
+
+(defn- temp-file []
+  (io/file (System/getProperty "java.io.tmpdir") (str "msp-notes-" (System/nanoTime) ".json")))
+
+(defn- wire [e] (json/read-value (nostr/event->json e)))
+
+(deftest a-second-export-adds-and-never-removes
+  ;; After `delete --apply` the relays hold nothing, and the file is the only
+  ;; copy left of what repost needs.
+  (let [f (temp-file)
+        a (note {:guid album :id "01A" :at 1790000100})
+        b (note {:guid album :id "01B" :at 1790000200})]
+    (try
+      (ms/write-notes! f [a])
+      (with-redefs [ms/fetch-from-all! (fn [_ _] [{:relay "wss://r" :events [(wire b)]}])]
+        (#'ms/export! {:relays ["wss://r"] :file f :author boostr}))
+      (is (= [a b] (ms/read-notes f)) "the new note is added and the old one kept")
+      (with-redefs [ms/fetch-from-all! (fn [_ _] [{:relay "wss://r" :events []}])]
+        (#'ms/export! {:relays ["wss://r"] :file f :author boostr}))
+      (is (= [a b] (ms/read-notes f)) "relays that hold nothing any more take nothing away")
+      (finally (io/delete-file f true)))))
+
+(deftest an-export-that-missed-a-relay-says-so
+  (let [f (temp-file)]
+    (try
+      (with-redefs [ms/fetch-from-all! (fn [_ _] [{:relay "wss://r" :events [] :error "no EOSE"}])]
+        (is (= 1 (#'ms/export! {:relays ["wss://r"] :file f :author boostr}))
+            "an incomplete read is a failed run, so it is run again"))
+      (finally (io/delete-file f true)))))
+
+(defn- scripted-relay
+  "A relay that answers a REQ with `events` and then `ending` -- \"EOSE\", or
+   nil for a relay that goes quiet."
+  [events ending]
+  (let [sub (atom nil)
+        queue (atom nil)]
+    {:send-json! (fn [_ msg]
+                   (when (= "REQ" (first msg))
+                     (reset! sub (second msg))
+                     (reset! queue (concat (map #(vector "EVENT" @sub %) events)
+                                           (when ending [[ending @sub]]))))
+                   (doto (manifold.deferred/deferred) (manifold.deferred/success! true)))
+     :await-message (fn [_ pred & _]
+                      (loop []
+                        (when-let [m (first @queue)]
+                          (swap! queue rest)
+                          (if (pred m) m (recur)))))}))
+
+(deftest a-relay-that-goes-quiet-is-an-incomplete-read
+  (let [e (wire (note {:guid album :id "01A"}))]
+    (testing "EOSE is the only proof a relay sent everything"
+      (let [{:keys [send-json! await-message]} (scripted-relay [e] "EOSE")]
+        (with-redefs [relay/connect! (fn [& _] (s/stream))
+                      relay/send-json! send-json!
+                      relay/await-message await-message]
+          (is (= {:relay "wss://r" :events [e]} (#'ms/fetch-all! "wss://r" {"kinds" [1]}))))))
+    (testing "a timeout keeps what arrived but is not mistaken for the end"
+      (let [{:keys [send-json! await-message]} (scripted-relay [e] nil)]
+        (with-redefs [relay/connect! (fn [& _] (s/stream))
+                      relay/send-json! send-json!
+                      relay/await-message await-message]
+          (let [r (#'ms/fetch-all! "wss://r" {"kinds" [1]})]
+            (is (= [e] (:events r)))
+            (is (:error r))))))))

@@ -172,7 +172,9 @@
 (def ^:private page-size 500)
 
 (defn- req!
-  "One REQ, read until EOSE. Returns the wire events."
+  "One REQ, read until EOSE. Returns {:events :complete?}: only an EOSE says
+   the relay sent everything it holds, and a timeout or a closed socket must
+   not pass for one -- the export would be silently short."
   [conn filter]
   (let [sub (str "msp-notes-" (System/nanoTime))]
     @(relay/send-json! conn ["REQ" sub filter])
@@ -183,7 +185,7 @@
         (if (= "EVENT" (first msg))
           (recur (conj acc (nth msg 2)))
           (do (relay/send-json! conn ["CLOSE" sub])
-              acc))))))
+              {:events acc :complete? (= "EOSE" (first msg))}))))))
 
 (defn- fetch-all!
   "Every event `url` holds for `filter`, paging back with `until` because a
@@ -194,13 +196,21 @@
       (try
         (loop [until nil
                seen {}]
-          (let [page (req! conn (cond-> (assoc filter "limit" page-size)
-                                  until (assoc "until" until)))
-                fresh (remove #(contains? seen (get % "id")) page)]
-            (if (empty? fresh)
+          (let [{page :events :keys [complete?]}
+                (req! conn (cond-> (assoc filter "limit" page-size)
+                             until (assoc "until" until)))
+                fresh (remove #(contains? seen (get % "id")) page)
+                seen (into seen (map (juxt #(get % "id") identity)) fresh)]
+            (cond
+              (not complete?)
+              {:relay url :events (vec (vals seen))
+               :error (str "no EOSE after " (count seen) " events (timed out or closed)")}
+
+              (empty? fresh)
               {:relay url :events (vec (vals seen))}
-              (recur (reduce min (map #(long (get % "created_at")) page))
-                     (into seen (map (juxt #(get % "id") identity)) fresh)))))
+
+              :else
+              (recur (reduce min (map #(long (get % "created_at")) page)) seen))))
         (finally (s/close! conn))))
     (catch Exception e
       {:relay url :events [] :error (ex-message e)})))
@@ -221,18 +231,25 @@
   (str/join " " (map #(str (:relay %) "=" (if (:ok? %) "ok" (str "refused(" (:message %) ")")))
                      results)))
 
-(defn- export! [{:keys [relays file]}]
-  (let [author (nostr/bytes->hex (nostr/decode-key boostr-npub "npub"))
-        results (fetch-from-all! relays {"kinds" [1] "authors" [author]})
-        notes (select-msp-notes author (map wire->event (mapcat :events results)))]
+(defn- export!
+  "Adds what the relays hold to the file, and never removes a note from it:
+   after a delete the relays hold nothing, and the file is then the only copy
+   of what repost needs. So a second run, or a run during an outage, is safe."
+  [{:keys [relays file author]}]
+  (let [results (fetch-from-all! relays {"kinds" [1] "authors" [author]})
+        before (if (.exists (io/file file)) (read-notes file) [])
+        notes (select-msp-notes author (concat before (map wire->event (mapcat :events results))))
+        failed (filter :error results)]
     (doseq [{:keys [relay events error]} results]
       (println (format "%-34s %4d notes by Boostr_Bot%s" relay (count events)
-                       (if error (str "  (failed: " error ")") ""))))
+                       (if error (str "  (INCOMPLETE: " error ")") ""))))
     (write-notes! file notes)
-    (println (count notes) "MSP 2.0 notes written to" (str file))
+    (println (count notes) "MSP 2.0 notes in" (str file) (str "(" (- (count notes) (count before)) " new)"))
     (when (seq notes)
       (println "oldest" (date (:created-at (first notes))) " newest" (date (:created-at (peek notes)))))
-    0))
+    (if (seq failed)
+      (do (println "Some relays did not answer in full. Run export again; it only adds.") 1)
+      0)))
 
 (defn- repost! [{:keys [relays file seckey client-name guids apply? interval-ms]}]
   (let [author (nostr/bytes->hex (nostr/decode-key boostr-npub "npub"))
@@ -295,7 +312,7 @@
                              default-interval-ms)}
         key! #(nostr/decode-key (bb/get-env "BBN_NOSTR_SECKEY") "nsec")
         status (case cmd
-                 "export" (export! opts)
+                 "export" (export! (assoc opts :author (nostr/bytes->hex (nostr/decode-key boostr-npub "npub"))))
                  "repost" (repost! (assoc opts
                                           :seckey (key!)
                                           :client-name (bb/get-env "BBN_CLIENT_NAME" "MSP 2.0")
