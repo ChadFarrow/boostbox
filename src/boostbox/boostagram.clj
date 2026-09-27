@@ -172,6 +172,20 @@
   (or (empty? names)
       (contains? names (some-> (:recipient-name b) str/trim str/lower-case))))
 
+(defn feed-listed?
+  "Whether this boostagram names one of `guids` as its feed or its remote feed,
+   or `guids` is empty.
+
+   The list is the albums whose artists agreed to have their boosts announced,
+   so it errs towards silence: a boost naming no feed guid matches nothing.
+   The remote feed counts because a boost sent from a music show carries the
+   show's guid as its feed and the song's album only as the remote one.
+   `guids` is expected already lower-cased."
+  [b guids]
+  (or (empty? guids)
+      (boolean (some #(contains? guids (some-> % str/trim str/lower-case))
+                     [(:feed-guid b) (:remote-feed-guid b)]))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
 ;;
 ;; A keysend can carry the boostagram in TLV 7629169, but an LNURL payment has
@@ -463,18 +477,26 @@
    parameters; never repurpose one.
 
    Returns nil with no base URL, so a bot with nowhere to serve a picture from
-   publishes a note with no picture rather than a broken link."
-  [base-url b art total-msat]
-  (when-not (str/blank? (str base-url))
-    (let [enc #(java.net.URLEncoder/encode (str %) "UTF-8")
-          sats (quot (long (or total-msat 0)) 1000)
-          params (cond-> []
-                   art (conj (str "art=" (enc art)))
-                   (:podcast b) (conj (str "title=" (enc (:podcast b))))
-                   (:episode b) (conj (str "ep=" (enc (:episode b))))
-                   (pos? sats) (conj (str "sats=" sats)))]
-      (str (str/replace (str base-url) #"/+$" "") "/og/boost.png"
-           (when (seq params) (str "?" (str/join "&" params)))))))
+   publishes a note with no picture rather than a broken link.
+
+   `by` is the signing account's name, for a bot with a key of its own, so the
+   picture and the `client` tag agree. The default name adds nothing -- the
+   server's wordmark already says it -- which keeps the URLs of every bot on
+   the default byte-identical to the ones published before `by` existed."
+  ([base-url b art total-msat] (banner-url base-url b art total-msat nil))
+  ([base-url b art total-msat by]
+   (when-not (str/blank? (str base-url))
+     (let [enc #(java.net.URLEncoder/encode (str %) "UTF-8")
+           sats (quot (long (or total-msat 0)) 1000)
+           by (when-not (or (str/blank? (str by)) (= by default-client-name)) by)
+           params (cond-> []
+                    art (conj (str "art=" (enc art)))
+                    (:podcast b) (conj (str "title=" (enc (:podcast b))))
+                    (:episode b) (conj (str "ep=" (enc (:episode b))))
+                    (pos? sats) (conj (str "sats=" sats))
+                    by (conj (str "by=" (enc by))))]
+       (str (str/replace (str base-url) #"/+$" "") "/og/boost.png"
+            (when (seq params) (str "?" (str/join "&" params))))))))
 
 (defn ->note-content
   "The human-readable body of the kind:1 note, laid out as boostmebitch lays

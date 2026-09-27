@@ -96,6 +96,22 @@
     (is (not (bg/recipient-match? (bg/normalize (dissoc fountain-tlv "name")) #{"msp 2.0"}))
         "a boostagram naming no recipient is nobody's split")))
 
+(deftest feed-guids-pick-out-the-albums-that-agreed
+  (let [album "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"
+        song-feed "917393e3-1b1e-5cef-ace4-edaa54e1f810"
+        show (bg/normalize fountain-tlv)
+        remote (bg/normalize (assoc fountain-tlv
+                                    "guid" "8d9ea0ef-ca36-5e1f-9a1a-ea7fc1dd4b77"
+                                    "remote_feed_guid" (str/upper-case song-feed)))]
+    (is (bg/feed-listed? show nil) "no list means every feed")
+    (is (bg/feed-listed? show #{}) "no list means every feed")
+    (is (bg/feed-listed? show #{album}) "the feed the boost was sent on")
+    (is (bg/feed-listed? remote #{song-feed})
+        "the remote song's feed, case-folded: a music show's boost names the artist's album there")
+    (is (not (bg/feed-listed? remote #{album})))
+    (is (not (bg/feed-listed? (bg/normalize (dissoc fountain-tlv "guid")) #{album}))
+        "a boost naming no feed is nobody's album")))
+
 (deftest boost-payload-mapping
   (let [b (bg/normalize fountain-tlv)
         p (bg/->boost-payload b {:received-msat 21000 :settled-at 1757275200})]
@@ -449,6 +465,19 @@
                            "https://evil/a.png&sats=999999" 1000)]
       (is (str/includes? u "%26sats%3D999999"))
       (is (= 1 (count (re-seq #"[?&]sats=" u))))))
+
+  (testing "an account signing with its own name says so in `by`, added last so
+            every URL published before it stays byte-identical"
+    (is (= "https://tardbox.com/og/boost.png?sats=2100&by=MSP+2.0"
+           (bg/banner-url "https://tardbox.com" (bg/normalize {"action" "boost"})
+                          nil 2100000 "MSP 2.0"))))
+
+  (testing "the default name adds nothing: that is the server's wordmark already"
+    (is (= "https://tardbox.com/og/boost.png?sats=2100"
+           (bg/banner-url "https://tardbox.com" (bg/normalize {"action" "boost"})
+                          nil 2100000 bg/default-client-name)
+           (bg/banner-url "https://tardbox.com" (bg/normalize {"action" "boost"})
+                          nil 2100000 nil))))
 
   (testing "no base URL means no picture, never a broken link"
     (is (nil? (bg/banner-url nil (bg/normalize fountain-tlv) "https://cdn.x/a.png" 1000)))

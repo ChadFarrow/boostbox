@@ -46,6 +46,18 @@
   [s]
   (into #{} (map str/lower-case) (csv s)))
 
+(defn- feed-guid-set
+  "BBN_PUBLISH_FEED_GUIDS as a set of lower-cased `<podcast:guid>`s. Throws on
+   an entry that is not one: the list names the albums whose artists agreed to
+   be announced, and a typo would otherwise match nothing and say nothing."
+  [s]
+  (let [guids (folded-set s)]
+    (when-let [bad (seq (remove bg/valid-feed-guid? guids))]
+      (throw (ex-info (str "BBN_PUBLISH_FEED_GUIDS: not a podcast:guid: "
+                           (str/join ", " bad))
+                      {:invalid (vec bad)})))
+    guids))
+
 (defn config
   "BBN_-prefixed so nothing here can collide with the web app's BB_ vars.
    Storage config is shared with the web app and read via bb/config."
@@ -101,6 +113,10 @@
      ;; which is how the MSP 2.0 support split arrives -- see
      ;; bg/recipient-match?.
       :recipient-names (folded-set (bb/get-env "BBN_RECIPIENT_NAMES" ""))
+     ;; Only boosts on these albums are published; empty means every album.
+     ;; Publishing only: an unlisted boost is still forwarded. See
+     ;; bg/feed-listed?.
+      :publish-feed-guids (feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))
      ;; how far back to reach on the very first run; 0 means "start from now"
       :backfill-sec (Long/parseLong (bb/get-env "BBN_BACKFILL_SEC" "0"))
       :dry-run? (truthy? (bb/get-env "BBN_DRY_RUN" "false"))
@@ -435,7 +451,7 @@
         ctxt (feed-context ctx boostagram)
         total (bg/note-total-msat boostagram received-msat)
         banner (bg/banner-url (:boostbox-url ctx) boostagram
-                              (or (:art ctxt) fallback-art) total)]
+                              (or (:art ctxt) fallback-art) total client-name)]
     (nostr/sign-event seckey
                       {:kind 1
                        :created-at (if settled-at (min (long settled-at) now) now)
@@ -775,9 +791,14 @@
                    forwarding? (update :actions (fnil into #{"boost"}) (:forward-actions ctx)))
         txs (fetch-transactions! session cursor)
         results (mapv #(tx->boost! read-ctx %) txs)
-        publishable? #(and (:boostagram %) (bg/boost? (:boostagram %) (:actions ctx #{"boost"})))
+        boost? #(and (:boostagram %) (bg/boost? (:boostagram %) (:actions ctx #{"boost"})))
+        ;; an unlisted album's boost takes the path a stream takes: forwarded,
+        ;; never published, and the cursor moves past it
+        listed? #(bg/feed-listed? (:boostagram %) (:publish-feed-guids ctx))
+        publishable? #(and (boost? %) (listed? %))
         boosts (->> results (filter publishable?) (sort-by #(or (:settled-at %) 0)))
         forward-only (count (remove publishable? (filter :boostagram results)))
+        unlisted (count (remove listed? (filter boost? results)))
         skipped (frequencies (keep :skip results))
         high-water (reduce max 0 (keep tx-settled-at txs))
         forwardable? #(and (:boostagram %) (bg/boost? (:boostagram %) (:forward-actions ctx)))
@@ -798,7 +819,7 @@
              :action (:action r)
              :url (:url r)))
     (u/log ::poll :transactions (count txs) :boosts (count boosts)
-           :forward-only forward-only :skipped skipped :cursor cursor)
+           :forward-only forward-only :unlisted unlisted :skipped skipped :cursor cursor)
     ;; A payment that is forwarded but never published (a stream, with the default
     ;; actions) goes into the state the loop starts from, so its first save --
     ;; inside publish-boost!, or at the end -- persists it with the cursor.
@@ -851,6 +872,7 @@
            :relays (:relays cfg)
            :boostbox (:boostbox-url cfg)
            :wallet-relay (first (:relays (:nwc cfg)))
+           :publish-feed-guids (count (:publish-feed-guids cfg))
            :dry-run (:dry-run? cfg))
     ;; check-state-durability! let this through, so someone asserted the
     ;; filesystem is a mounted volume. Say so once at startup: if it is not,

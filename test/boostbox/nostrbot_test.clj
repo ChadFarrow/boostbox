@@ -201,6 +201,19 @@
     (testing "a wallet clock ahead of ours never dates a note in the future, which relays refuse"
       (is (<= (:created-at (note {:settled-at (+ now 86400)})) (+ now 5))))))
 
+(deftest a-bot-with-its-own-name-signs-its-banner-with-it
+  (let [b (bg/normalize {"action" "boost" "podcast" "Some Album" "value_msat_total" 21000})
+        tags-of (fn [client-name]
+                  (let [e (bot/build-note (ctx (atom {}) :client-name client-name :feed-lookup? false)
+                                          b {:boost-url "u" :received-msat 21000})]
+                    {:content (:content e)
+                     :client (some #(when (= "client" (first %)) (second %)) (:tags e))}))]
+    (let [{:keys [content client]} (tags-of "MSP 2.0")]
+      (is (= "MSP 2.0" client))
+      (is (clojure.string/includes? content "&by=MSP+2.0") "the picture names the account the tag names"))
+    (is (not (clojure.string/includes? (:content (tags-of bg/default-client-name)) "by="))
+        "the default bot's banner URL is unchanged")))
+
 (deftest first-run-sets-a-watermark-instead-of-replaying-history
   (let [a (atom {"cursor" nil "recent" []})
         asked (atom nil)
@@ -435,6 +448,15 @@
     (is (= #{"msp 2.0"} (folded "MSP 2.0")))
     (is (= #{"boost" "auto"} (folded " Boost , AUTO ")))
     (is (= #{} (folded "")))))
+
+(deftest a-typo-in-the-album-list-stops-the-bot
+  (let [guids #'bot/feed-guid-set]
+    (is (= #{"c90e609a-df1e-596a-bd5e-57bcc8aad6cc" "917393e3-1b1e-5cef-ace4-edaa54e1f810"}
+           (guids " C90E609A-DF1E-596A-BD5E-57BCC8AAD6CC , 917393e3-1b1e-5cef-ace4-edaa54e1f810")))
+    (is (= #{} (guids "")) "no list means every album")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"c90e609a-df1e-596a-bd5e-57bcc8aad6c"
+                          (guids "c90e609a-df1e-596a-bd5e-57bcc8aad6c"))
+        "a guid one character short is refused, not silently matched against nothing")))
 
 ;; A wallet in many shows' splits gets a boostagram on nearly every payment,
 ;; about 2 KB each. relay.getalby.com passed a page of 20 (39 KB) and silently
@@ -740,6 +762,18 @@
       (is (= 100 (get @a "cursor")) "the note went out, so the cursor moves on")
       (is (= ["h1"] (hashes (get @a "forward-pending")))))))
 
+(deftest a-listed-album-is-published
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{"c90e609a-df1e-596a-bd5e-57bcc8aad6cc"})
+                      ::session)
+      (is (= 1 (count @published))))))
+
 (deftest nothing-is-forwarded-without-a-recipient-filter
   (let [a (atom {"cursor" 50 "recent" []})
         sent (atom [])]
@@ -807,6 +841,22 @@
       (is (= ["s1"] (hashes (get @at-send "forward-pending")))
           "the saved state held the stream before any send began")
       (is (= 100 (get @at-send "cursor")) "in the same save that moved the cursor past it"))))
+
+(deftest an-unlisted-album-is-forwarded-and-never-published
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])
+        t1 (tx "h1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] (throw (AssertionError. "an unlisted boost is not stored")))
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{"917393e3-1b1e-5cef-ace4-edaa54e1f810"})
+                      ::session)
+      (is (empty? @published) "its artist never agreed")
+      (is (= ["h1"] (hashes @sent)) "the chart still counts it")
+      (is (= 100 (get @a "cursor")) "and it is never read again"))))
 
 (deftest a-published-boost-is-saved-in-the-queue-before-it-is-sent
   (let [a (atom {"cursor" 50 "recent" []})
