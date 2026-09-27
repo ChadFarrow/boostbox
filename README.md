@@ -277,7 +277,7 @@ volume to the bot's service, point `BB_FS_ROOT_PATH` at it and set
 | `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
 | `BBN_ACTIONS` | No | `boost` | Comma-separated blip-10 actions to publish. `boost,auto` adds v4vmusic's automatic per-song boosts. Streams are never worth a note. |
 | `BBN_RECIPIENT_NAMES` | No | *(empty)* | Only publish splits addressed to these recipient names (comma-separated, case-insensitive). Empty publishes every boost. For a wallet shared with other splits, e.g. `MSP 2.0`. |
-| `BBN_PUBLISH_FEED_GUIDS` | No | *(empty)* | Only publish boosts whose feed or remote feed is one of these `<podcast:guid>`s (comma-separated). Empty publishes every album. Publishing only: an unlisted boost is still forwarded. An entry that is not a guid stops the bot. |
+| `BBN_PUBLISH_FEED_GUIDS` | No | *(empty)* | Only publish boosts whose feed or remote feed is one of these `<podcast:guid>`s, or whose feed names one of them as its `<podcast:publisher>` -- for music, the artist (comma-separated). Empty publishes every album. Publishing only: an unlisted boost is still forwarded. An entry that is not a guid stops the bot. |
 | `BBN_FORWARD_URL` | No | *(unset)* | MSP-2.0's `/api/boosts/ingest`. With a token and `BBN_RECIPIENT_NAMES`, every matching split payment is forwarded to MSP's chart. |
 | `BBN_FORWARD_TOKEN` | No | *(unset)* | Bearer token for that ingest; equals MSP-2.0's `MSP_BOT_INGEST_TOKEN`. |
 | `BBN_FORWARD_ACTIONS` | No | `boost,auto,stream` | Which blip-10 actions are forwarded. Streams are forwarded but never published. |
