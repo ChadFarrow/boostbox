@@ -747,3 +747,39 @@
                   fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
       (bot/poll-once! (fwd-ctx a :recipient-names #{}) ::session)
       (is (empty? @sent)))))
+
+;; The five tests above stub nwc/transaction->boost as a map, which ignores its
+;; second argument (the opts) whenever the key is present -- so they would all
+;; still pass even if poll-once! passed plain `ctx` instead of the widened
+;; `read-ctx`. These two use a real function stub that honours `opts` the way
+;; nwc/transaction->boost actually does, so they are the ones that catch a
+;; regression in that wiring.
+(defn- honest-stream-stub [result]
+  (fn [_tx opts]
+    (if (contains? (:actions opts) "stream")
+      result
+      {:skip :not-a-boost :action "stream"})))
+
+(deftest a-forwarding-bot-reads-a-stream-it-would-otherwise-skip
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost (honest-stream-stub (stream "s1" 100))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["s1"] (hashes @sent)) "forwarding is on, so :actions was widened to include \"stream\"")
+      (is (empty? @published)))))
+
+(deftest a-bot-without-forwarding-still-skips-streams
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost (honest-stream-stub (stream "s1" 100))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (empty? @sent) "forwarding is off, so :actions was never widened and the stream stays a skip")
+      (is (empty? @published)))))
