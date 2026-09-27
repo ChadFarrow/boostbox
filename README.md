@@ -277,6 +277,9 @@ volume to the bot's service, point `BB_FS_ROOT_PATH` at it and set
 | `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
 | `BBN_ACTIONS` | No | `boost` | Comma-separated blip-10 actions to publish. `boost,auto` adds v4vmusic's automatic per-song boosts. Streams are never worth a note. |
 | `BBN_RECIPIENT_NAMES` | No | *(empty)* | Only publish splits addressed to these recipient names (comma-separated, case-insensitive). Empty publishes every boost. For a wallet shared with other splits, e.g. `MSP 2.0`. |
+| `BBN_FORWARD_URL` | No | *(unset)* | MSP-2.0's `/api/boosts/ingest`. With a token and `BBN_RECIPIENT_NAMES`, every matching split payment is forwarded to MSP's chart. |
+| `BBN_FORWARD_TOKEN` | No | *(unset)* | Bearer token for that ingest; equals MSP-2.0's `MSP_BOT_INGEST_TOKEN`. |
+| `BBN_FORWARD_ACTIONS` | No | `boost,auto,stream` | Which blip-10 actions are forwarded. Streams are forwarded but never published. |
 | `BBN_CLIENT_NAME`       |    No    | `Boostr_Bot`                                                   | NIP-89 `client` tag: the app that signed the note, which is this bot. Clients render it as "via ...". Never the paying app -- that gets its own `app` tag. |
 | `BBN_FEED_LOOKUP`       |    No    | `true`                                                     | Read the show's RSS feed to find its npubs and cover art. Off is supported: the note still publishes, with no picture and no `p` tags. |
 | `BBN_FEED_TIMEOUT_MS`   |    No    | `8000`                                                     | How long to wait on that feed read before giving up on it.                                        |
