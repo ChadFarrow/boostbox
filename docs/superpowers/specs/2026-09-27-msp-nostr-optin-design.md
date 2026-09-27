@@ -1,6 +1,7 @@
 # MSP 2.0 Nostr posts: the artist picks
 
-Date: 2026-09-27. Status: approved design, not built. Depends on boostbox#43.
+Date: 2026-09-27. Status: parked -- Chad wants the page, but it is a ways off. Not built. Depends on
+boostbox#43, which carries the manual list (`BBN_PUBLISH_FEED_GUIDS`) until then.
 
 ## Context
 
@@ -204,6 +205,13 @@ reason (`not-listed`, `action`, `npub-mismatch`, `feed-unreadable`, `optins-not-
 
 **Live, before switching over:** Longy signs in, saves one feed, and a boost on it posts from the
 MSP 2.0 npub with the chosen settings. Then `BBN_PUBLISH_FEED_GUIDS` is removed.
+
+## Open questions (settle before building)
+
+- **Per artist or per feed?** This spec sets payment types, *show the amount* and *mention me* once
+  per artist, and only the on/off switch per feed. Chad has not confirmed that.
+- **The rest of #43 may have moved on.** Re-read `publish-boost!` and `feed-listed?` before the
+  plan: this spec names them as they were on 2026-09-27.
 
 ## Rollout
 
