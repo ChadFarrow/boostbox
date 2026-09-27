@@ -174,17 +174,20 @@
 
 (defn feed-listed?
   "Whether this boostagram names one of `guids` as its feed or its remote feed,
-   or `guids` is empty.
+   or one of `publisher-guids` is -- or `guids` is empty.
 
-   The list is the albums whose artists agreed to have their boosts announced,
-   so it errs towards silence: a boost naming no feed guid matches nothing.
-   The remote feed counts because a boost sent from a music show carries the
-   show's guid as its feed and the song's album only as the remote one.
+   The list is the albums and artists who agreed to have their boosts
+   announced, so it errs towards silence: a boost naming no feed guid matches
+   nothing. The remote feed counts because a boost sent from a music show
+   carries the show's guid as its feed and the song's album only as the remote
+   one. `publisher-guids` are the artists those feeds name in their own
+   `<podcast:publisher>`, read by the caller -- never a guid the payer wrote.
    `guids` is expected already lower-cased."
-  [b guids]
-  (or (empty? guids)
-      (boolean (some #(contains? guids (some-> % str/trim str/lower-case))
-                     [(:feed-guid b) (:remote-feed-guid b)]))))
+  ([b guids] (feed-listed? b guids nil))
+  ([b guids publisher-guids]
+   (or (empty? guids)
+       (boolean (some #(contains? guids (some-> % str str/trim str/lower-case))
+                      (concat [(:feed-guid b) (:remote-feed-guid b)] publisher-guids))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
 ;;
@@ -366,12 +369,19 @@
    so it is emitted once per kind rather than once per id -- a second identical
    `k` says nothing the first did not. Ids are de-duplicated because apps that
    send a remote item routinely repeat the host feed's guid in both fields, and
-   the same `i` tag twice is noise a relay has to store forever."
-  [b]
-  (->> nip73-id-fields
-       (keep (fn [{:keys [field kind valid? norm]}]
-               (let [v (get b field)]
-                 (when (valid? v) [kind (norm v)]))))
+   the same `i` tag twice is noise a relay has to store forever.
+
+   `publisher-guids` come last: they are not in the boostagram but in the feeds
+   it names, read by the bot -- for music, the artist every album shares."
+  [b publisher-guids]
+  (->> (concat
+        (keep (fn [{:keys [field kind valid? norm]}]
+                (let [v (get b field)]
+                  (when (valid? v) [kind (norm v)])))
+              nip73-id-fields)
+        (for [g publisher-guids
+              :when (valid-feed-guid? g)]
+          ["podcast:publisher:guid" (str/lower-case (str/trim g))]))
        (distinct)
        (reduce (fn [[tags seen] [kind v]]
                  [(cond-> (conj tags ["i" (str kind ":" v)])
@@ -394,10 +404,10 @@
    attribute the bot's own note to software that never signed it. `app` is the
    app that SENT the boost, the convention boostmebitch uses on its kind:3369
    receipts. It is payer-written text, so it is a claim, not a fact."
-  [b {:keys [boost-url npubs banner-url client-name total-msat]}]
+  [b {:keys [boost-url npubs banner-url client-name total-msat publisher-guids]}]
   (let [banner-item (when banner-url (str "url " banner-url))
         sender (sender-npub b)]
-    (cond-> (nip73-id-tags b)
+    (cond-> (nip73-id-tags b publisher-guids)
       boost-url
       (conj ["r" boost-url])
 

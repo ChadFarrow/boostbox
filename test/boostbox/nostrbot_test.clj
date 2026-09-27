@@ -858,6 +858,60 @@
       (is (= ["h1"] (hashes @sent)) "the chart still counts it")
       (is (= 100 (get @a "cursor")) "and it is never read again"))))
 
+(def ^:private artist "1a197bac-95ae-53bd-bf6d-40ba8b551088")
+(def ^:private album-guid "fe17f4f6-074f-4b2c-a450-611faccfaea2")
+
+(defn- i-tags [e] (set (for [[k v] (:tags e) :when (= "i" k)] v)))
+
+(deftest an-artist-on-the-list-is-published-from-any-of-their-albums
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        t1 (tx "h1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (boost "h1" 100)}
+                  bot/feed-context (fn [_ _] {:publisher-guid artist})
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{artist}) ::session)
+      (is (= 1 (count @published)) "the album is not listed, but its artist is")
+      (is (contains? (i-tags (first @published)) (str "podcast:publisher:guid:" artist))
+          "and the note names the artist as NIP-73's publisher id"))))
+
+(deftest a-music-show-boost-is-listed-by-the-songs-own-album
+  ;; The show's feed names the show's publisher, not the artist. The song's
+  ;; album is the remote feed, and blip-10 carries no address for it, so the
+  ;; bot finds it from what an earlier boost taught it.
+  (let [a (atom {"cursor" 50 "recent" [] "feeds" {album-guid "https://x.example/album.xml"}})
+        published (atom [])
+        t1 (tx "h1" 100)
+        b (assoc-in (boost "h1" 100) [:boostagram :remote-feed-guid] album-guid)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 b}
+                  bot/read-feed-at (fn [_ url _]
+                                     (when (= url "https://x.example/album.xml") {:publisher-guid artist}))
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{artist} :feed-lookup? true) ::session)
+      (is (= 1 (count @published)))
+      (is (contains? (i-tags (first @published)) (str "podcast:publisher:guid:" artist))))))
+
+(deftest a-feed-that-cannot-be-read-lists-no-artist
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        sent (atom [])
+        t1 (tx "h1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (boost "h1" 100)}
+                  bot/feed-context (fn [_ _] nil)
+                  bot/store-boost! (fn [_ _] (throw (AssertionError. "an unlisted boost is not stored")))
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{artist}) ::session)
+      (is (empty? @published) "nothing says whose album it is, so it is nobody's")
+      (is (= ["h1"] (hashes @sent)) "and the chart still counts it"))))
+
 (deftest a-published-boost-is-saved-in-the-queue-before-it-is-sent
   (let [a (atom {"cursor" 50 "recent" []})
         at-send (atom nil)]
