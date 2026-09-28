@@ -1,7 +1,8 @@
 (ns boostbox.feed
-  "The three things a boost note needs out of an RSS feed and nothing else: the
-   npubs the feed declares for its people, a cover image, and the guid of the
-   publisher feed it names -- for music, the artist.
+  "The things a boost note needs out of an RSS feed and nothing else: the npubs
+   the feed declares for its people, a cover image, the guid of the publisher
+   feed it names -- for music, the artist -- and the splits the boosted item
+   pays, which name a recipient a boost link gives only by address.
 
    Modelled on boostmebitch's lib/feed-xml.ts so the two apps agree about what
    a feed says. Two rules carry over from there, and both are load-bearing:
@@ -248,20 +249,25 @@
         ends (keep #(str/index-of xml % start) ["<item" "<podcast:liveItem"])]
     (subs xml start (if (seq ends) (apply min ends) (count xml)))))
 
-(defn item-art
-  "The cover on the `<item>` whose guid matches, or nil.
+(defn- item-markup
+  "The inner markup of the `<item>` whose guid matches, or nil.
 
    Matched on the guid the boostagram carries rather than on position: an item
-   list is not ordered by anything we know, and the wrong item's art is a
-   picture of a different episode."
+   list is not ordered by anything we know, and the wrong item is a different
+   episode."
   [^String xml item-guid]
   (when-not (str/blank? (str item-guid))
     (let [needle (str/trim (str item-guid))]
       (some (fn [{:keys [inner]}]
               (when (some #(= needle (str/trim (decode-xml-text (:inner %))))
                           (find-blocks inner "guid"))
-                (image-in inner)))
+                inner))
             (take max-items-scanned (find-blocks xml "item"))))))
+
+(defn item-art
+  "The cover on the `<item>` whose guid matches, or nil."
+  [^String xml item-guid]
+  (some-> (item-markup xml item-guid) image-in))
 
 (defn feed-art
   "The best cover for this boost: the episode's own, else the show's."
@@ -288,18 +294,80 @@
                :when (bg/valid-feed-guid? guid)]
            (str/lower-case guid))))
 
+;; ~~~~~~~~~~~~~~~~~~~ Value recipients ~~~~~~~~~~~~~~~~~~~
+
+(def max-value-recipients
+  "How many `<podcast:valueRecipient>`s are read from one value block. Real
+   splits run to a dozen or two; past this it is not a split list."
+  100)
+
+(defn- recipients-in
+  "{:name :address} for each recipient in the first `<podcast:value>` of
+   `slice`, or nil when it has none.
+
+   A `<podcast:valueTimeSplit>` is cut out first: the recipients inside one are
+   paid only for a stretch of the episode, often under other names, and read
+   as the item's own they would make an address look like someone else's.
+
+   The close is found exactly rather than with `find-blocks`, whose search for
+   `</podcast:value` would stop at the first `</podcast:valueTimeSplit` and
+   lose every recipient listed after one."
+  [^String slice]
+  (when-let [{:keys [after self-closing?]} (first (find-tags slice "podcast:value"))]
+    (let [inner (if self-closing?
+                  ""
+                  (subs slice after (or (str/index-of slice "</podcast:value>" after)
+                                        (count slice))))
+          own (reduce (fn [s {split :inner}]
+                        (if (str/blank? split) s (str/replace s split "")))
+                      inner
+                      (take max-value-recipients (find-blocks inner "podcast:valueTimeSplit")))]
+      (not-empty
+       (vec (for [{:keys [attrs]} (take max-value-recipients
+                                        (find-tags own "podcast:valueRecipient"))
+                  :let [address (read-attr attrs "address")]
+                  :when address]
+              {:name (read-attr attrs "name") :address address}))))))
+
+(defn value-recipients
+  "The splits a boost on this item paid: the item's own value block when it has
+   one, the channel's otherwise -- Podcasting 2.0's rule, an item's block
+   replacing the channel's rather than adding to it."
+  [^String xml item-guid]
+  (or (some-> (item-markup xml item-guid) recipients-in)
+      (recipients-in (channel-slice xml))))
+
+(defn recipient-name
+  "The name `recipients` give `address`, or nil.
+
+   For a payment whose metadata says where it went but not to whom -- Fountain's
+   boost link carries `recipient_address` and no name. The name comes from the
+   feed, which the podcaster wrote, never from the payer. Only an address with
+   exactly one name answers: one listed twice under different names could be
+   either split, and guessing would file the payment under the wrong one."
+  [recipients address]
+  (let [fold #(some-> % str str/trim str/lower-case not-empty)
+        a (fold address)
+        names (when a
+                (distinct (keep #(when (= a (fold (:address %)))
+                                   (some-> (:name %) str/trim not-empty))
+                                recipients)))]
+    (when (= 1 (count (distinct (map str/lower-case names))))
+      (first names))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Entry point ~~~~~~~~~~~~~~~~~~~
 
 (defn read-feed
-  "{:npubs :art :publisher-guid} for one feed document. Returns nil for
-   anything unusable, so a caller has one thing to test rather than several."
+  "{:npubs :art :publisher-guid :recipients} for one feed document. Returns nil
+   for anything unusable, so a caller has one thing to test rather than several."
   [^String xml item-guid]
   (try
     (when-not (str/blank? xml)
       (let [clean (strip-comments xml)
             npubs (feed-npubs clean)
             art (feed-art clean item-guid)
-            publisher (publisher-guid clean)]
-        (when (or (seq npubs) art publisher)
-          {:npubs npubs :art art :publisher-guid publisher})))
+            publisher (publisher-guid clean)
+            recipients (value-recipients clean item-guid)]
+        (when (or (seq npubs) art publisher recipients)
+          {:npubs npubs :art art :publisher-guid publisher :recipients recipients})))
     (catch Exception _ nil)))

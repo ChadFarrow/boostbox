@@ -115,6 +115,9 @@
      :sender-id (->str (get* m "sender_id"))
      :sender-npub (->str (get* m "sender_npub"))
      :recipient-name (clean (get* m "name" "recipient_name") max-name-length)
+     ;; BoostBox's own spelling; Fountain's boost link sends this and no name,
+     ;; so the name is looked up in the feed -- see nostrbot/with-feed-recipient
+     :recipient-address (clean (get* m "recipient_address") max-name-length)
      ;; blip-10 names these "podcast" and "episode", but senders that model
      ;; their payload on BoostBox's own schema (BoostMeBitch, for one) send
      ;; "feed_title" and "item_title" instead. Accept both, exactly as the guid

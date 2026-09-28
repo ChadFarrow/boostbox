@@ -453,10 +453,13 @@
 (deftest a-boost-link-honours-the-recipient-and-action-filters
   (let [msp (ctx (atom {}) :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"})]
     (testing "a linked boost to another recipient is that recipient's"
-      (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc linked-metadata "name" "Another Show"))]
         (let [r (bot/tx->boost! msp link-tx)]
           (is (= :other-recipient (:skip r)))
           (is (= "hL" (:payment-hash r))))))
+    (testing "a linked boost naming no recipient at all cannot be told apart, and says so"
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+        (is (= :recipient-unnamed (:skip (bot/tx->boost! msp link-tx))))))
     (testing "a linked auto-boost on the named split publishes"
       (with-redefs [bot/fetch-boost-metadata!
                     (fn [_] (assoc linked-metadata "action" "auto" "name" "MSP 2.0"))]
@@ -465,6 +468,115 @@
       (with-redefs [bot/fetch-boost-metadata!
                     (fn [_] (assoc linked-metadata "action" "auto" "name" "MSP 2.0"))]
         (is (= :not-a-boost (:skip (bot/tx->boost! (ctx (atom {})) link-tx))))))))
+
+(def fountain-link-tx
+  {"payment_hash" "hF" "amount" 1000 "settled_at" 1790595877
+   "description" "https://fountain.fm/track/BK7VSc4cZ5KChQMcZ1uE?payment=fbMNWUbBpg51sCEQ4Wig"})
+
+(def fountain-link-metadata
+  "What fountain.fm's x-rss-payment answered for a real 100-sat boost on
+   2026-09-28, the MSP split's leg: an address and no recipient name."
+  {"id" "fbMNWUbBpg51sCEQ4Wig" "action" "BOOST" "split" 0.01
+   "group" "R7rgk17X0gpYB1g5PQJN" "message" nil
+   "link" "https://fountain.fm/track/BK7VSc4cZ5KChQMcZ1uE?payment=fbMNWUbBpg51sCEQ4Wig"
+   "app_name" "Fountain" "sender_id" "HzsySSGguZSCUdahmev4"
+   "sender_name" "chadf@fountain.fm"
+   "sender_npub" "npub177fz5zkm87jdmf0we2nz7mm7uc2e7l64uzqrv6rvdrsg8qkrg7yqx0aaq7"
+   "recipient_address" "chadf@getalby.com"
+   "value_msat" 1000 "value_usd" 0.000831 "value_msat_total" 100000
+   "timestamp" "2026-09-28T11:44:37.690Z" "position" 15
+   "feed_guid" "565d0930-74bc-44ba-ab5d-da2f6c4b7b79" "feed_title" "Songs From The Seaside"
+   "item_guid" "31561378-6997-4298-9baf-c1671ae6f42e" "item_title" "Penthouses & Pavements"
+   "publisher_guid" "4d25f0dd-9270-4fb7-8aeb-ddd4a5213585" "publisher_title" "Longy"
+   "remote_item_guid" nil "remote_feed_guid" nil "remote_publisher_guid" nil})
+
+(def seaside-url "https://headstarts.uk/msp/longy/songs%20from%20the%20seaside/Songs_From_The_Seaside.xml")
+
+(def seaside-recipients
+  [{:name "longy" :address "longy@fountain.fm"}
+   {:name "MSP 2.0" :address "chadf@getalby.com"}
+   {:name "Podcastindex.org" :address "podcastindex@getalby.com"}
+   {:name "nmnu" :address "nmnu@fountain.fm"}])
+
+(defn- msp-ctx []
+  (reset! @#'bot/link-feed-urls {})
+  (ctx (atom {}) :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}
+       :boost-link-origins nil :feed-lookup? true :pi-key "k" :pi-secret "s"))
+
+(deftest a-fountain-boost-link-is-named-from-the-feed
+  (let [asked (atom [])]
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid
+                  (fn [_ guid] (swap! asked conj guid) {:url seaside-url})
+                  bot/read-feed-at (fn [_ url item]
+                                     (when (and (= url seaside-url)
+                                                (= item "31561378-6997-4298-9baf-c1671ae6f42e"))
+                                       {:recipients seaside-recipients}))]
+      (let [c (msp-ctx)
+            r (bot/tx->boost! c fountain-link-tx)]
+        (is (some? (:boostagram r)) "the MSP split's leg of a Fountain boost publishes")
+        (is (= "MSP 2.0" (-> r :boostagram :recipient-name)))
+        (is (= seaside-url (-> r :boostagram :url))
+            "so publish-boost! reads the same feed and memoizes its address")
+        (testing "MSP receives the name as a keysend would carry it"
+          (is (= "MSP 2.0" (get (:link-metadata r) "recipient_name")))
+          (is (= "MSP 2.0" (get (json/read-value (get (fwd/->record r) "tlv")) "name"))))
+        (testing "the feed's address is looked up once per guid, not per payment"
+          (bot/tx->boost! c (assoc fountain-link-tx "payment_hash" "hF2"))
+          (is (= ["565d0930-74bc-44ba-ab5d-da2f6c4b7b79"] @asked)))))))
+
+(deftest a-fountain-boost-on-a-listed-album-publishes-end-to-end
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        posted (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [fountain-link-tx])
+                  bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] {:url seaside-url})
+                  bot/read-feed-at (fn [_ _ _] {:recipients seaside-recipients
+                                                :publisher-guid "4d25f0dd-9270-4fb7-8aeb-ddd4a5213585"})
+                  bot/store-boost! (fn [_ p] (swap! posted conj p) {:id "01NEW" :url "https://tardbox.com/boost/01NEW"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (reset! @#'bot/link-feed-urls {})
+      (bot/poll-once! (ctx a :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}
+                           :boost-link-origins nil :feed-lookup? true :pi-key "k" :pi-secret "s"
+                           :publish-feed-guids #{"4d25f0dd-9270-4fb7-8aeb-ddd4a5213585"})
+                      ::session)
+      (is (= 1 (count @published)) "Longy is listed, so the note goes out")
+      (is (some #(= ["recipient" "MSP 2.0"] %) (:tags (first @published))))
+      (is (= seaside-url (get-in @a ["feeds" "565d0930-74bc-44ba-ab5d-da2f6c4b7b79"]))
+          "and the address the lookup found is memoized"))))
+
+(deftest a-recipient-the-feed-cannot-name-is-said-not-counted
+  (testing "a feed that gives the address another name is that recipient's"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc fountain-link-metadata
+                                                           "recipient_address" "longy@fountain.fm"))
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] {:url seaside-url})
+                  bot/read-feed-at (fn [_ _ _] {:recipients seaside-recipients})]
+      (is (= :other-recipient (:skip (bot/tx->boost! (msp-ctx) fountain-link-tx))))))
+  (testing "no feed to read: its own reason, narrated, carrying the address"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] nil)
+                  bot/read-feed-at (fn [_ _ _] nil)]
+      (let [r (bot/tx->boost! (msp-ctx) fountain-link-tx)]
+        (is (= :recipient-unnamed (:skip r)))
+        (is (= "chadf@getalby.com" (:recipient-address r)))
+        (is (= "hF" (:payment-hash r)))
+        (is (contains? bot/skip-reasons (:skip r)))
+        (is (#'bot/narrate-skip? r)))))
+  (testing "a name the payer sent is never looked up or overridden"
+    (let [read? (atom false)]
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc fountain-link-metadata "name" "Someone"))
+                    bot/read-feed-at (fn [_ _ _] (reset! read? true) {:recipients seaside-recipients})]
+        (is (= :other-recipient (:skip (bot/tx->boost! (msp-ctx) fountain-link-tx))))
+        (is (not @read?)))))
+  (testing "a bot with no recipient filter never reads the feed for a name"
+    (let [read? (atom false)]
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                    bot/read-feed-at (fn [_ _ _] (reset! read? true) nil)]
+        (let [r (bot/tx->boost! (ctx (atom {}) :boost-link-origins nil) fountain-link-tx)]
+          (is (some? (:boostagram r)))
+          (is (nil? (-> r :boostagram :recipient-name)))
+          (is (not @read?)))))))
 
 (deftest filter-env-vars-parse-to-case-folded-sets
   (let [folded #'bot/folded-set]

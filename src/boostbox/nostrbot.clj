@@ -307,6 +307,66 @@
       (u/log ::boost-link-fetch-failed :url (str url) :error (ex-message e))
       nil)))
 
+(declare read-feed-at)
+
+(def ^:private link-feed-urls-size
+  "Feed guids whose address with-feed-recipient has looked up. Cleared rather
+   than evicted when full, exactly as feed-cache is."
+  256)
+
+(defonce ^:private link-feed-urls (atom {}))
+
+(defn- link-feed-url
+  "The feed address for `b`, found the way publish-boost! finds one -- what it
+   carries, then the memo, then the Podcast Index -- and remembered per guid,
+   a miss included. On a shared wallet a Fountain listener's streams arrive
+   every few minutes, and most of them are never published, so the state
+   file's memo never learns their address; without this each one would cost a
+   Podcast Index request."
+  [ctx b]
+  (let [guid (some-> (:feed-guid b) str str/trim not-empty str/lower-case)]
+    (or (some-> (:url b) str str/trim not-empty)
+        (when guid
+          (let [c @link-feed-urls]
+            (if (contains? c guid)
+              (get c guid)
+              (let [url (some-> (resolve-feed ctx {"feeds" (:feeds ctx)} b)
+                                :boostagram :url str str/trim not-empty)]
+                (swap! link-feed-urls
+                       (fn [m] (assoc (if (>= (count m) link-feed-urls-size) {} m) guid url)))
+                url)))))))
+
+(defn- with-feed-recipient
+  "Name the recipient of a boost link that gives only an address, from the
+   splits the boosted item's own feed lists.
+
+   Fountain pays a lightning-address split by LNURL and puts a link to its own
+   copy of the metadata in the payment. That metadata carries
+   `recipient_address` and no name, so on a bot filtering by name every such
+   payment read as another recipient's and was counted and never mentioned --
+   the MSP 2.0 split of every Fountain boost on an MSP album, since that split
+   is a lightning address.
+
+   Only when there is a filter to satisfy, since a bot with none never reads
+   the name. The name is the podcaster's, from their RSS; the payer chose only
+   the address, and could have paid that address anyway. The feed's address
+   is set on the boostagram when found, so publish-boost! reads the same feed
+   and memoizes it. Answers `b` unchanged when no name can be had."
+  [ctx b]
+  (if (or (empty? (:recipient-names ctx))
+          (:recipient-name b)
+          (str/blank? (str (:recipient-address b))))
+    b
+    (let [url (link-feed-url ctx b)
+          name (some-> (read-feed-at ctx url (:item-guid b))
+                       :recipients
+                       (feed/recipient-name (:recipient-address b)))]
+      (if name
+        (do (u/log ::recipient-named-from-feed :feed-guid (:feed-guid b)
+                   :recipient-address (:recipient-address b) :recipient-name name)
+            (assoc b :recipient-name name :url url))
+        b))))
+
 (defn tx->boost!
   "A transaction turned into something publishable, from whichever source
    actually carries the metadata -- or a `{:skip <reason>}` map naming why it
@@ -336,8 +396,21 @@
       result
       (if-let [url (bg/boost-link (get tx "description") (:boost-link-origins ctx))]
         (let [linked (fetch-boost-metadata! url)
-              b (some-> linked bg/normalize)]
+              b (some->> linked bg/normalize (with-feed-recipient ctx))
+              ;; MSP reads the name as a keysend carries it, so a name the
+              ;; feed supplied goes with the payer's metadata, never over it
+              linked (if (and b (:recipient-name b)
+                              (not-any? #(contains? linked %) ["name" "recipient_name"]))
+                       (assoc linked "recipient_name" (:recipient-name b))
+                       linked)]
           (cond
+            ;; a filter to satisfy and no name to satisfy it with: said, not
+            ;; counted, or the next app that sends only an address goes
+            ;; missing exactly as Fountain's did
+            (and b (seq (:recipient-names ctx)) (nil? (:recipient-name b)))
+            (skip {:skip :recipient-unnamed :url url
+                   :recipient-address (:recipient-address b)})
+
             ;; same order as the TLV path: another recipient's split is that,
             ;; whatever its action
             (and b (not (bg/recipient-match? b (:recipient-names ctx))))
@@ -367,7 +440,7 @@
 (def skip-reasons
   "Every reason tx->boost! can give for publishing nothing: whatever the
    transaction's own metadata says, plus the one only a boost link can."
-  (conj nwc/skip-reasons :boost-link-unreadable))
+  (conj nwc/skip-reasons :boost-link-unreadable :recipient-unnamed))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Publishing ~~~~~~~~~~~~~~~~~~~
 
@@ -387,13 +460,13 @@
 (defn- cached-feed-read
   "Read one feed, remembering the answer -- including a nil one, so an
    unreadable feed is not re-fetched for every boost it sends."
-  [url read!]
+  [k read!]
   (let [c @feed-cache]
-    (if (contains? c url)
-      (get c url)
+    (if (contains? c k)
+      (get c k)
       (let [v (read!)]
         (swap! feed-cache
-               (fn [m] (assoc (if (>= (count m) feed-cache-size) {} m) url v)))
+               (fn [m] (assoc (if (>= (count m) feed-cache-size) {} m) k v)))
         v))))
 
 (defn read-feed-at
@@ -407,8 +480,10 @@
     (let [url (some-> url str str/trim not-empty)
           url (when (and url (<= (count url) 2048)) url)]
       (when (and url (sf/fetchable-url? url))
+        ;; keyed on the item too: its art and its splits are the item's own,
+        ;; and a feed cached for one episode would answer for every other
         (cached-feed-read
-         url
+         [url (some-> item-guid str str/trim)]
          (fn []
            (try
              (when-let [{:keys [body]} (sf/fetch-pinned!
@@ -846,7 +921,7 @@
         forwarding? (and (fwd/enabled? ctx) (not (:dry-run? ctx)))
         ;; a stream MSP wants must be read as a boostagram, not skipped as
         ;; :not-a-boost; what is *published* is still decided by :actions alone
-        read-ctx (cond-> ctx
+        read-ctx (cond-> (assoc ctx :feeds (get state "feeds"))
                    forwarding? (update :actions (fnil into #{"boost"}) (:forward-actions ctx)))
         txs (fetch-transactions! session cursor)
         results (mapv #(tx->boost! read-ctx %) txs)
@@ -871,7 +946,8 @@
              :payment-hash (:payment-hash r)
              :reason (:skip r)
              :action (:action r)
-             :url (:url r)))
+             :url (:url r)
+             :recipient-address (:recipient-address r)))
     (u/log ::poll :transactions (count txs) :boosts (count boosts)
            :forward-only forward-only :skipped skipped :cursor cursor)
     ;; A payment that is forwarded but never published (a stream, with the default
