@@ -1183,3 +1183,41 @@
       (reset! a (assoc @a "cursor" 1790595600))
       (bot/poll-once! c ::session)
       (is (= 1 (count @published)) "re-read again, it is already published"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Lookup caches ~~~~~~~~~~~~~~~~~~~
+
+(deftest a-remembered-miss-expires-and-a-hit-does-not
+  (let [memoized! #'bot/memoized!
+        cache (atom {})
+        calls (atom 0)
+        miss #(do (swap! calls inc) nil)
+        hit #(do (swap! calls inc) "https://x.example/feed.xml")
+        age! (fn [k] (swap! cache update-in [k :at] - @#'bot/miss-ttl-ms 1))]
+    (testing "a miss is believed for a while: one lookup per burst, not per payment"
+      (memoized! cache 8 :a miss)
+      (memoized! cache 8 :a miss)
+      (is (= 1 @calls)))
+    (testing "then asked again: a Podcast Index timeout must not hide a feed until restart"
+      (age! :a)
+      (memoized! cache 8 :a miss)
+      (is (= 2 @calls)))
+    (testing "a found value is kept however old"
+      (memoized! cache 8 :b hit)
+      (age! :b)
+      (is (= "https://x.example/feed.xml" (memoized! cache 8 :b hit)))
+      (is (= 3 @calls)))
+    (testing "cleared rather than evicted when full"
+      (memoized! cache 2 :c hit)
+      (is (= [:c] (keys @cache))))))
+
+(deftest a-rewind-is-applied-at-startup-once
+  (let [a (atom {"cursor" (quot (System/currentTimeMillis) 1000)})
+        to (- (quot (System/currentTimeMillis) 1000) 3600)
+        c (ctx a :rewind-to to)]
+    (#'bot/apply-rewind! c)
+    (is (= to (get @a "cursor")))
+    (swap! a assoc "cursor" (+ to 60))
+    (#'bot/apply-rewind! c)
+    (is (= (+ to 60) (get @a "cursor")) "the same value never rewinds twice")
+    (#'bot/apply-rewind! (ctx a))
+    (is (= (+ to 60) (get @a "cursor")) "unset is a no-op")))

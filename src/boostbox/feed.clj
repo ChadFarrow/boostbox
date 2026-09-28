@@ -265,16 +265,17 @@
                 inner))
             (find-blocks xml "item" max-items-scanned)))))
 
-(defn item-art
-  "The cover on the `<item>` whose guid matches, or nil."
-  [^String xml item-guid]
-  (some-> (item-markup xml item-guid) image-in))
+(defn- item-or-channel
+  "`f` of the item's markup when that answers, else of the channel's. The
+   rule for everything a boost reads per episode: an item's own cover or
+   value block replaces the show's rather than adding to it."
+  [f item channel]
+  (or (some-> item f) (f channel)))
 
 (defn feed-art
   "The best cover for this boost: the episode's own, else the show's."
   [^String xml item-guid]
-  (or (item-art xml item-guid)
-      (image-in (channel-slice xml))))
+  (item-or-channel image-in (item-markup xml item-guid) (channel-slice xml)))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Publisher ~~~~~~~~~~~~~~~~~~~
 
@@ -314,7 +315,7 @@
    `</podcast:value` would stop at the first `</podcast:valueTimeSplit` and
    lose every recipient listed after one."
   [^String slice]
-  (when-let [{:keys [after self-closing?]} (first (find-tags slice "podcast:value"))]
+  (when-let [{:keys [after self-closing?]} (first (find-tags slice "podcast:value" 1))]
     (let [inner (if self-closing?
                   ""
                   (subs slice after (or (str/index-of slice "</podcast:value>" after)
@@ -334,8 +335,7 @@
    one, the channel's otherwise -- Podcasting 2.0's rule, an item's block
    replacing the channel's rather than adding to it."
   [^String xml item-guid]
-  (or (some-> (item-markup xml item-guid) recipients-in)
-      (recipients-in (channel-slice xml))))
+  (item-or-channel recipients-in (item-markup xml item-guid) (channel-slice xml)))
 
 (defn recipient-name
   "The name `recipients` give `address`, or nil.
@@ -369,9 +369,9 @@
             ;; once between them rather than once each
             item (item-markup clean item-guid)
             channel (channel-slice clean)
-            art (or (some-> item image-in) (image-in channel))
+            art (item-or-channel image-in item channel)
             publisher (publisher-guid clean)
-            recipients (or (some-> item recipients-in) (recipients-in channel))]
+            recipients (item-or-channel recipients-in item channel)]
         (when (or (seq npubs) art publisher recipients)
           {:npubs npubs :art art :publisher-guid publisher :recipients recipients})))
     (catch Exception _ nil)))
