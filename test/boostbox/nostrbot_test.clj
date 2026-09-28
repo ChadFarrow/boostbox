@@ -546,6 +546,29 @@
       (is (= seaside-url (get-in @a ["feeds" "565d0930-74bc-44ba-ab5d-da2f6c4b7b79"]))
           "and the address the lookup found is memoized"))))
 
+(deftest an-address-with-spaces-is-still-read
+  (testing "the Podcast Index hands back headstarts.uk addresses with their spaces in"
+    (let [fetched (atom [])
+          xml (str "<rss><channel><podcast:value>"
+                   "<podcast:valueRecipient name=\"longy\" address=\"longy@fountain.fm\" split=\"78\"/>"
+                   "<podcast:valueRecipient name=\"MSP 2.0\" address=\"chadf@getalby.com\" split=\"1\"/>"
+                   "</podcast:value></channel></rss>")]
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                    boostbox.podcastindex/feed-by-guid
+                    (fn [_ _] {:url "https://headstarts.uk/msp/longy/songs from the seaside/Songs_From_The_Seaside.xml"})
+                    boostbox.safefetch/fetchable-url? (fn [u] (try (java.net.URI. u) true (catch Exception _ false)))
+                    boostbox.safefetch/fetch-pinned! (fn [u _] (swap! fetched conj u)
+                                                       {:status 200 :body (.getBytes xml "UTF-8")})]
+        (reset! @#'bot/feed-cache {})
+        (let [r (bot/tx->boost! (msp-ctx) fountain-link-tx)]
+          (is (= "MSP 2.0" (-> r :boostagram :recipient-name)))
+          (is (= [seaside-url] @fetched) "fetched at its escaped address"))
+        (testing "and remembered, escaped"
+          (is (= seaside-url
+                 (get-in (#'bot/remember-feed {} {:feed-guid "565d0930-74bc-44ba-ab5d-da2f6c4b7b79"
+                                                  :url "https://headstarts.uk/msp/longy/songs from the seaside/Songs_From_The_Seaside.xml"})
+                         ["feeds" "565d0930-74bc-44ba-ab5d-da2f6c4b7b79"]))))))))
+
 (deftest a-recipient-the-feed-cannot-name-is-said-not-counted
   (testing "a feed that gives the address another name is that recipient's"
     (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc fountain-link-metadata

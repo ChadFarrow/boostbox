@@ -203,7 +203,10 @@
    optimization, and rebuilding it costs one boost per feed."
   [state b]
   (let [guid (some-> (:feed-guid b) str str/trim not-empty str/lower-case)
-        url (some-> (:url b) str str/trim not-empty)]
+        ;; escaped as read-feed-at escapes it, or an address with a space in
+        ;; it -- the Podcast Index returns MSP's headstarts.uk ones that way --
+        ;; is never remembered
+        url (some-> (:url b) str str/trim not-empty sf/escape-url)]
     (if (and guid url (sf/fetchable-url? url))
       (let [feeds (get state "feeds" {})]
         (assoc state "feeds"
@@ -480,7 +483,7 @@
     ;; `:url` is one of the few fields normalize passes through without
     ;; bounding, because nothing used to read it. Longer than this is not a
     ;; feed address, and it is also the cache key below.
-    (let [url (some-> url str str/trim not-empty)
+    (let [url (some-> url str str/trim not-empty sf/escape-url)
           url (when (and url (<= (count url) 2048)) url)]
       (when (and url (sf/fetchable-url? url))
         ;; keyed on the item too: its art and its splits are the item's own,
