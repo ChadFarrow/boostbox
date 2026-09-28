@@ -119,6 +119,9 @@
       :publish-feed-guids (feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))
      ;; how far back to reach on the very first run; 0 means "start from now"
       :backfill-sec (Long/parseLong (bb/get-env "BBN_BACKFILL_SEC" "0"))
+     ;; a one-shot move of an existing cursor back to this unix time; see
+     ;; rewind-cursor
+      :rewind-to (some-> (bb/get-env "BBN_REWIND_TO" nil) str/trim not-empty Long/parseLong)
       :dry-run? (truthy? (bb/get-env "BBN_DRY_RUN" "false"))
       :state-key (bb/get-env "BBN_STATE_KEY" "nostrbot/state.json")
       :publish-profile? (truthy? (bb/get-env "BBN_PUBLISH_PROFILE" "false"))
@@ -988,6 +991,43 @@
         (forward-poll! ctx state @dropped)
         state))))
 
+;; ~~~~~~~~~~~~~~~~~~~ Rewind ~~~~~~~~~~~~~~~~~~~
+
+(def max-rewind-sec
+  "How far back BBN_REWIND_TO may reach. The de-duplication set holds the last
+   `max-recent` payments the bot acted on; a rewind past them would re-read a
+   boost already announced as one never seen, and announce it twice."
+  (* 7 24 3600))
+
+(defn rewind-cursor
+  "The state with its cursor moved back to `to`, once, so the next poll re-reads
+   payments the bot passed over -- a real boost it skipped because of a defect
+   since fixed. Returns {:state :rewound?}, or throws on a `to` it refuses.
+
+   This is not a backfill. It needs the state file intact: the de-duplication
+   set is what keeps a re-read boost that was already announced from being
+   announced again, and the forwarded set does the same for MSP. With no cursor
+   there is nothing to rewind and the state is left alone. Applied once per
+   value: `rewound_to` records it, so a restart with the variable still set
+   does not pull the cursor back over boosts published since. Never forward."
+  [state to now]
+  (let [cursor (get state "cursor")]
+    (cond
+      (nil? to) {:state state :rewound? false}
+
+      (> to now)
+      (throw (ex-info "BBN_REWIND_TO is in the future" {:rewind-to to :now now}))
+
+      (< to (- now max-rewind-sec))
+      (throw (ex-info (str "BBN_REWIND_TO reaches back more than " (quot max-rewind-sec 86400)
+                           " days; past that the de-duplication set may not cover the window")
+                      {:rewind-to to :now now}))
+
+      (or (nil? cursor) (= to (get state "rewound_to")) (<= cursor to))
+      {:state state :rewound? false}
+
+      :else {:state (assoc state "cursor" to "rewound_to" to) :rewound? true})))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Main ~~~~~~~~~~~~~~~~~~~
 
 (defn -main [& _]
@@ -1027,6 +1067,15 @@
                                  (u/log ::bot-shutting-down)
                                  (Thread/sleep 250)
                                  (logger))))
+    (when-let [to (:rewind-to cfg)]
+      (let [before (load-state (:state-io ctx))
+            {:keys [state rewound?]} (rewind-cursor before to (quot (System/currentTimeMillis) 1000))]
+        (if rewound?
+          (do (save-state! (:state-io ctx) state)
+              (u/log ::cursor-rewound :from (get before "cursor") :to to
+                     :note "Remove BBN_REWIND_TO once the next poll has run."))
+          (u/log ::cursor-not-rewound :cursor (get before "cursor") :rewind-to to
+                 :already-applied (= to (get before "rewound_to"))))))
     (when (:publish-profile? cfg)
       (publish-profile! ctx)
       ;; the relay list goes with the profile: a name without one leaves

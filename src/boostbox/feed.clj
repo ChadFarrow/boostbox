@@ -85,23 +85,25 @@
 
    One forward pass: each step starts from the end of the previous hit, so the
    work is linear in the document rather than in the number of candidate
-   matches."
-  [^String xml ^String name]
-  (let [needle (str "<" name)
-        n (count needle)]
-    (loop [from 0, out []]
-      (if-let [open (str/index-of xml needle from)]
-        (let [next-ch (when (< (+ open n) (.length xml)) (.charAt xml (+ open n)))]
-          (if-not (contains? #{\space \tab \newline \return \/ \>} next-ch)
-            ;; <podcast:person> must not match <podcast:personality>
-            (recur (+ open n) out)
-            (if-let [end (tag-end xml open)]
-              (let [raw (subs xml (+ open n) (dec end))
-                    self? (str/ends-with? (str/trimr raw) "/")
-                    attrs (if self? (str/trimr (subs raw 0 (dec (count (str/trimr raw))))) raw)]
-                (recur end (conj out {:attrs attrs :self-closing? self? :after end})))
-              out)))
-        out))))
+   matches. With `limit`, it stops at that many: a caller that only ever looks
+   at the first N must not pay for walking 200k."
+  ([^String xml ^String name] (find-tags xml name Long/MAX_VALUE))
+  ([^String xml ^String name limit]
+   (let [needle (str "<" name)
+         n (count needle)]
+     (loop [from 0, out []]
+       (if-let [open (when (< (count out) limit) (str/index-of xml needle from))]
+         (let [next-ch (when (< (+ open n) (.length xml)) (.charAt xml (+ open n)))]
+           (if-not (contains? #{\space \tab \newline \return \/ \>} next-ch)
+             ;; <podcast:person> must not match <podcast:personality>
+             (recur (+ open n) out)
+             (if-let [end (tag-end xml open)]
+               (let [raw (subs xml (+ open n) (dec end))
+                     self? (str/ends-with? (str/trimr raw) "/")
+                     attrs (if self? (str/trimr (subs raw 0 (dec (count (str/trimr raw))))) raw)]
+                 (recur end (conj out {:attrs attrs :self-closing? self? :after end})))
+               out)))
+         out)))))
 
 (defn- close-positions
   "Where every `</name` sits, in one forward pass."
@@ -133,16 +135,17 @@
    for from each open tag. Scanning per open tag is the quadratic shape this
    namespace exists to avoid, and it does not announce itself: 200k unclosed
    `<podcast:txt>` opens measured 72 s that way and 30 ms this way, on a
-   document a feed can serve by accident."
-  [^String xml ^String name]
-  (let [closes (close-positions xml name)]
-    (for [{:keys [after self-closing?] :as hit} (find-tags xml name)]
-      (assoc hit :inner
-             (if self-closing?
-               ""
-               (if-let [i (first-at-or-after closes after)]
-                 (subs xml after i)
-                 ""))))))
+   document a feed can serve by accident. `limit` is find-tags'."
+  ([^String xml ^String name] (find-blocks xml name Long/MAX_VALUE))
+  ([^String xml ^String name limit]
+   (let [closes (close-positions xml name)]
+     (for [{:keys [after self-closing?] :as hit} (find-tags xml name limit)]
+       (assoc hit :inner
+              (if self-closing?
+                ""
+                (if-let [i (first-at-or-after closes after)]
+                  (subs xml after i)
+                  "")))))))
 
 (def ^:private entities
   {"amp" "&" "lt" "<" "gt" ">" "quot" "\"" "apos" "'" "#39" "'" "#34" "\""})
@@ -200,13 +203,11 @@
    order is data: the show's own npub should survive a feed that lists a dozen
    guests."
   [^String xml]
-  (let [txt (for [{:keys [attrs inner]} (take max-npub-tags-scanned
-                                              (find-blocks xml "podcast:txt"))
+  (let [txt (for [{:keys [attrs inner]} (find-blocks xml "podcast:txt" max-npub-tags-scanned)
                   :let [purpose (some-> (read-attr attrs "purpose") str/lower-case)]
                   :when (contains? nostr-txt-purposes purpose)]
               (decode-npub (decode-xml-text inner)))
-        person (for [{:keys [attrs]} (take max-npub-tags-scanned
-                                           (find-tags xml "podcast:person"))]
+        person (for [{:keys [attrs]} (find-tags xml "podcast:person" max-npub-tags-scanned)]
                  (decode-npub (read-attr attrs "npub")))]
     (->> (concat txt person)
          (remove nil?)
@@ -262,7 +263,7 @@
               (when (some #(= needle (str/trim (decode-xml-text (:inner %))))
                           (find-blocks inner "guid"))
                 inner))
-            (take max-items-scanned (find-blocks xml "item"))))))
+            (find-blocks xml "item" max-items-scanned)))))
 
 (defn item-art
   "The cover on the `<item>` whose guid matches, or nil."
@@ -321,10 +322,9 @@
           own (reduce (fn [s {split :inner}]
                         (if (str/blank? split) s (str/replace s split "")))
                       inner
-                      (take max-value-recipients (find-blocks inner "podcast:valueTimeSplit")))]
+                      (find-blocks inner "podcast:valueTimeSplit" max-value-recipients))]
       (not-empty
-       (vec (for [{:keys [attrs]} (take max-value-recipients
-                                        (find-tags own "podcast:valueRecipient"))
+       (vec (for [{:keys [attrs]} (find-tags own "podcast:valueRecipient" max-value-recipients)
                   :let [address (read-attr attrs "address")]
                   :when address]
               {:name (read-attr attrs "name") :address address}))))))
@@ -365,9 +365,13 @@
     (when-not (str/blank? xml)
       (let [clean (strip-comments xml)
             npubs (feed-npubs clean)
-            art (feed-art clean item-guid)
+            ;; feed-art and value-recipients, with the item and channel found
+            ;; once between them rather than once each
+            item (item-markup clean item-guid)
+            channel (channel-slice clean)
+            art (or (some-> item image-in) (image-in channel))
             publisher (publisher-guid clean)
-            recipients (value-recipients clean item-guid)]
+            recipients (or (some-> item recipients-in) (recipients-in channel))]
         (when (or (seq npubs) art publisher recipients)
           {:npubs npubs :art art :publisher-guid publisher :recipients recipients})))
     (catch Exception _ nil)))

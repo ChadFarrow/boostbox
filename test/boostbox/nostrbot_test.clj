@@ -1109,3 +1109,54 @@
       (is (= fwd/max-pending (count (get @a "forward-pending"))))
       (is (= ["s1" "s2"] (take-last 2 (hashes (get @a "forward-pending"))))
           "queued oldest first, whatever order the wallet answered in"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Rewind ~~~~~~~~~~~~~~~~~~~
+
+(deftest a-rewind-moves-the-cursor-back-once
+  (let [now 1790600000
+        to (- now 3600)
+        state {"cursor" (- now 60) "recent" [{"payment_hash" "p" "event_id" "e"}]}
+        {s :state rewound? :rewound?} (bot/rewind-cursor state to now)]
+    (is rewound?)
+    (is (= to (get s "cursor")))
+    (is (= (get state "recent") (get s "recent"))
+        "the de-duplication set is what keeps a re-read boost from being announced twice")
+    (testing "a restart with the variable still set does not pull the cursor back again"
+      (let [later (assoc s "cursor" (- now 10))]
+        (is (= {:state later :rewound? false} (bot/rewind-cursor later to now)))))
+    (testing "never forward"
+      (is (not (:rewound? (bot/rewind-cursor {"cursor" (- to 10)} to now)))))
+    (testing "no cursor is a first run, not something to rewind"
+      (is (= {:state {} :rewound? false} (bot/rewind-cursor {} to now))))
+    (testing "unset is a no-op"
+      (is (= {:state state :rewound? false} (bot/rewind-cursor state nil now))))))
+
+(deftest a-rewind-the-dedupe-set-may-not-cover-is-refused
+  (let [now 1790600000]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (bot/rewind-cursor {"cursor" now} (- now bot/max-rewind-sec 1) now)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (bot/rewind-cursor {"cursor" now} (+ now 60) now)))))
+
+(deftest a-rewind-re-reads-a-skipped-boost-and-publishes-it-once
+  (let [a (atom {"cursor" 1790599000 "recent" []})
+        published (atom [])
+        c (ctx a :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}
+               :boost-link-origins nil :feed-lookup? true :pi-key "k" :pi-secret "s")]
+    (with-redefs [nwc/list-transactions! (fn [_ {:keys [from]}]
+                                           (if (<= from 1790595877) [fountain-link-tx] []))
+                  bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] {:url seaside-url})
+                  bot/read-feed-at (fn [_ _ _] {:recipients seaside-recipients})
+                  bot/store-boost! (fn [_ _] {:id "01NEW" :url "https://tardbox.com/boost/01NEW"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (reset! @#'bot/link-feed-urls {})
+      (bot/poll-once! c ::session)
+      (is (empty? @published) "past the cursor, the boost is not re-read")
+      (reset! a (:state (bot/rewind-cursor @a 1790595600 1790600000)))
+      (bot/poll-once! c ::session)
+      (is (= 1 (count @published)))
+      (bot/poll-once! c ::session)
+      (reset! a (assoc @a "cursor" 1790595600))
+      (bot/poll-once! c ::session)
+      (is (= 1 (count @published)) "re-read again, it is already published"))))
