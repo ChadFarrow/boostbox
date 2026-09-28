@@ -48,7 +48,14 @@
                    {:nwc (nwc/parse-uri (bb/get-env "BBN_NWC_URI"))
                     :recipient-names (into #{} (comp (map str/trim) (remove str/blank?) (map str/lower-case))
                                            (str/split (bb/get-env "BBN_RECIPIENT_NAMES" "") #","))
-                    :boost-link-origins nil})]
+                    :boost-link-origins nil
+                    ;; a boost link that names its recipient only by address
+                    ;; (Fountain's) is named from the item's feed -- see
+                    ;; nostrbot/with-feed-recipient; the Podcast Index finds a
+                    ;; feed the link gives no address for, when keys are set
+                    :feed-lookup? true
+                    :pi-key (bb/get-env "BBN_PI_KEY" nil)
+                    :pi-secret (bb/get-env "BBN_PI_SECRET" nil)})]
     (when-not (fwd/enabled? cfg)
       (binding [*out* *err*]
         (println "BBN_FORWARD_URL, BBN_FORWARD_TOKEN and BBN_RECIPIENT_NAMES are all required"))
