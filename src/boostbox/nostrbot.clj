@@ -185,6 +185,32 @@
 (defn- save-state! [{:keys [write]} state]
   (write state))
 
+(defn- feed-guid-key
+  "A feed guid as every map in here keys it: trimmed and lower-cased, nil if
+   blank."
+  [guid]
+  (some-> guid str str/trim not-empty str/lower-case))
+
+(def ^:private miss-ttl-ms
+  "How long a lookup that found nothing is believed. A found value is kept
+   until its cache fills; a miss only this long, because the reason for one
+   is often passing -- a Podcast Index timeout, a feed host briefly down --
+   and a Fountain boost whose feed reads as missing is skipped, not retried."
+  (* 10 60 1000))
+
+(defn- memoized!
+  "The value `compute!` gives for `k`, remembered in `cache` (an atom), a miss
+   included for `miss-ttl-ms`. Cleared rather than evicted when `size` is
+   reached: these are burst absorbers, and a clear costs one lookup each."
+  [cache size k compute!]
+  (let [now (System/currentTimeMillis)
+        {:keys [v at] :as hit} (get @cache k)]
+    (if (and hit (or (some? v) (< (- now at) miss-ttl-ms)))
+      v
+      (let [v (compute!)]
+        (swap! cache (fn [m] (assoc (if (>= (count m) size) {} m) k {:v v :at now})))
+        v))))
+
 (def max-feeds
   "How many feed addresses the memo below keeps. The whole state file is
    rewritten on every boost, so this is a bound on write size, not on memory."
@@ -202,7 +228,7 @@
    Cleared rather than evicted when full, exactly as feed-cache is: this is an
    optimization, and rebuilding it costs one boost per feed."
   [state b]
-  (let [guid (some-> (:feed-guid b) str str/trim not-empty str/lower-case)
+  (let [guid (feed-guid-key (:feed-guid b))
         ;; escaped as read-feed-at escapes it, or an address with a space in
         ;; it -- the Podcast Index returns MSP's headstarts.uk ones that way --
         ;; is never remembered
@@ -217,7 +243,7 @@
   "Fill in a feed address this boost did not carry from what an earlier one
    taught us. A boost that brought its own address is left alone."
   [state b]
-  (let [guid (some-> (:feed-guid b) str str/trim not-empty str/lower-case)]
+  (let [guid (feed-guid-key (:feed-guid b))]
     (if (or (some-> (:url b) str str/trim not-empty) (nil? guid))
       b
       (if-let [url (get (get state "feeds" {}) guid)]
@@ -316,31 +342,24 @@
 (declare read-feed-at)
 
 (def ^:private link-feed-urls-size
-  "Feed guids whose address with-feed-recipient has looked up. Cleared rather
-   than evicted when full, exactly as feed-cache is."
+  "Feed guids whose address with-feed-recipient has looked up."
   256)
 
 (defonce ^:private link-feed-urls (atom {}))
 
 (defn- link-feed-url
   "The feed address for `b`, found the way publish-boost! finds one -- what it
-   carries, then the memo, then the Podcast Index -- and remembered per guid,
-   a miss included. On a shared wallet a Fountain listener's streams arrive
-   every few minutes, and most of them are never published, so the state
-   file's memo never learns their address; without this each one would cost a
-   Podcast Index request."
+   carries, then the memo, then the Podcast Index -- and remembered per guid.
+   On a shared wallet a Fountain listener's streams arrive every few minutes,
+   and most of them are never published, so the state file's memo never
+   learns their address; without this each one would cost a Podcast Index
+   request."
   [ctx b]
-  (let [guid (some-> (:feed-guid b) str str/trim not-empty str/lower-case)]
-    (or (some-> (:url b) str str/trim not-empty)
-        (when guid
-          (let [c @link-feed-urls]
-            (if (contains? c guid)
-              (get c guid)
-              (let [url (some-> (resolve-feed ctx {"feeds" (:feeds ctx)} b)
-                                :boostagram :url str str/trim not-empty)]
-                (swap! link-feed-urls
-                       (fn [m] (assoc (if (>= (count m) link-feed-urls-size) {} m) guid url)))
-                url)))))))
+  (or (some-> (:url b) str str/trim not-empty)
+      (when-let [guid (feed-guid-key (:feed-guid b))]
+        (memoized! link-feed-urls link-feed-urls-size guid
+                   #(some-> (resolve-feed ctx {"feeds" (:feeds ctx)} b)
+                            :boostagram :url str str/trim not-empty)))))
 
 (defn- with-feed-recipient
   "Name the recipient of a boost link that gives only an address, from the
@@ -464,16 +483,10 @@
 (defonce ^:private feed-cache (atom {}))
 
 (defn- cached-feed-read
-  "Read one feed, remembering the answer -- including a nil one, so an
+  "Read one feed, remembering the answer -- a nil one too, for a while, so an
    unreadable feed is not re-fetched for every boost it sends."
   [k read!]
-  (let [c @feed-cache]
-    (if (contains? c k)
-      (get c k)
-      (let [v (read!)]
-        (swap! feed-cache
-               (fn [m] (assoc (if (>= (count m) feed-cache-size) {} m) k v)))
-        v))))
+  (memoized! feed-cache feed-cache-size k read!))
 
 (defn read-feed-at
   "boostbox.feed/read-feed of the document at `url`, fetched through safefetch
@@ -527,10 +540,10 @@
    no address for a remote feed, so it is found the way a guid-only boost's
    feed is: the memo, then the Podcast Index."
   [ctx state b]
-  (let [guid (some-> (:remote-feed-guid b) str str/trim str/lower-case)]
+  (let [guid (feed-guid-key (:remote-feed-guid b))]
     (if (or (not (:feed-lookup? ctx))
             (not (bg/valid-feed-guid? guid))
-            (= guid (some-> (:feed-guid b) str str/trim str/lower-case)))
+            (= guid (feed-guid-key (:feed-guid b))))
       {:state state :ctxt nil}
       (let [{state :state {url :url} :boostagram} (resolve-feed ctx state {:feed-guid guid})]
         {:state state :ctxt (read-feed-at ctx url (:remote-item-guid b))}))))
@@ -1031,6 +1044,22 @@
 
       :else {:state (assoc state "cursor" to "rewound_to" to) :rewound? true})))
 
+(defn- apply-rewind!
+  "BBN_REWIND_TO at startup: rewind-cursor against the saved state, saved and
+   logged. Throws on a value rewind-cursor refuses, which stops the bot rather
+   than run it on a cursor nobody asked for."
+  [{:keys [rewind-to state-io]}]
+  (when rewind-to
+    (let [before (load-state state-io)
+          {:keys [state rewound?]} (rewind-cursor before rewind-to
+                                                  (quot (System/currentTimeMillis) 1000))]
+      (if rewound?
+        (do (save-state! state-io state)
+            (u/log ::cursor-rewound :from (get before "cursor") :to rewind-to
+                   :note "Remove BBN_REWIND_TO once the next poll has run."))
+        (u/log ::cursor-not-rewound :cursor (get before "cursor") :rewind-to rewind-to
+               :already-applied (= rewind-to (get before "rewound_to")))))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Main ~~~~~~~~~~~~~~~~~~~
 
 (defn -main [& _]
@@ -1070,15 +1099,7 @@
                                  (u/log ::bot-shutting-down)
                                  (Thread/sleep 250)
                                  (logger))))
-    (when-let [to (:rewind-to cfg)]
-      (let [before (load-state (:state-io ctx))
-            {:keys [state rewound?]} (rewind-cursor before to (quot (System/currentTimeMillis) 1000))]
-        (if rewound?
-          (do (save-state! (:state-io ctx) state)
-              (u/log ::cursor-rewound :from (get before "cursor") :to to
-                     :note "Remove BBN_REWIND_TO once the next poll has run."))
-          (u/log ::cursor-not-rewound :cursor (get before "cursor") :rewind-to to
-                 :already-applied (= to (get before "rewound_to"))))))
+    (apply-rewind! ctx)
     (when (:publish-profile? cfg)
       (publish-profile! ctx)
       ;; the relay list goes with the profile: a name without one leaves
