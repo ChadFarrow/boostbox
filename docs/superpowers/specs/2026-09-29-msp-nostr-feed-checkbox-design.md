@@ -23,7 +23,7 @@ use, at the moment they choose to keep MSP in their splits, and the answer trave
 - Ticked, the editor writes one tag into the channel when it generates the feed:
 
   ```xml
-  <podcast:txt purpose="msp-nostr">yes</podcast:txt>
+  <podcast:txt purpose="msp-nostr">allow</podcast:txt>
   ```
 
 - The msp-bot already reads the boosted album's feed for every boost it considers (for the cover,
@@ -38,11 +38,11 @@ There is no page, no storage, no API and no new secret. The feed is the record o
 - **Per album.** The tag lives in one album's feed and covers that album only. An artist ticks it
   on each album they want posted. (An artist-wide switch would need MSP to write into the artist's
   publisher feed, which the bot reads only as a guid today.)
-- **The value is `yes`.** It means "post this album's boosts". Anything else, or no tag, means
+- **The value is `allow`.** It means "MSP 2.0 may post this album's boosts". Anything else, or no tag, means
   off: the bot never guesses consent from a value it does not recognise. Which payment types post
   stays the bot's `BBN_ACTIONS` (`boost,auto` on msp-bot), not something the feed spells out. Finer
   choices later (hide the amount, do not mention the artist) get their own tags, e.g.
-  `purpose="msp-nostr-amount"` with `no`, so `yes` never changes meaning.
+  `purpose="msp-nostr-amount"` with `hide`, so `allow` never changes meaning.
 - **Streams are never posted,** whatever the tag says: `BBN_ACTIONS` never includes `stream`.
 - **The manual list stays, as an override.** `BBN_PUBLISH_FEED_GUIDS` keeps working for feeds not
   made in the editor, or before an artist republishes. A boost posts if its album carries the tag
@@ -58,7 +58,7 @@ spec and must be checked there.
    a payment from the album anyway.
 2. **The state.** A field on the feed in `feedStore.tsx`, e.g. `mspNostrPosts: boolean`, default
    `false`, saved with the rest of the feed.
-3. **The tag.** `xmlGenerator.ts` writes `<podcast:txt purpose="msp-nostr">yes</podcast:txt>`
+3. **The tag.** `xmlGenerator.ts` writes `<podcast:txt purpose="msp-nostr">allow</podcast:txt>`
    in the channel when the field is true, and nothing when false. Channel only, never on an item.
 4. **Import.** Loading an existing feed that has the tag ticks the box, so re-editing a feed does
    not silently untick it.
@@ -69,7 +69,7 @@ spec and must be checked there.
 ## Part 2: the bot (boostbox)
 
 **Reading the tag.** `boostbox.feed/read-feed` returns one more key, `:msp-nostr?`, true when the
-first channel-level `<podcast:txt purpose="msp-nostr">` holds `yes`, compared trimmed and
+first channel-level `<podcast:txt purpose="msp-nostr">` holds `allow`, compared trimmed and
 case-insensitively. Read from the channel slice only, so an item cannot opt in an album; the
 purpose is matched case-insensitively like the existing `nostr`/`npub` purposes. The purpose name
 is a constant, not configuration.
@@ -79,7 +79,7 @@ is a constant, not configuration.
 - the host feed, for a boost made on the album itself (`feed_guid` is the album);
 - the remote feed, for a boost made from a music show (`remote_feed_guid` is the album).
 
-A boost is consented when the album's feed carries the tag with `yes`. The action still has to be
+A boost is consented when the album's feed carries the tag with `allow`. The action still has to be
 in `BBN_ACTIONS`, as it does today, before the boost reaches this check. The show's own feed does
 not count for a remote item: a music show ticking the box must not opt in the artists it plays. So
 for a boost with a remote guid, only the remote feed's tag counts.
@@ -88,7 +88,7 @@ for a boost with a remote guid, only the remote feed's tag counts.
 reads, before the store):
 
 ```text
-post = (the album's feed says msp-nostr: yes)
+post = (the album's feed says msp-nostr: allow)
        OR (feed-listed? against BBN_PUBLISH_FEED_GUIDS)
 ```
 
@@ -141,8 +141,8 @@ artist's own tool. Neither can be forged by a payer, since both read only the fe
 channel; unticking and removing the split both remove it; importing a tagged feed ticks the box.
 
 **boostbox (Kaocha):**
-- `read-feed`: `yes` on the channel is read, in any case and with spaces around it; on an item
-  only it is not; `no`, blank, or any other value is off; purpose case.
+- `read-feed`: `allow` on the channel is read, in any case and with spaces around it; on an item
+  only it is not; blank, `yes`, or any other value is off; purpose case.
 - the decision: host-feed tag, remote-feed tag, a show's tag not counting for a remote item,
   unreadable feed, manual list still working, tag or list either enough.
 - `BBN_REQUIRE_CONSENT`: an empty list posts nothing untagged; unset, an empty list posts all
