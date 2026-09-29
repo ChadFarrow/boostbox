@@ -23,7 +23,7 @@ use, at the moment they choose to keep MSP in their splits, and the answer trave
 - Ticked, the editor writes one tag into the channel when it generates the feed:
 
   ```xml
-  <podcast:txt purpose="msp-nostr">boost auto</podcast:txt>
+  <podcast:txt purpose="msp-nostr">yes</podcast:txt>
   ```
 
 - The msp-bot already reads the boosted album's feed for every boost it considers (for the cover,
@@ -38,13 +38,12 @@ There is no page, no storage, no API and no new secret. The feed is the record o
 - **Per album.** The tag lives in one album's feed and covers that album only. An artist ticks it
   on each album they want posted. (An artist-wide switch would need MSP to write into the artist's
   publisher feed, which the bot reads only as a guid today.)
-- **What the value means.** Space-separated tokens, each opting into one thing:
-  - `boost`, `auto`: which payment types are posted. At least one, or the tag means nothing.
-    The editor writes both by default; the checkbox is one switch in v1.
-  - Room for later, not built in v1: `no-amount` (hide the sats), `no-mention` (no `p` tag for the
-    artist). Unknown tokens are ignored, so an older bot reading a newer feed posts less, never
-    more.
-- **Streams are never posted,** whatever the tag says. `stream` is not a token.
+- **The value is `yes`.** It means "post this album's boosts". Anything else, or no tag, means
+  off: the bot never guesses consent from a value it does not recognise. Which payment types post
+  stays the bot's `BBN_ACTIONS` (`boost,auto` on msp-bot), not something the feed spells out. Finer
+  choices later (hide the amount, do not mention the artist) get their own tags, e.g.
+  `purpose="msp-nostr-amount"` with `no`, so `yes` never changes meaning.
+- **Streams are never posted,** whatever the tag says: `BBN_ACTIONS` never includes `stream`.
 - **The manual list stays, as an override.** `BBN_PUBLISH_FEED_GUIDS` keeps working for feeds not
   made in the editor, or before an artist republishes. A boost posts if its album carries the tag
   **or** it is on the list. Longy's albums keep posting through the switch-over.
@@ -59,7 +58,7 @@ spec and must be checked there.
    a payment from the album anyway.
 2. **The state.** A field on the feed in `feedStore.tsx`, e.g. `mspNostrPosts: boolean`, default
    `false`, saved with the rest of the feed.
-3. **The tag.** `xmlGenerator.ts` writes `<podcast:txt purpose="msp-nostr">boost auto</podcast:txt>`
+3. **The tag.** `xmlGenerator.ts` writes `<podcast:txt purpose="msp-nostr">yes</podcast:txt>`
    in the channel when the field is true, and nothing when false. Channel only, never on an item.
 4. **Import.** Loading an existing feed that has the tag ticks the box, so re-editing a feed does
    not silently untick it.
@@ -69,34 +68,34 @@ spec and must be checked there.
 
 ## Part 2: the bot (boostbox)
 
-**Reading the tag.** `boostbox.feed/read-feed` returns one more key, `:msp-nostr`, the set of
-tokens from the first channel-level `<podcast:txt purpose="msp-nostr">`, or nil. Read from the
-channel slice only, so an item cannot opt in an album; the purpose is matched case-insensitively
-like the existing `nostr`/`npub` purposes; the value is capped (say 200 characters) and split on
-whitespace. The purpose name is a constant, not configuration.
+**Reading the tag.** `boostbox.feed/read-feed` returns one more key, `:msp-nostr?`, true when the
+first channel-level `<podcast:txt purpose="msp-nostr">` holds `yes`, compared trimmed and
+case-insensitively. Read from the channel slice only, so an item cannot opt in an album; the
+purpose is matched case-insensitively like the existing `nostr`/`npub` purposes. The purpose name
+is a constant, not configuration.
 
 **Which feed is the album's.** The same two feeds `publish-boost!` already reads:
 
 - the host feed, for a boost made on the album itself (`feed_guid` is the album);
 - the remote feed, for a boost made from a music show (`remote_feed_guid` is the album).
 
-A boost is consented when **either** feed carries the tag with a token matching the boost's action
-(`boost` for a boost, `auto` for an auto-boost). The show's own feed does not count for a remote
-item: a music show ticking the box must not opt in the artists it plays. So for a boost with a
-remote guid, only the remote feed's tag counts.
+A boost is consented when the album's feed carries the tag with `yes`. The action still has to be
+in `BBN_ACTIONS`, as it does today, before the boost reaches this check. The show's own feed does
+not count for a remote item: a music show ticking the box must not opt in the artists it plays. So
+for a boost with a remote guid, only the remote feed's tag counts.
 
 **Deciding a boost** (in `publish-boost!`, where `bg/feed-listed?` runs today: after the feed
 reads, before the store):
 
 ```text
-post = (tag in the album's feed allows this action)
+post = (the album's feed says msp-nostr: yes)
        OR (feed-listed? against BBN_PUBLISH_FEED_GUIDS)
 ```
 
 - A feed that cannot be read carries no tag, so the boost is not posted unless it is on the manual
   list. As today, the list check errs towards silence.
 - A boost not posted is still forwarded to the chart, as today, and `::boost-not-listed` still
-  logs once, now with `:consent-tag` (the tokens seen, or nil) beside the guids.
+  logs once, now with `:consent-tag` (the value seen, or nil) beside the guids.
 
 **The empty list must stop meaning "every album" on this bot.** Today `feed-listed?` treats an
 empty `BBN_PUBLISH_FEED_GUIDS` as "post everything", which is right for Boostr. Once the tag
@@ -119,7 +118,7 @@ on top; the editor copy should say "within an hour".
 | What MSP stores | Nothing new; the feed carries it | A blob per artist and three endpoints |
 | Proof it is the artist | Whoever edits the feed | The feed names the signed-in npub |
 | Feeds not made in the editor | Tag added by hand, or the manual list | Any feed with the split and the npub |
-| Hide amount / no mention | Later, as tokens | Built in |
+| Hide amount / no mention | Later, as tags of their own | Built in |
 | Revoking | Untick, republish; within the cache window | Switch off; within 5 minutes |
 | Work | A checkbox, a field, one tag; a small bot change | A page, NIP-98 auth, storage, an API, a bot client |
 
@@ -142,10 +141,10 @@ artist's own tool. Neither can be forged by a payer, since both read only the fe
 channel; unticking and removing the split both remove it; importing a tagged feed ticks the box.
 
 **boostbox (Kaocha):**
-- `read-feed`: the tag on the channel is read; on an item only it is not; purpose case; tokens
-  split and capped; unknown tokens ignored.
-- the decision: host-feed tag, remote-feed tag, a show's tag not counting for a remote item, action
-  not in the tokens, unreadable feed, manual list still working, tag or list either enough.
+- `read-feed`: `yes` on the channel is read, in any case and with spaces around it; on an item
+  only it is not; `no`, blank, or any other value is off; purpose case.
+- the decision: host-feed tag, remote-feed tag, a show's tag not counting for a remote item,
+  unreadable feed, manual list still working, tag or list either enough.
 - `BBN_REQUIRE_CONSENT`: an empty list posts nothing untagged; unset, an empty list posts all
   (Boostr unchanged).
 - the cache: a tag removed from a feed stops posts once the found value expires.
@@ -168,8 +167,6 @@ note; remove that album's guid from the manual list only after the tag is confir
 
 - **Per album or per artist?** This spec is per album. Per artist needs MSP to write the tag into
   the artist's publisher feed and the bot to read that feed too.
-- **Is the checkbox one switch or two?** v1 writes `boost auto` together. Separate boxes for boosts
-  and auto-boosts cost little in the editor.
 - **Does every MSP-built feed get republished often enough** for the tag to reach feeds hosted
   elsewhere (Longy's on headstarts.uk)? If an artist uploads the file by hand, they must upload it
   again after ticking.
