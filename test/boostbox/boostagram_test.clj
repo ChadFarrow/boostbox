@@ -115,6 +115,23 @@
         "or the artist, from the publisher feed the album names")
     (is (not (bg/feed-listed? show #{song-feed} [nil])))))
 
+(deftest generators-pick-out-the-feeds-built-with-msp
+  (let [msp "MSP 2.0 - Music Side Project Studio"
+        listed #{(str/lower-case msp)}]
+    (is (bg/generator-listed? nil ["Fountain"]) "no generators means every feed")
+    (is (bg/generator-listed? #{} []) "no generators means every feed, read or not")
+    (is (bg/generator-listed? listed [msp]))
+    (is (bg/generator-listed? listed [(str "  " (str/upper-case msp) " ")])
+        "trimmed and case-folded, as the recipient name is")
+    (is (bg/generator-listed? listed ["Podhome (https://www.podhome.fm)" msp])
+        "either feed: a music show's boost is MSP's when the song's album is")
+    (is (not (bg/generator-listed? listed ["MSP 2.0"])) "the whole name, not a prefix")
+    (is (not (bg/generator-listed? listed [(str msp " (fork)")])))
+    (is (not (bg/generator-listed? listed ["Sovereign Feeds" "Fountain"]))
+        "a show that only supports MSP with a split")
+    (is (not (bg/generator-listed? listed [])) "a feed that could not be read was built by nothing")
+    (is (not (bg/generator-listed? listed [nil])))))
+
 (deftest boost-payload-mapping
   (let [b (bg/normalize fountain-tlv)
         p (bg/->boost-payload b {:received-msat 21000 :settled-at 1757275200})]

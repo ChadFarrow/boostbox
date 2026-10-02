@@ -7,6 +7,7 @@
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
             [boostbox.relay :as relay]
+            [boostbox.safefetch :as sf]
             [com.brunobonacci.mulog.core :as mulog-core]
             [jsonista.core :as json]))
 
@@ -605,7 +606,10 @@
   (let [folded #'bot/folded-set]
     (is (= #{"msp 2.0"} (folded "MSP 2.0")))
     (is (= #{"boost" "auto"} (folded " Boost , AUTO ")))
-    (is (= #{} (folded "")))))
+    (is (= #{} (folded "")))
+    (is (= #{"msp 2.0 - music side project studio"}
+           (bot/generator-set " MSP 2.0 - Music Side Project Studio "))
+        "a generator keeps its spaces and hyphen; only a comma separates two")))
 
 (deftest a-typo-in-the-album-list-stops-the-bot
   (let [guids #'bot/feed-guid-set]
@@ -1069,6 +1073,87 @@
       (bot/poll-once! (fwd-ctx a :publish-feed-guids #{artist}) ::session)
       (is (empty? @published) "nothing says whose album it is, so it is nobody's")
       (is (= ["h1"] (hashes @sent)) "and the chart still counts it"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Only feeds built with MSP ~~~~~~~~~~~~~~~~~~~
+
+(def ^:private msp-generator "MSP 2.0 - Music Side Project Studio")
+(def ^:private msp-generators #{"msp 2.0 - music side project studio"})
+
+(defn- generator-poll!
+  "One poll of one boost on a forwarding bot that publishes only feeds built
+   with MSP. Answers what was published and what was forwarded."
+  [b & {:keys [feed-context read-feed-at state overrides]}]
+  (let [a (atom (merge {"cursor" 50 "recent" []} state))
+        published (atom [])
+        sent (atom [])
+        t1 (tx (:payment-hash b) 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 b}
+                  bot/feed-context (fn [_ _] feed-context)
+                  bot/read-feed-at (fn [_ url _] (get read-feed-at url))
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (apply fwd-ctx a (mapcat identity (merge {:publish-generators msp-generators}
+                                                               overrides)))
+                      ::session)
+      {:published @published :sent (hashes @sent) :cursor (get @a "cursor")})))
+
+(deftest a-feed-built-with-msp-is-announced
+  (let [{:keys [published sent]} (generator-poll! (boost "h1" 100)
+                                                  :feed-context {:generator msp-generator})]
+    (is (= 1 (count published)))
+    (is (= ["h1"] sent))))
+
+(deftest a-feed-not-built-with-msp-is-forwarded-and-never-announced
+  ;; A show that adds an MSP 2.0 split only to support MSP: the recipient
+  ;; filter lets it through, its own generator does not.
+  (let [{:keys [published sent cursor]}
+        (generator-poll! (boost "h1" 100)
+                         :feed-context {:generator "Podhome (https://www.podhome.fm)"})]
+    (is (empty? published))
+    (is (= ["h1"] sent) "the chart still counts it")
+    (is (= 100 cursor) "and it is never read again")))
+
+(deftest a-music-show-boost-is-announced-when-the-songs-album-was-built-with-msp
+  (let [b (assoc-in (boost "h1" 100) [:boostagram :remote-feed-guid] album-guid)
+        {:keys [published]}
+        (generator-poll! b
+                         :state {"feeds" {album-guid "https://x.example/album.xml"}}
+                         :feed-context {:generator "Sovereign Feeds"}
+                         :read-feed-at {"https://x.example/album.xml" {:generator msp-generator}}
+                         :overrides {:feed-lookup? true})]
+    (is (= 1 (count published)) "the show was not built with MSP, the song's album was")))
+
+(deftest a-feed-that-cannot-be-read-was-built-by-nothing
+  (let [{:keys [published sent]} (generator-poll! (boost "h1" 100) :feed-context nil)]
+    (is (empty? published) "nothing says MSP built it, so it is not announced")
+    (is (= ["h1"] sent))))
+
+(deftest the-album-list-and-the-generator-must-both-agree
+  (let [{:keys [published]}
+        (generator-poll! (boost "h1" 100)
+                         :feed-context {:generator msp-generator}
+                         :overrides {:publish-feed-guids #{"917393e3-1b1e-5cef-ace4-edaa54e1f810"}})]
+    (is (empty? published) "built with MSP, but not the album the list names")))
+
+(deftest an-unlisted-boost-says-which-generators-its-feeds-named
+  (let [h (str "gen-" (System/nanoTime))
+        logs (atom [])]
+    (with-redefs [mulog-core/log* (fn [_ event pairs]
+                                    (swap! logs conj (assoc (apply hash-map pairs) :event event)))]
+      (generator-poll! (boost h 100) :feed-context {:generator "Podhome (https://www.podhome.fm)"}))
+    (is (= [["Podhome (https://www.podhome.fm)"]]
+           (map :generators (filter #(= ::bot/boost-not-listed (:event %)) @logs))))))
+
+(deftest a-generator-list-needs-the-feed-read
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"BBN_FEED_LOOKUP"
+                        (bot/check-publish-generators! {:publish-generators msp-generators
+                                                        :feed-lookup? false}))
+      "with no feed read, nothing could ever match")
+  (is (nil? (bot/check-publish-generators! {:publish-generators msp-generators :feed-lookup? true})))
+  (is (nil? (bot/check-publish-generators! {:publish-generators #{} :feed-lookup? false}))
+      "the Boostr bot, which names no generator"))
 
 (deftest a-published-boost-is-saved-in-the-queue-before-it-is-sent
   (let [a (atom {"cursor" 50 "recent" []})

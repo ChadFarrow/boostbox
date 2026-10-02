@@ -1,8 +1,10 @@
 (ns boostbox.feed
   "The things a boost note needs out of an RSS feed and nothing else: the npubs
    the feed declares for its people, a cover image, the guid of the publisher
-   feed it names -- for music, the artist -- and the splits the boosted item
-   pays, which name a recipient a boost link gives only by address.
+   feed it names -- for music, the artist -- the splits the boosted item pays,
+   which name a recipient a boost link gives only by address, and the program
+   that wrote it, which tells an MSP-built album from a show that only
+   supports MSP.
 
    Modelled on boostmebitch's lib/feed-xml.ts so the two apps agree about what
    a feed says. Two rules carry over from there, and both are load-bearing:
@@ -355,11 +357,36 @@
     (when (= 1 (count (distinct (map str/lower-case names))))
       (first names))))
 
+;; ~~~~~~~~~~~~~~~~~~~ Generator ~~~~~~~~~~~~~~~~~~~
+
+(def max-generator-length
+  "Longer than this is not the name of a program that wrote a feed."
+  200)
+
+(defn generator
+  "The channel's `<generator>` -- the program that wrote the feed -- trimmed,
+   or nil. MSP 2.0 writes a fixed `MSP 2.0 - Music Side Project Studio` into
+   every feed it builds, which is how a boost on an MSP album is told apart
+   from one on a show that only carries an `MSP 2.0` support split.
+
+   `channel` is the channel's own markup (channel-slice): an item is not the
+   feed. Over the bound it is refused rather than cut down, so a long string
+   can never be trimmed into one that matches."
+  [^String channel]
+  (some-> (first (find-blocks channel "generator" 1))
+          :inner
+          decode-xml-text
+          (str/replace #"\p{Cntrl}" "")
+          str/trim
+          not-empty
+          (as-> g (when (<= (count g) max-generator-length) g))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Entry point ~~~~~~~~~~~~~~~~~~~
 
 (defn read-feed
-  "{:npubs :art :publisher-guid :recipients} for one feed document. Returns nil
-   for anything unusable, so a caller has one thing to test rather than several."
+  "{:npubs :art :publisher-guid :recipients :generator} for one feed document.
+   Returns nil for anything unusable, so a caller has one thing to test rather
+   than several."
   [^String xml item-guid]
   (try
     (when-not (str/blank? xml)
@@ -371,7 +398,9 @@
             channel (channel-slice clean)
             art (item-or-channel image-in item channel)
             publisher (publisher-guid clean)
-            recipients (item-or-channel recipients-in item channel)]
-        (when (or (seq npubs) art publisher recipients)
-          {:npubs npubs :art art :publisher-guid publisher :recipients recipients})))
+            recipients (item-or-channel recipients-in item channel)
+            built-by (generator channel)]
+        (when (or (seq npubs) art publisher recipients built-by)
+          {:npubs npubs :art art :publisher-guid publisher :recipients recipients
+           :generator built-by})))
     (catch Exception _ nil)))

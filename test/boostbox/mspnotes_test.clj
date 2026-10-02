@@ -79,7 +79,7 @@
         b (note {:guid album :id "01B"})
         c (note {:guid other-album :id "01C"})
         posted (ms/permalinks [(ms/resign msp-key "MSP 2.0" a)])]
-    (is (= [b] (ms/to-repost #{album} {} posted [a b c])))))
+    (is (= [b] (ms/to-repost {:guids #{album}} {} posted [a b c])))))
 
 (deftest deletion-requests-name-every-note-once
   (let [ids (mapv #(format "%064x" %) (range 120))
@@ -183,7 +183,7 @@
 (def artist "1a197bac-95ae-53bd-bf6d-40ba8b551088")
 
 (deftest an-artist-is-listed-through-the-feeds-a-note-names
-  (let [resolved {album artist}]
+  (let [resolved {album {:publisher-guid artist}}]
     (is (ms/listed? #{artist} resolved (note {:guid album})))
     (is (ms/listed? #{artist} resolved (note {:guid music-show :remote album}))
         "a music show's boost, through the song's album")
@@ -203,13 +203,57 @@
     (is (= (:tags e) (:tags (ms/resign msp-key "MSP 2.0" e [artist])))
         "named once, however often it is re-signed")))
 
-(deftest each-albums-artist-is-read-from-its-own-feed
-  (with-redefs [pi/feed-by-guid (fn [_ guid] (when (= guid album) {:url "https://x.example/album.xml"}))
-                bot/read-feed-at (fn [_ url _] (when (= url "https://x.example/album.xml") {:publisher-guid artist}))]
-    (is (= {album artist} (ms/resolve-publishers! {:pi-key "k" :pi-secret "s"} [album other-album]))
-        "an album the index does not know is simply absent")))
+(def msp-generator "MSP 2.0 - Music Side Project Studio")
+(def msp-generators #{"msp 2.0 - music side project studio"})
+
+(deftest each-feed-is-read-once-for-its-artist-and-generator
+  (let [reads (atom 0)]
+    (with-redefs [pi/feed-by-guid (fn [_ guid] (when (= guid album) {:url "https://x.example/album.xml"}))
+                  bot/read-feed-at (fn [_ url _]
+                                     (swap! reads inc)
+                                     (when (= url "https://x.example/album.xml")
+                                       {:publisher-guid artist :generator msp-generator}))]
+      (is (= {album {:publisher-guid artist :generator msp-generator}}
+             (ms/resolve-feeds! {:pi-key "k" :pi-secret "s"} [album other-album album]))
+          "an album the index does not know is simply absent")
+      (is (= 1 @reads) "one read per feed, however many notes name it"))))
 
 (deftest a-second-run-skips-by-artist-too
   (let [a (note {:guid album :id "01A"})
         b (note {:guid album :id "01B"})]
-    (is (= [b] (ms/to-repost #{artist} {album artist} (ms/permalinks [a]) [a b])))))
+    (is (= [b] (ms/to-repost {:guids #{artist}} {album {:publisher-guid artist}} (ms/permalinks [a]) [a b])))))
+
+(deftest only-notes-on-feeds-built-with-msp-are-re-posted
+  (let [resolved {album {:generator msp-generator}
+                  music-show {:generator "Sovereign Feeds"}
+                  other-album {:generator "Podhome (https://www.podhome.fm)"}}
+        filters {:generators msp-generators}]
+    (is (ms/selected? filters resolved (note {:guid album})))
+    (is (ms/selected? filters resolved (note {:guid music-show :remote album}))
+        "a music show's boost, through the song's album")
+    (is (not (ms/selected? filters resolved (note {:guid music-show})))
+        "a show that only supports MSP with a split")
+    (is (not (ms/selected? filters resolved (note {:guid other-album}))))
+    (is (not (ms/selected? filters {} (note {:guid album})))
+        "a feed that could not be read was built by nothing")
+    (is (not (ms/selected? filters resolved (note {}))) "a note naming no feed")))
+
+(deftest the-album-list-narrows-the-generator
+  (let [resolved {album {:generator msp-generator} other-album {:generator msp-generator}}
+        filters {:guids #{album} :generators msp-generators}]
+    (is (ms/selected? filters resolved (note {:guid album})))
+    (is (not (ms/selected? filters resolved (note {:guid other-album})))
+        "built with MSP, but not on the list")
+    (is (ms/selected? {:guids #{album}} resolved (note {:guid album})) "a list alone, as before")))
+
+(deftest with-neither-list-nothing-is-selected
+  (is (not (ms/selected? {} {album {:generator msp-generator}} (note {:guid album}))))
+  (is (not (ms/selected? {:guids #{} :generators #{}} {album {:generator msp-generator}} (note {:guid album})))))
+
+(deftest a-repost-without-a-list-or-without-the-index-is-refused
+  ;; Both refuse before the file is read, so neither can post anything.
+  (let [repost! #'ms/repost!
+        opts {:seckey msp-key :relays [] :file (io/file "/nonexistent/boostr-msp-notes.json")}]
+    (is (= 2 (repost! (assoc opts :guids #{} :generators #{}))) "name albums, artists or generators")
+    (is (= 2 (repost! (assoc opts :guids #{} :generators msp-generators)))
+        "the old notes carry no feed address, so a generator is found only through the index")))
