@@ -26,8 +26,11 @@
             [boostbox.relay :as relay]))
 
 (def default-relays
-  "The same three the homepage's client-side npub resolver already uses."
-  "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net")
+  "The same three the homepage's client-side npub resolver already uses, plus
+   Chad's own relay, so his bots never depend on public relays alone. It takes
+   writes only from allow-listed pubkeys: a bot whose key is not listed there
+   is refused by it, silently, since one acceptance counts as published."
+  "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net,wss://chadf.nostr1.com")
 
 (def max-recent
   "How many payment hashes to remember for de-duplication."

@@ -602,6 +602,13 @@
           (is (nil? (-> r :boostagram :recipient-name)))
           (is (not @read?)))))))
 
+(deftest the-built-in-relays-include-chads-catch-all
+  ;; Chad keeps a copy of everything his bots publish on his own relay. It
+  ;; takes writes only from allow-listed pubkeys, so a new bot key must be
+  ;; added there too.
+  (is (= ["wss://relay.damus.io" "wss://nos.lol" "wss://relay.primal.net" "wss://chadf.nostr1.com"]
+         (#'bot/csv bot/default-relays))))
+
 (deftest filter-env-vars-parse-to-case-folded-sets
   (let [folded #'bot/folded-set]
     (is (= #{"msp 2.0"} (folded "MSP 2.0")))
