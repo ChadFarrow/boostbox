@@ -272,7 +272,7 @@ volume to the bot's service, point `BB_FS_ROOT_PATH` at it and set
 | `BBN_NOSTR_SECKEY`      |   Yes    | N/A                                                        | The bot's Nostr signing key, as 64-char hex or `nsec1...`.                                        |
 | `BBN_BOOSTBOX_API_KEY`  |   Yes    | N/A                                                        | API key for `POST /boost`; must be one of the server's `BB_ALLOWED_KEYS`.                         |
 | `BBN_BOOSTBOX_URL`      |    No    | `https://tardbox.com`                                      | BoostBox instance to store boosts in.                                                             |
-| `BBN_RELAYS`            |    No    | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net` | Comma-separated relays to publish to. One acceptance counts as success.                           |
+| `BBN_RELAYS`            |    No    | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net,wss://chadf.nostr1.com` | Comma-separated relays to publish to. One acceptance counts as success. The last default is the operator's own relay, which accepts only allow-listed pubkeys. |
 | `BBN_POLL_INTERVAL_SEC` |    No    | `60`                                                       | How often to poll the wallet. Notifications short-circuit the wait; polling guarantees delivery.  |
 | `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
 | `BBN_ACTIONS` | No | `boost` | Comma-separated blip-10 actions to publish. `boost,auto` adds v4vmusic's automatic per-song boosts. Streams are never worth a note. |
