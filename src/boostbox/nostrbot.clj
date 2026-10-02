@@ -58,6 +58,13 @@
                       {:invalid (vec bad)})))
     guids))
 
+(defn generator-set
+  "BBN_PUBLISH_GENERATORS as a set of trimmed, lower-cased names. Only a comma
+   separates two, so `MSP 2.0 - Music Side Project Studio` stays one entry.
+   Public so the re-post tool reads the variable exactly as the bot does."
+  [s]
+  (folded-set s))
+
 (defn config
   "BBN_-prefixed so nothing here can collide with the web app's BB_ vars.
    Storage config is shared with the web app and read via bb/config."
@@ -117,6 +124,10 @@
      ;; feed's guid), are published; empty means every album. Publishing
      ;; only: an unlisted boost is still forwarded. See bg/feed-listed?.
       :publish-feed-guids (feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))
+     ;; Only boosts whose feed or remote feed was written by one of these
+     ;; `<generator>`s are published; empty means any. ANDed with the list
+     ;; above, and publishing only, like it. See bg/generator-listed?.
+      :publish-generators (generator-set (bb/get-env "BBN_PUBLISH_GENERATORS" ""))
      ;; how far back to reach on the very first run; 0 means "start from now"
       :backfill-sec (Long/parseLong (bb/get-env "BBN_BACKFILL_SEC" "0"))
      ;; a one-shot move of an existing cursor back to this unix time; see
@@ -161,6 +172,17 @@
                          "was down is dropped. Set BB_STORAGE=S3, or set "
                          "BBN_ALLOW_EPHEMERAL_STATE=1 if this really is a persistent volume.")
                     {:storage "FS" :root-path (:root-path bb-cfg)}))))
+
+(defn check-publish-generators!
+  "A generator is read out of the feed, so with BBN_FEED_LOOKUP off no boost
+   could ever match BBN_PUBLISH_GENERATORS, and the bot would forward every
+   payment while publishing nothing, with no line saying why."
+  [{:keys [publish-generators feed-lookup?]}]
+  (when (and (seq publish-generators) (not feed-lookup?))
+    (throw (ex-info (str "BBN_PUBLISH_GENERATORS is read from each boost's feed, and "
+                         "BBN_FEED_LOOKUP is off, so nothing would ever be published. "
+                         "Turn BBN_FEED_LOOKUP on, or clear BBN_PUBLISH_GENERATORS.")
+                    {:publish-generators (vec (sort publish-generators))}))))
 
 (defn- state-io [{:keys [bb-cfg state-key]}]
   (case (:storage bb-cfg)
@@ -526,7 +548,10 @@
 
    Any failure at all answers nil. A feed being slow, moved or malformed must
    not stop a boost being announced -- the note simply goes out with no picture
-   and no p tags, which is what every note looked like before this existed."
+   and no p tags, which is what every note looked like before this existed.
+   The one exception is a bot that publishes by the feed itself
+   (BBN_PUBLISH_GENERATORS, or an artist on BBN_PUBLISH_FEED_GUIDS): there a
+   feed that cannot be read names nobody, and the boost is not announced."
   [ctx boostagram]
   (read-feed-at ctx (:url boostagram) (:item-guid boostagram)))
 
@@ -667,22 +692,26 @@
           (remember state {"payment_hash" payment-hash "skipped" "below-threshold"}))
 
       :else
-      (let [;; the artist is named in the album's own feed, not in the boost,
-            ;; so the list can only be checked once the feeds are read -- and
-            ;; must be checked before the store, because tardbox's homepage is
-            ;; public too
+      (let [;; the artist and the program that built the album are named in
+            ;; the album's own feed, not in the boost, so the lists can only be
+            ;; checked once the feeds are read -- and must be checked before
+            ;; the store, because tardbox's homepage is public too
             host (feed-context ctx boostagram)
             {state :state remote :ctxt} (remote-feed-context ctx state boostagram)
-            publishers (vec (distinct (keep :publisher-guid [host remote])))]
-        (if-not (bg/feed-listed? boostagram (:publish-feed-guids ctx) publishers)
-          ;; not remembered: add the artist and a re-read of this payment
-          ;; publishes it. Logged once, with what would have to be listed.
+            publishers (vec (distinct (keep :publisher-guid [host remote])))
+            generators (vec (distinct (keep :generator [host remote])))]
+        (if-not (and (bg/feed-listed? boostagram (:publish-feed-guids ctx) publishers)
+                     (bg/generator-listed? (:publish-generators ctx) generators))
+          ;; not remembered: list the artist, or fix the feed, and a re-read
+          ;; of this payment publishes it. Logged once, with what each feed
+          ;; named.
           (do (when (first-sighting! payment-hash)
                 (u/log ::boost-not-listed :payment-hash payment-hash
                        :podcast (:podcast boostagram)
                        :feed-guid (:feed-guid boostagram)
                        :remote-feed-guid (:remote-feed-guid boostagram)
-                       :publisher-guids publishers))
+                       :publisher-guids publishers
+                       :generators generators))
               state)
           (let [stored (cond
                          ;; already stored on an earlier attempt
@@ -1065,6 +1094,7 @@
 (defn -main [& _]
   (let [cfg (config)
         _ (check-state-durability! cfg)
+        _ (check-publish-generators! cfg)
         logger (u/start-publisher! {:type :console
                                     :pretty? (= "DEV" (:env (:bb-cfg cfg)))})
         ctx (assoc cfg :state-io (state-io cfg))]
@@ -1075,6 +1105,12 @@
            :boostbox (:boostbox-url cfg)
            :wallet-relay (first (:relays (:nwc cfg)))
            :publish-feed-guids (count (:publish-feed-guids cfg))
+           ;; the values, not a count: a value pasted with its quotes
+           ;; matches nothing, and only the text shows it
+           :publish-generators (vec (sort (:publish-generators cfg)))
+           ;; a music show's album carries no address, so without the index
+           ;; only the memo can find it -- and with it its generator
+           :podcast-index (pi/configured? cfg)
            :dry-run (:dry-run? cfg))
     ;; check-state-durability! let this through, so someone asserted the
     ;; filesystem is a mounted volume. Say so once at startup: if it is not,

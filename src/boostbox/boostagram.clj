@@ -192,6 +192,23 @@
        (boolean (some #(contains? guids (some-> % str str/trim str/lower-case))
                       (concat [(:feed-guid b) (:remote-feed-guid b)] publisher-guids))))))
 
+(defn generator-listed?
+  "Whether one of `generators` wrote one of the boost's feeds, or `generators`
+   is empty. `feed-generators` are the `<generator>`s the caller read from the
+   boost's feed and its remote feed, so a music show's boost counts when the
+   song's album was built with MSP.
+
+   It exists because the recipient name cannot tell an artist's MSP split from
+   a show that adds an `MSP 2.0` split only to support MSP: the album's own
+   generator can. Whole-name equality, trimmed and case-folded like the
+   recipient name, never a prefix. A feed that could not be read names no
+   generator, so the rule errs towards silence. `generators` is expected
+   already lower-cased."
+  [generators feed-generators]
+  (or (empty? generators)
+      (boolean (some #(contains? generators (some-> % str str/trim str/lower-case))
+                     feed-generators))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
 ;;
 ;; A keysend can carry the boostagram in TLV 7629169, but an LNURL payment has

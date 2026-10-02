@@ -2,11 +2,12 @@
   "One-off: move the MSP 2.0 notes Boostr_Bot published to MSP 2.0's own npub.
 
    Until 2026-09 the msp-bot signed with Boostr_Bot's key and announced every
-   MSP boost. It now signs as MSP 2.0 and announces only the albums whose
-   artists agreed (BBN_PUBLISH_FEED_GUIDS). This carries the history across:
+   MSP boost. It now signs as MSP 2.0 and announces only the albums built with
+   MSP (BBN_PUBLISH_GENERATORS), or listed (BBN_PUBLISH_FEED_GUIDS). This
+   carries the history across:
 
      export   read Boostr_Bot's MSP notes from the relays into one file
-     repost   re-sign the listed albums' notes as MSP 2.0 and publish them,
+     repost   re-sign the selected notes as MSP 2.0 and publish them,
               slowly, skipping any the MSP npub already has
      delete   ask the relays to delete every exported note (NIP-09)
 
@@ -99,10 +100,15 @@
                    (str/lower-case (subs v (count "podcast:guid:")))))))
 
 (defn publishers-of
-  "The artists the note's feeds name, from `resolved` (feed guid -> the
-   publisher guid its feed names; see resolve-publishers!)."
+  "The artists the note's feeds name, from `resolved` (feed guid -> what its
+   feed says; see resolve-feeds!)."
   [resolved e]
-  (vec (distinct (keep resolved (feed-guids e)))))
+  (vec (distinct (keep #(get-in resolved [% :publisher-guid]) (feed-guids e)))))
+
+(defn generators-of
+  "The `<generator>`s of the note's feeds, from `resolved`."
+  [resolved e]
+  (vec (distinct (keep #(get-in resolved [% :generator]) (feed-guids e)))))
 
 (defn listed?
   "Whether the note names one of `guids` as its feed or remote feed, or as the
@@ -113,18 +119,29 @@
   ([guids resolved e]
    (boolean (some guids (concat (feed-guids e) (publishers-of resolved e))))))
 
-(defn resolve-publishers!
-  "Feed guid -> the artist that feed names in its `<podcast:publisher>`, for
-   every guid the Podcast Index can find a feed for and the feed answers. The
-   old notes carry no feed address, and the index is how the bot itself finds
-   one from a guid. A guid missing from the answer names no artist."
+(defn selected?
+  "Whether the note is re-posted: the rule the bot applies to a new boost --
+   `guids` (bg/feed-listed?) AND `generators` (bg/generator-listed?), each
+   passing when empty -- except that with both empty nothing is: here that can
+   only be an operator who forgot to set them."
+  [{:keys [guids generators]} resolved e]
+  (boolean (and (or (seq guids) (seq generators))
+                (or (empty? guids) (listed? guids resolved e))
+                (bg/generator-listed? generators (generators-of resolved e)))))
+
+(defn resolve-feeds!
+  "Feed guid -> {:publisher-guid :generator}: the artist that feed names in its
+   `<podcast:publisher>` and the program that wrote it, for every guid the
+   Podcast Index can find a feed for and the feed answers. The old notes carry
+   no feed address, and the index is how the bot itself finds one from a guid.
+   A guid missing from the answer names no artist and no generator."
   [ctx guids]
   (let [ctx (assoc ctx :feed-lookup? true)]
     (into {} (for [g (distinct guids)
                    :let [url (:url (pi/feed-by-guid ctx g))
-                         publisher (when url (:publisher-guid (bot/read-feed-at ctx url nil)))]
-                   :when publisher]
-               [g publisher]))))
+                         feed (when url (bot/read-feed-at ctx url nil))]
+                   :when feed]
+               [g (select-keys feed [:publisher-guid :generator])]))))
 
 (def ^:private banner-re #"https?://\S+/og/boost\.png(?:\?\S*)?")
 
@@ -187,8 +204,8 @@
   [events]
   (into #{} (keep #(tag % "r")) events))
 
-(defn to-repost [guids resolved posted notes]
-  (filterv #(and (listed? guids resolved %) (not (contains? posted (tag % "r")))) notes))
+(defn to-repost [filters resolved posted notes]
+  (filterv #(and (selected? filters resolved %) (not (contains? posted (tag % "r")))) notes))
 
 (defn deletion-events
   "NIP-09 requests for `ids`, fifty notes to a request so no one event nears a
@@ -296,28 +313,40 @@
       (do (println "Some relays did not answer in full. Run export again; it only adds.") 1)
       0)))
 
-(defn- repost! [{:keys [relays file seckey client-name guids apply? interval-ms] :as opts}]
+(defn- repost! [{:keys [relays file seckey client-name guids generators apply? interval-ms] :as opts}]
   (let [author (nostr/bytes->hex (nostr/decode-key boostr-npub "npub"))
-        me (pubkey-of seckey)]
+        me (pubkey-of seckey)
+        filters {:guids guids :generators generators}]
     (cond
       (not (repost-key? seckey author))
       (do (println "that is Boostr_Bot's own key -- paste MSP 2.0's nsec") 2)
 
-      (empty? guids)
-      (do (println "BBN_PUBLISH_FEED_GUIDS is empty -- name the albums to re-post") 2)
+      (and (empty? guids) (empty? generators))
+      (do (println "BBN_PUBLISH_FEED_GUIDS and BBN_PUBLISH_GENERATORS are both empty"
+                   "-- name the albums, artists or generators to re-post") 2)
+
+      (and (seq generators) (not (pi/configured? opts)))
+      (do (println "BBN_PUBLISH_GENERATORS needs the Podcast Index key and secret: the notes"
+                   "carry no feed address, so a feed's generator is found only through the index") 2)
 
       :else
       (let [notes (read-notes file)
             all-feeds (distinct (mapcat feed-guids notes))
             resolved (if (pi/configured? opts)
-                       (resolve-publishers! opts all-feeds)
+                       (resolve-feeds! opts all-feeds)
                        (do (println "No Podcast Index key: artists cannot be matched, only album guids.")
                            {}))
-            _ (println (count all-feeds) "feeds in the notes;" (count resolved) "name an artist")
+            _ (println (count all-feeds) "feeds in the notes;" (count resolved) "read;"
+                       (count (filter (comp :publisher-guid val) resolved)) "name an artist"
+                       (if (seq generators)
+                         (str "; " (count (filter #(bg/generator-listed? generators [(:generator (val %))])
+                                                  resolved))
+                              " built by " (str/join ", " (sort generators)))
+                         ""))
             posted (permalinks (map wire->event
                                     (mapcat :events (fetch-from-all! relays {"kinds" [1] "authors" [me]}))))
-            todo (to-repost guids resolved posted notes)]
-        (println (count notes) "exported;" (count (filter #(listed? guids resolved %) notes)) "listed;"
+            todo (to-repost filters resolved posted notes)]
+        (println (count notes) "exported;" (count (filter #(selected? filters resolved %) notes)) "selected;"
                  (count todo) "not yet posted by" (nostr/->npub (nostr/hex->bytes me)))
         (doseq [e todo] (println " " (describe e)))
         (if-not apply?
@@ -353,8 +382,9 @@
   "java -cp boostbox.jar boostbox.mspnotes export|repost|delete [--apply] [--interval <sec>]
                                                               [--per-request <n>]
    Reads BBN_RELAYS, BBN_NOSTR_SECKEY (repost: MSP 2.0's; delete: Boostr_Bot's),
-   BBN_PUBLISH_FEED_GUIDS, BBN_CLIENT_NAME, and BBN_PI_KEY/BBN_PI_SECRET (repost,
-   to find each album's artist); MSP_NOTES_FILE moves the export."
+   BBN_PUBLISH_FEED_GUIDS, BBN_PUBLISH_GENERATORS, BBN_CLIENT_NAME, and
+   BBN_PI_KEY/BBN_PI_SECRET (repost, to find each album's artist and generator;
+   required with BBN_PUBLISH_GENERATORS); MSP_NOTES_FILE moves the export."
   [& [cmd & flags]]
   (let [opts {:relays (->> (str/split (bb/get-env "BBN_RELAYS" default-relays) #",")
                            (map str/trim) (remove str/blank?) vec)
@@ -376,7 +406,8 @@
                                           :client-name (bb/get-env "BBN_CLIENT_NAME" "MSP 2.0")
                                           :pi-key (bb/get-env "BBN_PI_KEY" nil)
                                           :pi-secret (bb/get-env "BBN_PI_SECRET" nil)
-                                          :guids (bot/feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))))
+                                          :guids (bot/feed-guid-set (bb/get-env "BBN_PUBLISH_FEED_GUIDS" ""))
+                                          :generators (bot/generator-set (bb/get-env "BBN_PUBLISH_GENERATORS" ""))))
                  "delete" (delete! (assoc opts :seckey (key!)))
                  (do (println "usage: boostbox.mspnotes export|repost|delete [--apply] [--interval <sec>] [--per-request <n>]")
                      2))]

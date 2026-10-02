@@ -141,6 +141,35 @@
                                              "feedGuid=\"matt-finlay\"/></podcast:publisher>"))
                                  nil)))))))
 
+(deftest the-generator-says-what-built-the-feed
+  ;; From a real MSP album: Longy's "Songs From The Seaside", on headstarts.uk.
+  (let [msp "MSP 2.0 - Music Side Project Studio"
+        channel (fn [inner] (str "<rss><channel><title>Songs From The Seaside</title>"
+                                 inner "<item><guid>s1</guid></item></channel></rss>"))]
+    (is (= msp (:generator (feed/read-feed (channel (str "<generator>\n  " msp "  \n</generator>")) nil)))
+        "trimmed, and enough on its own for a result")
+    (testing "entities and CDATA are decoded"
+      (is (= "Podhome (https://www.podhome.fm)"
+             (:generator (feed/read-feed (channel "<generator><![CDATA[Podhome (https://www.podhome.fm)]]></generator>") nil))))
+      (is (= "Sovereign Feeds & Co"
+             (:generator (feed/read-feed (channel "<generator>Sovereign Feeds &amp; Co</generator>") nil)))))
+    (testing "only the channel's own, live and readable"
+      (is (nil? (:generator (feed/read-feed (str "<rss><channel><title>x</title><item><guid>s1</guid>"
+                                                 "<generator>" msp "</generator></item></channel></rss>")
+                                            nil)))
+          "an item's generator is not the feed's")
+      (is (nil? (:generator (feed/read-feed (channel (str "<!-- <generator>" msp "</generator> -->")) nil))))
+      (is (nil? (:generator (feed/read-feed (channel "<generator>   </generator>") nil))))
+      (is (nil? (:generator (feed/read-feed (channel "<generator/>") nil)))))
+    (testing "too long is refused, never cut down to something that matches"
+      (is (nil? (:generator (feed/read-feed (channel (str "<generator>" msp (apply str (repeat 300 "x"))
+                                                          "</generator>"))
+                                            nil)))))
+    (testing "control characters are stripped"
+      (is (= msp (:generator (feed/read-feed (channel (str "<generator>MSP 2.0 -\u0007 Music Side Project Studio"
+                                                           "</generator>"))
+                                             nil)))))))
+
 (deftest a-feed-that-says-nothing-answers-nil
   (is (nil? (feed/read-feed "<rss></rss>" nil)))
   (is (nil? (feed/read-feed "" nil)))
@@ -160,7 +189,9 @@
             (str "<rss><channel>" (apply str (repeat 200000 "<item>")) "</channel></rss>")]
            ["200k unclosed time splits in a value block"
             (str "<rss><channel><podcast:value>"
-                 (apply str (repeat 200000 "<podcast:valueTimeSplit>")) "</channel></rss>")]]]
+                 (apply str (repeat 200000 "<podcast:valueTimeSplit>")) "</channel></rss>")]
+           ["200k unclosed <generator> opens"
+            (str "<rss><channel>" (apply str (repeat 200000 "<generator>")) "</channel></rss>")]]]
     (let [t0 (System/currentTimeMillis)
           _ (feed/read-feed doc "g1")
           ms (- (System/currentTimeMillis) t0)]
