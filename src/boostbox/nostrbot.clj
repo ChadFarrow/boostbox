@@ -23,7 +23,8 @@
             [boostbox.safefetch :as sf]
             [boostbox.podcastindex :as pi]
             [boostbox.feed :as feed]
-            [boostbox.relay :as relay]))
+            [boostbox.relay :as relay]
+            [boostbox.zaps :as zaps]))
 
 (def default-relays
   "The same three the homepage's client-side npub resolver already uses, plus
@@ -105,6 +106,10 @@
      ;; tags. Off is a supported way to run: the note still publishes, without
      ;; either.
       :feed-lookup? (truthy? (bb/get-env "BBN_FEED_LOOKUP" "true"))
+     ;; For an app that charges on top of the splits (Fountain), the note says
+     ;; what the listener spent, read from the app's own zap receipt. See
+     ;; boostbox.zaps.
+      :app-zap-lookup? (truthy? (bb/get-env "BBN_APP_ZAP_LOOKUP" "true"))
      ;; Optional. Without them the feed address memo is the only way a boost
      ;; that carries no address finds its feed, which needs another app to have
      ;; sent one for that show first.
@@ -664,6 +669,29 @@
 
 (declare first-sighting!)
 
+(defn with-spent-total
+  "`b` with value_msat_total raised to what the listener spent, when the app
+   that sent it publishes a zap receipt saying so (boostbox.zaps). For the
+   note only: the BoostBox record keeps what the payer wrote.
+
+   A receipt for less than the splits were paid cannot be this boost's, and
+   is ignored. Any failure leaves `b` as it was, so a relay being down only
+   costs the note the app's fee."
+  [ctx b {:keys [received-msat settled-at payment-hash]}]
+  (if-not (and (:app-zap-lookup? ctx) (zaps/app-for b))
+    b
+    (let [paid (bg/note-total-msat b received-msat)
+          spent (try (zaps/find-spent! b (bg/sender-npub b) settled-at)
+                     (catch Exception e
+                       (u/log ::zap-lookup-failed :payment-hash payment-hash
+                              :error (ex-message e))
+                       nil))]
+      (u/log ::zap-lookup :payment-hash payment-hash :app (:app-name b)
+             :value-msat-total paid :spent-msat (:msat spent) :receipt (:id spent))
+      (if (and spent paid (>= (long (:msat spent)) (long paid)))
+        (assoc b :value-msat-total (:msat spent))
+        b))))
+
 (defn publish-boost!
   "Store, then publish, then record. Returns the updated state.
 
@@ -736,13 +764,18 @@
                                        "boost_id" (:id stored)
                                        "url" (:url stored)})
                 _ (save-state! (:state-io ctx) state)
-                event (build-note ctx boostagram {:boost-url (:url stored)
-                                                  :received-msat received-msat
-                                                  :settled-at settled-at
-                                                  :fallback-art pi-artwork
-                                                  :feed-ctx host
-                                                  :remote-ctx remote
-                                                  :publisher-guids publishers})]
+                event (build-note ctx
+                                  (with-spent-total ctx boostagram
+                                    {:received-msat received-msat
+                                     :settled-at settled-at
+                                     :payment-hash payment-hash})
+                                  {:boost-url (:url stored)
+                                   :received-msat received-msat
+                                   :settled-at settled-at
+                                   :fallback-art pi-artwork
+                                   :feed-ctx host
+                                   :remote-ctx remote
+                                   :publisher-guids publishers})]
             (if dry-run?
               (do (u/log ::dry-run-note :boost-url (:url stored)
                          :event (nostr/event->json event))
