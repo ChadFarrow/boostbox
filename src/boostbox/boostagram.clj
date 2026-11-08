@@ -209,6 +209,29 @@
       (boolean (some #(contains? generators (some-> % str str/trim str/lower-case))
                      feed-generators))))
 
+(defn boost-key
+  "What the payments of one boost have in common and two boosts do not, as a
+   hex digest -- or nil when the boostagram does not say who sent it.
+
+   An app sends every split of a boost the same metadata, apart from what the
+   split is: its recipient name, its share (`value_msat`) and, from an app that
+   pays in more than one pass, its uuid (`group`). v4vmusic.com pays the bot a
+   split of its own on every boost, and on an episode whose feed also lists the
+   bot it pays it again, as the feed's split, under a second uuid -- so `group`
+   cannot say those two payments are one boost (2026-10-27, 2026-11-07).
+
+   No sender id, no key: anonymous boosts of one amount on one episode read
+   alike, and two listeners' boosts must never be taken for one."
+  [b]
+  (when-let [sender (some-> (:sender-id b) str/trim not-empty)]
+    (->> [(:app-name b) sender (:sender-name b) (:action b)
+          (:feed-guid b) (:item-guid b) (:remote-feed-guid b) (:remote-item-guid b)
+          (:position b) (:value-msat-total b) (:message b)]
+         pr-str
+         (#(.getBytes ^String % StandardCharsets/UTF_8))
+         nostr/sha256
+         nostr/bytes->hex)))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
 ;;
 ;; A keysend can carry the boostagram in TLV 7629169, but an LNURL payment has

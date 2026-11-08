@@ -1225,6 +1225,127 @@
       (is (= ["s1" "s2"] (take-last 2 (hashes (get @a "forward-pending"))))
           "queued oldest first, whatever order the wallet answered in"))))
 
+;; ~~~~~~~~~~~~~~~~~~~ One boost, two payments ~~~~~~~~~~~~~~~~~~~
+
+;; v4vmusic.com pays the bot a split of its own on every boost, and an episode
+;; whose feed also lists the bot is paid a second time, as the feed's split,
+;; with a uuid of its own: two payments, two notes (2026-10-27, 2026-11-07).
+(defn- v4vms-leg
+  [hash settled-at recipient msat uuid & {:as fields}]
+  {:payment-hash hash
+   :settled-at settled-at
+   :received-msat msat
+   :boostagram (bg/normalize (merge {"action" "boost"
+                                     "app_name" "v4vmusic-com"
+                                     "sender_name" "Sir TJ The Wrathful"
+                                     "sender_id" "v4vmusic-com-anon-osx6b042ff"
+                                     "message" "Great episode, thanks Matt and inpc😎"
+                                     "podcast" "V4V Music Spotlight (Phafe Presents)"
+                                     "guid" "31e6e997-df26-59d5-9301-1f5928809566"
+                                     "episode_guid" "06fa0fb3-880f-46b5-928e-096c21a2b5c0"
+                                     "ts" 5714
+                                     "value_msat_total" 777000
+                                     "name" recipient
+                                     "value_msat" msat
+                                     "uuid" uuid}
+                                    fields))})
+
+(def ^:private app-split-tx (tx "h-app" 1793111016))
+(def ^:private feed-split-tx (tx "h-feed" 1793111034))
+(def ^:private app-split
+  (v4vms-leg "h-app" 1793111016 "Boostr Bot - Boost to Nostr" 4000
+             "e6cc7c2b-12cc-4ce5-8fb5-fdf90672d2fc"))
+(def ^:private feed-split
+  (v4vms-leg "h-feed" 1793111034 "Boostr" 8000 "5569d650-8cec-4542-8719-2499b1498cdc"))
+
+(defn- two-payments-poll!
+  "Poll over `txs`, read as `boosts`, and answer what was stored and published."
+  [a c txs boosts & {:keys [polls] :or {polls 1}}]
+  (let [stored (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (wallet-after txs)
+                  nwc/transaction->boost boosts
+                  bot/store-boost! (fn [_ p]
+                                     (swap! stored conj p)
+                                     {:id (str "01ID" (count @stored))
+                                      :url (str "https://tardbox.com/boost/01ID" (count @stored))})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (dotimes [_ polls] (bot/poll-once! c ::session)))
+    {:stored @stored :published @published}))
+
+(deftest one-boost-paid-to-the-wallet-twice-is-announced-once
+  (testing "both payments in one poll"
+    (let [a (atom {"cursor" 1793111000 "recent" []})
+          {:keys [stored published]} (two-payments-poll!
+                                      a (ctx a) [app-split-tx feed-split-tx]
+                                      {app-split-tx app-split feed-split-tx feed-split})]
+      (is (= 1 (count published)) "one boost, one note")
+      (is (= 1 (count stored)) "and one record: a second would be a second card")
+      (is (= 1793111034 (get @a "cursor")) "the second payment is done with, not pending")
+      (is (= {"payment_hash" "h-feed" "skipped" "duplicate" "duplicate_of" "h-app"}
+             (get (#'bot/seen-index @a) "h-feed"))
+          "remembered, and says which payment was announced")))
+
+  (testing "the second payment arriving a poll later, as it did on 2026-11-07"
+    (let [a (atom {"cursor" 1793111000 "recent" []})
+          {:keys [published]} (two-payments-poll!
+                               a (ctx a) [app-split-tx]
+                               {app-split-tx app-split})
+          later (two-payments-poll! a (ctx a) [app-split-tx feed-split-tx]
+                                    {app-split-tx app-split feed-split-tx feed-split})]
+      (is (= 1 (count published)))
+      (is (empty? (:published later)) "the state file carries what the first note was")
+      (is (empty? (:stored later)))))
+
+  (testing "a dry run shows the same one note"
+    (let [a (atom {"cursor" 1793111000 "recent" []})
+          stored (:stored (two-payments-poll!
+                           a (ctx a :dry-run? true) [app-split-tx feed-split-tx]
+                           {app-split-tx app-split feed-split-tx feed-split}))]
+      (is (= 1 (count stored))))))
+
+(deftest a-second-boost-is-still-a-boost
+  (testing "the same boost again, after the window"
+    (let [late (+ 1793111016 bot/duplicate-window-sec 1)
+          t2 (tx "h-again" late)
+          again (v4vms-leg "h-again" late "Boostr" 8000 "0b0e-again")
+          a (atom {"cursor" 1793111000 "recent" []})]
+      (is (= 2 (count (:published (two-payments-poll!
+                                   a (ctx a) [app-split-tx t2]
+                                   {app-split-tx app-split t2 again})))))))
+
+  (testing "another listener saying the same thing"
+    (let [t2 (tx "h-other" 1793111034)
+          other (v4vms-leg "h-other" 1793111034 "Boostr" 8000 "0b0e-other"
+                           "sender_id" "v4vmusic-com-anon-someone-else")
+          a (atom {"cursor" 1793111000 "recent" []})]
+      (is (= 2 (count (:published (two-payments-poll!
+                                   a (ctx a) [app-split-tx t2]
+                                   {app-split-tx app-split t2 other})))))))
+
+  (testing "an app that names no sender: two boosts that read alike stay two"
+    (let [a (atom {"cursor" 50 "recent" []})
+          t1 (tx "h1" 100)
+          t2 (tx "h2" 118)]
+      (is (= 2 (count (:published (two-payments-poll!
+                                   a (ctx a) [t1 t2]
+                                   {t1 (boost "h1" 100) t2 (boost "h2" 118)}))))))))
+
+(deftest a-payment-announced-in-anothers-note-still-reaches-msp
+  (let [a (atom {"cursor" 1793111000 "recent" []})
+        sent (atom [])
+        msp (fn [leg] (update leg :boostagram assoc :recipient-name "MSP 2.0"))]
+    (with-redefs [nwc/list-transactions! (wallet-after [app-split-tx feed-split-tx])
+                  nwc/transaction->boost {app-split-tx (msp app-split)
+                                          feed-split-tx (msp feed-split)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["h-app" "h-feed"] (hashes @sent))
+          "the chart counts payments, and both were paid"))))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Rewind ~~~~~~~~~~~~~~~~~~~
 
 (deftest a-rewind-moves-the-cursor-back-once
