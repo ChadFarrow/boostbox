@@ -307,10 +307,12 @@
 
 (def duplicate-window-sec
   "How far apart two payments with one bg/boost-key may settle and still be one
-   boost. v4vmusic.com's two passes settled 18 s and 31 s apart; a listener
-   sending the very same boost again from the same place in the episode inside
-   this window gets one note for the two."
-  600)
+   boost. v4vmusic.com's two passes settled 18 s and 31 s apart, so two minutes
+   is four times the longest seen. A listener sending the very same boost again
+   from the same place in the episode inside this window gets one note for the
+   two; kept short so that an auto-boost replayed on the same track at the same
+   position (the MSP bot posts those) is almost never merged."
+  120)
 
 (defn- seen-index [state]
   (into {} (map (juxt #(get % "payment_hash") identity)) (get state "recent" [])))
