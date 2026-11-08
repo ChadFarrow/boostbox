@@ -646,6 +646,48 @@
   (testing "short text is untouched"
     (is (= "row of ducks" (:message (bg/normalize {"action" "boost" "message" "row of ducks"}))))))
 
+;; The two payments v4vmusic.com made to boostr@ for one boost on 2026-10-27
+;; (tardbox 01M5YVXJ0TE31VHMMN55BDFPGV and 01M5YVY42FE12VG1HDJM726JZB): its own
+;; split, then the feed's. They differ only in what each split is -- its name,
+;; its share, and a uuid v4vmusic minted for each pass.
+(def v4vms-leg
+  {"action" "boost"
+   "app_name" "v4vmusic-com"
+   "app_version" "0.17.15"
+   "sender_name" "Sir TJ The Wrathful"
+   "sender_id" "v4vmusic-com-anon-osx6b042ff"
+   "message" "Great episode, thanks Matt and inpc😎"
+   "podcast" "V4V Music Spotlight (Phafe Presents)"
+   "episode" "v4vms 007 inpc"
+   "guid" "31e6e997-df26-59d5-9301-1f5928809566"
+   "episode_guid" "06fa0fb3-880f-46b5-928e-096c21a2b5c0"
+   "ts" 5714
+   "value_msat_total" 777000})
+
+(deftest the-legs-of-one-boost-share-a-key
+  (let [app-split (bg/normalize (assoc v4vms-leg "name" "Boostr Bot - Boost to Nostr"
+                                       "value_msat" 4000
+                                       "uuid" "e6cc7c2b-12cc-4ce5-8fb5-fdf90672d2fc"))
+        feed-split (bg/normalize (assoc v4vms-leg "name" "Boostr"
+                                        "value_msat" 8000
+                                        "uuid" "5569d650-8cec-4542-8719-2499b1498cdc"))
+        k (bg/boost-key app-split)]
+    (is (string? k))
+    (is (= k (bg/boost-key feed-split))
+        "the recipient, the share and the uuid are the split's, not the boost's")
+    (testing "anything that makes it another boost makes it another key"
+      (doseq [[field v] {"message" "Another one"
+                         "value_msat_total" 1554000
+                         "ts" 5800
+                         "sender_id" "v4vmusic-com-anon-someone-else"
+                         "episode_guid" "c498fddf-ce54-4e1c-a967-4e84958108ad"
+                         "app_name" "Fountain"
+                         "action" "auto"}]
+        (is (not= k (bg/boost-key (bg/normalize (assoc v4vms-leg field v)))) field)))
+    (testing "no sender id, no key: two listeners' boosts must never be taken for one"
+      (is (nil? (bg/boost-key (bg/normalize (dissoc v4vms-leg "sender_id")))))
+      (is (nil? (bg/boost-key (bg/normalize (assoc v4vms-leg "sender_id" "  "))))))))
+
 (deftest boost-id-comes-off-the-end-of-the-url
   (is (= "01M1Z3KRQ0E27RZ2T0CT1B2NEE"
          (bg/boost-id-from-url "https://tardbox.com/boost/01M1Z3KRQ0E27RZ2T0CT1B2NEE")))

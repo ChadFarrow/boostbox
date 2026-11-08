@@ -336,6 +336,13 @@ re-read it:
 The last two are defects worth reporting. `scripts/nwc-inspect.sh` dumps what
 the wallet actually reports for recent payments, including each one's reason.
 
+One boost can pay the bot twice, through two splits: v4vmusic.com pays it a
+split of its own on every boost, and the episode's feed may list it as well.
+The second payment logs `boostbox.nostrbot/boost-paid-twice` with the payment
+already announced (`:duplicate-of`) and publishes nothing. Two payments are one
+boost when the app, the sender id, the episode, the position, the total and the
+message all agree, and they settled within ten minutes of each other.
+
 **No line at all for a boost you can see in the wallet** means either that it
 reached the bot carrying neither a TLV nor a boost link, so it counted as
 `:no-boostagram`, or that the poll never covered it, which is a cursor problem

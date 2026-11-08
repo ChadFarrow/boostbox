@@ -305,8 +305,29 @@
           {:state (remember-feed state b'') :boostagram b'' :artwork artwork})
         {:state state :boostagram b' :artwork nil}))))
 
+(def duplicate-window-sec
+  "How far apart two payments with one bg/boost-key may settle and still be one
+   boost. v4vmusic.com's two passes settled 18 s and 31 s apart; a listener
+   sending the very same boost again from the same place in the episode inside
+   this window gets one note for the two."
+  600)
+
 (defn- seen-index [state]
   (into {} (map (juxt #(get % "payment_hash") identity)) (get state "recent" [])))
+
+(defn- announced-as
+  "The remembered payment that already stands for the same boost as this one,
+   or nil. Only a payment that was stored carries a boost key, so a boost that
+   was skipped -- below the threshold, not listed -- never hides another."
+  [state payment-hash k settled-at]
+  (when (and k settled-at)
+    (some #(when (and (= k (get % "boost_key"))
+                      (not= payment-hash (get % "payment_hash"))
+                      (number? (get % "settled_at"))
+                      (<= (Math/abs (- (long settled-at) (long (get % "settled_at"))))
+                          duplicate-window-sec))
+             %)
+          (get state "recent" []))))
 
 (defn- remember [state entry]
   (let [h (get entry "payment_hash")
@@ -697,7 +718,11 @@
 
    Ordering matters for idempotency: the BoostBox id is written to state before
    the note is published, so a publish failure retries without minting a second
-   BoostBox record for the same payment."
+   BoostBox record for the same payment.
+
+   One boost can pay the wallet twice, through two splits: such a payment is
+   remembered as a `duplicate` of the one already stored (bg/boost-key) and
+   neither stored nor announced. It is still a payment, so it is forwarded."
   [{:keys [relays dry-run? min-sats] :as ctx} state
    {:keys [payment-hash boostagram received-msat settled-at boost-url boost-id]}]
   (let [;; one app's boost teaches the next one where this feed lives, and the
@@ -706,6 +731,12 @@
         {state :state boostagram :boostagram pi-artwork :artwork}
         (resolve-feed ctx state boostagram)
         seen (get (seen-index state) payment-hash)
+        k (bg/boost-key boostagram)
+        ;; what this payment's entry carries once stored, so the boost's next
+        ;; payment can find it
+        keyed (fn [entry] (cond-> entry
+                            (and k settled-at) (assoc "boost_key" k "settled_at" settled-at)))
+        announced (announced-as state payment-hash k settled-at)
         ;; value_msat_total is frequently absent -- Alby's parsed struct drops
         ;; it, and single-recipient splits never set it. Falling back to what
         ;; actually arrived is what ->boost-payload already does; without the
@@ -721,6 +752,15 @@
       (< sats min-sats)
       (do (u/log ::boost-below-threshold :payment-hash payment-hash :sats sats)
           (remember state {"payment_hash" payment-hash "skipped" "below-threshold"}))
+
+      announced
+      (do (when (first-sighting! payment-hash)
+            (u/log ::boost-paid-twice :payment-hash payment-hash
+                   :duplicate-of (get announced "payment_hash")
+                   :recipient-name (:recipient-name boostagram)
+                   :group (:group boostagram)))
+          (remember state {"payment_hash" payment-hash "skipped" "duplicate"
+                           "duplicate_of" (get announced "payment_hash")}))
 
       :else
       (let [;; the artist and the program that built the album are named in
@@ -760,9 +800,9 @@
                                             boostagram
                                             {:received-msat received-msat
                                              :settled-at settled-at})))
-                state (remember state {"payment_hash" payment-hash
-                                       "boost_id" (:id stored)
-                                       "url" (:url stored)})
+                state (remember state (keyed {"payment_hash" payment-hash
+                                              "boost_id" (:id stored)
+                                              "url" (:url stored)}))
                 _ (save-state! (:state-io ctx) state)
                 event (build-note ctx
                                   (with-spent-total ctx boostagram
@@ -792,10 +832,10 @@
                 ;; recover -- and an unpersisted event_id would make this boost look
                 ;; stored-but-unpublished, so the next poll would mint a second note
                 ;; for it on the relays.
-                (let [state (remember state {"payment_hash" payment-hash
-                                             "boost_id" (:id stored)
-                                             "url" (:url stored)
-                                             "event_id" (:id event)})]
+                (let [state (remember state (keyed {"payment_hash" payment-hash
+                                                    "boost_id" (:id stored)
+                                                    "url" (:url stored)
+                                                    "event_id" (:id event)}))]
                   (save-state! (:state-io ctx) state)
                   state)))))))))
 
