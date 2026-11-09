@@ -2,11 +2,14 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest testing is]]
             [boostbox.boostagram :as bg]
+            [boostbox.forward :as fwd]
             [boostbox.nostrbot :as bot]
             [boostbox.podcastindex]
             [boostbox.nostr :as nostr]
             [boostbox.nwc :as nwc]
             [boostbox.relay :as relay]
+            [boostbox.safefetch :as sf]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [jsonista.core :as json]))
 
 (def seckey (nostr/hex->bytes (apply str (repeat 64 "9"))))
@@ -184,6 +187,58 @@
 
 ;; ~~~~~~~~~~~~~~~~~~~ First-run safety ~~~~~~~~~~~~~~~~~~~
 
+;; A backfill publishes months of boosts in one sitting. Stamped "now", 289 of
+;; them landed in followers' feeds at once; stamped when they were paid, they
+;; slot into the bot's history in order.
+(deftest a-note-carries-the-time-the-boost-was-paid
+  (let [b (:boostagram (boost "h1" 0))
+        now (quot (System/currentTimeMillis) 1000)
+        note (fn [opts] (bot/build-note (ctx (atom {})) b (merge {:boost-url "u" :received-msat 21000} opts)))]
+    (testing "an old payment keeps its own time"
+      (let [e (note {:settled-at 1770336000})]
+        (is (= 1770336000 (:created-at e)))
+        (is (nostr/verify-event? e) "the id and signature cover the backdated time")))
+    (testing "no payment time means now"
+      (is (<= now (:created-at (note {})) (+ now 5))))
+    (testing "a wallet clock ahead of ours never dates a note in the future, which relays refuse"
+      (is (<= (:created-at (note {:settled-at (+ now 86400)})) (+ now 5))))))
+
+(deftest a-bot-with-its-own-name-signs-its-banner-with-it
+  (let [b (bg/normalize {"action" "boost" "podcast" "Some Album" "value_msat_total" 21000})
+        tags-of (fn [client-name]
+                  (let [e (bot/build-note (ctx (atom {}) :client-name client-name :feed-lookup? false)
+                                          b {:boost-url "u" :received-msat 21000})]
+                    {:content (:content e)
+                     :client (some #(when (= "client" (first %)) (second %)) (:tags e))}))]
+    (let [{:keys [content client]} (tags-of "MSP 2.0")]
+      (is (= "MSP 2.0" client))
+      (is (clojure.string/includes? content "&by=MSP+2.0") "the picture names the account the tag names"))
+    (is (not (clojure.string/includes? (:content (tags-of bg/default-client-name)) "by="))
+        "the default bot's banner URL is unchanged")))
+
+(deftest a-music-show-boost-shows-the-albums-cover-and-names-its-artist
+  ;; The show's feed describes the show. The song, its cover and its artist
+  ;; are in the album the remote item points at, which the bot reads anyway.
+  (let [person (fn [c] {:npub (str "npub-" c) :pubkey (apply str (repeat 64 c))})
+        b (bg/normalize {"action" "boost" "podcast" "Homegrown Hits" "value_msat_total" 21000})
+        note (fn [host remote]
+               (bot/build-note (ctx (atom {}) :feed-lookup? false) b
+                               {:boost-url "u" :received-msat 21000 :feed-ctx host :remote-ctx remote}))
+        p-tags (fn [e] (vec (for [[k v] (:tags e) :when (= "p" k)] v)))
+        host {:art "https://show.example/cover.png" :npubs [(person "a") (person "b")]}
+        album {:art "https://album.example/cover.png" :npubs [(person "c") (person "a")]}]
+    (let [e (note host album)]
+      (is (clojure.string/includes? (:content e) "art=https%3A%2F%2Falbum.example%2Fcover.png")
+          "the banner shows the album that was boosted, not the show")
+      (is (= [(apply str (repeat 64 "c")) (apply str (repeat 64 "a")) (apply str (repeat 64 "b"))]
+             (p-tags e))
+          "the artist first, then the show's people, each once"))
+    (let [tags (p-tags (note {:npubs (mapv person ["a" "b" "d" "e"])} album))]
+      (is (= 4 (count tags)) "still no more than one feed may name")
+      (is (= (apply str (repeat 64 "c")) (first tags)) "and the artist survives the cap"))
+    (is (clojure.string/includes? (:content (note host nil)) "art=https%3A%2F%2Fshow.example%2Fcover.png")
+        "with no album read, the show's cover as before")))
+
 (deftest first-run-sets-a-watermark-instead-of-replaying-history
   (let [a (atom {"cursor" nil "recent" []})
         asked (atom nil)
@@ -243,7 +298,7 @@
                       [{"settled_at" 300}]))
                   nwc/transaction->boost (constantly nil)]
       (bot/poll-once! (ctx a) ::session)
-      (is (= [0 50] @offsets)
+      (is (= [0 bot/transactions-page-size] @offsets)
           "a page that came back full may have older transactions behind it")
       (is (= 300 (get @a "cursor"))
           "a window of ordinary payments still advances the cursor, or it would
@@ -286,6 +341,10 @@
       (is (= "01LINKED" (:boost-id b)))
       (is (= "9fe51a32-e08d-5ab7-9540-22a25c6bc2bf" (-> b :boostagram :feed-guid))
           "so the note can still carry NIP-73 tags"))))
+
+(deftest a-linked-boost-carries-the-metadata-the-link-returned
+  (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+    (is (= linked-metadata (:link-metadata (bot/tx->boost! (ctx (atom {})) link-tx))))))
 
 (deftest a-linked-boost-is-never-stored-twice
   (let [a (atom {"cursor" 50 "recent" []})
@@ -393,11 +452,258 @@
         (is (contains? bot/skip-reasons (:skip (bot/tx->boost! (ctx (atom {})) tx)))
             (pr-str tx))))))
 
+(deftest a-boost-link-honours-the-recipient-and-action-filters
+  (let [msp (ctx (atom {}) :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"})]
+    (testing "a linked boost to another recipient is that recipient's"
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc linked-metadata "name" "Another Show"))]
+        (let [r (bot/tx->boost! msp link-tx)]
+          (is (= :other-recipient (:skip r)))
+          (is (= "hL" (:payment-hash r))))))
+    (testing "a linked boost naming no recipient at all cannot be told apart, and says so"
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] linked-metadata)]
+        (is (= :recipient-unnamed (:skip (bot/tx->boost! msp link-tx))))))
+    (testing "a linked auto-boost on the named split publishes"
+      (with-redefs [bot/fetch-boost-metadata!
+                    (fn [_] (assoc linked-metadata "action" "auto" "name" "MSP 2.0"))]
+        (is (some? (:boostagram (bot/tx->boost! msp link-tx))))))
+    (testing "and the default bot still refuses it"
+      (with-redefs [bot/fetch-boost-metadata!
+                    (fn [_] (assoc linked-metadata "action" "auto" "name" "MSP 2.0"))]
+        (is (= :not-a-boost (:skip (bot/tx->boost! (ctx (atom {})) link-tx))))))))
+
+(def fountain-link-tx
+  {"payment_hash" "hF" "amount" 1000 "settled_at" 1790595877
+   "description" "https://fountain.fm/track/BK7VSc4cZ5KChQMcZ1uE?payment=fbMNWUbBpg51sCEQ4Wig"})
+
+(def fountain-link-metadata
+  "What fountain.fm's x-rss-payment answered for a real 100-sat boost on
+   2026-09-28, the MSP split's leg: an address and no recipient name."
+  {"id" "fbMNWUbBpg51sCEQ4Wig" "action" "BOOST" "split" 0.01
+   "group" "R7rgk17X0gpYB1g5PQJN" "message" nil
+   "link" "https://fountain.fm/track/BK7VSc4cZ5KChQMcZ1uE?payment=fbMNWUbBpg51sCEQ4Wig"
+   "app_name" "Fountain" "sender_id" "HzsySSGguZSCUdahmev4"
+   "sender_name" "chadf@fountain.fm"
+   "sender_npub" "npub177fz5zkm87jdmf0we2nz7mm7uc2e7l64uzqrv6rvdrsg8qkrg7yqx0aaq7"
+   "recipient_address" "chadf@getalby.com"
+   "value_msat" 1000 "value_usd" 0.000831 "value_msat_total" 100000
+   "timestamp" "2026-09-28T11:44:37.690Z" "position" 15
+   "feed_guid" "565d0930-74bc-44ba-ab5d-da2f6c4b7b79" "feed_title" "Songs From The Seaside"
+   "item_guid" "31561378-6997-4298-9baf-c1671ae6f42e" "item_title" "Penthouses & Pavements"
+   "publisher_guid" "4d25f0dd-9270-4fb7-8aeb-ddd4a5213585" "publisher_title" "Longy"
+   "remote_item_guid" nil "remote_feed_guid" nil "remote_publisher_guid" nil})
+
+(def seaside-url "https://headstarts.uk/msp/longy/songs%20from%20the%20seaside/Songs_From_The_Seaside.xml")
+
+(def seaside-recipients
+  [{:name "longy" :address "longy@fountain.fm"}
+   {:name "MSP 2.0" :address "chadf@getalby.com"}
+   {:name "Podcastindex.org" :address "podcastindex@getalby.com"}
+   {:name "nmnu" :address "nmnu@fountain.fm"}])
+
+(defn- msp-ctx []
+  (reset! @#'bot/link-feed-urls {})
+  (ctx (atom {}) :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}
+       :boost-link-origins nil :feed-lookup? true :pi-key "k" :pi-secret "s"))
+
+(deftest a-fountain-boost-link-is-named-from-the-feed
+  (let [asked (atom [])]
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid
+                  (fn [_ guid] (swap! asked conj guid) {:url seaside-url})
+                  bot/read-feed-at (fn [_ url item]
+                                     (when (and (= url seaside-url)
+                                                (= item "31561378-6997-4298-9baf-c1671ae6f42e"))
+                                       {:recipients seaside-recipients}))]
+      (let [c (msp-ctx)
+            r (bot/tx->boost! c fountain-link-tx)]
+        (is (some? (:boostagram r)) "the MSP split's leg of a Fountain boost publishes")
+        (is (= "MSP 2.0" (-> r :boostagram :recipient-name)))
+        (is (= seaside-url (-> r :boostagram :url))
+            "so publish-boost! reads the same feed and memoizes its address")
+        (testing "MSP receives the name as a keysend would carry it"
+          (is (= "MSP 2.0" (get (:link-metadata r) "recipient_name")))
+          (is (= "MSP 2.0" (get (json/read-value (get (fwd/->record r) "tlv")) "name"))))
+        (testing "the feed's address is looked up once per guid, not per payment"
+          (bot/tx->boost! c (assoc fountain-link-tx "payment_hash" "hF2"))
+          (is (= ["565d0930-74bc-44ba-ab5d-da2f6c4b7b79"] @asked)))))))
+
+(deftest a-fountain-boost-on-a-listed-album-publishes-end-to-end
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        posted (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [fountain-link-tx])
+                  bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] {:url seaside-url})
+                  bot/read-feed-at (fn [_ _ _] {:recipients seaside-recipients
+                                                :publisher-guid "4d25f0dd-9270-4fb7-8aeb-ddd4a5213585"})
+                  bot/store-boost! (fn [_ p] (swap! posted conj p) {:id "01NEW" :url "https://tardbox.com/boost/01NEW"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (reset! @#'bot/link-feed-urls {})
+      (bot/poll-once! (ctx a :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}
+                           :boost-link-origins nil :feed-lookup? true :pi-key "k" :pi-secret "s"
+                           :publish-feed-guids #{"4d25f0dd-9270-4fb7-8aeb-ddd4a5213585"})
+                      ::session)
+      (is (= 1 (count @published)) "Longy is listed, so the note goes out")
+      (is (some #(= ["recipient" "MSP 2.0"] %) (:tags (first @published))))
+      (is (= seaside-url (get-in @a ["feeds" "565d0930-74bc-44ba-ab5d-da2f6c4b7b79"]))
+          "and the address the lookup found is memoized"))))
+
+(deftest an-address-with-spaces-is-still-read
+  (testing "the Podcast Index hands back headstarts.uk addresses with their spaces in"
+    (let [fetched (atom [])
+          xml (str "<rss><channel><podcast:value>"
+                   "<podcast:valueRecipient name=\"longy\" address=\"longy@fountain.fm\" split=\"78\"/>"
+                   "<podcast:valueRecipient name=\"MSP 2.0\" address=\"chadf@getalby.com\" split=\"1\"/>"
+                   "</podcast:value></channel></rss>")]
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                    boostbox.podcastindex/feed-by-guid
+                    (fn [_ _] {:url "https://headstarts.uk/msp/longy/songs from the seaside/Songs_From_The_Seaside.xml"})
+                    boostbox.safefetch/fetchable-url? (fn [u] (try (java.net.URI. u) true (catch Exception _ false)))
+                    boostbox.safefetch/fetch-pinned! (fn [u _] (swap! fetched conj u)
+                                                       {:status 200 :body (.getBytes xml "UTF-8")})]
+        (reset! @#'bot/feed-cache {})
+        (let [r (bot/tx->boost! (msp-ctx) fountain-link-tx)]
+          (is (= "MSP 2.0" (-> r :boostagram :recipient-name)))
+          (is (= [seaside-url] @fetched) "fetched at its escaped address"))
+        (testing "and remembered, escaped"
+          (is (= seaside-url
+                 (get-in (#'bot/remember-feed {} {:feed-guid "565d0930-74bc-44ba-ab5d-da2f6c4b7b79"
+                                                  :url "https://headstarts.uk/msp/longy/songs from the seaside/Songs_From_The_Seaside.xml"})
+                         ["feeds" "565d0930-74bc-44ba-ab5d-da2f6c4b7b79"]))))))))
+
+(deftest a-recipient-the-feed-cannot-name-is-said-not-counted
+  (testing "a feed that gives the address another name is that recipient's"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc fountain-link-metadata
+                                                           "recipient_address" "longy@fountain.fm"))
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] {:url seaside-url})
+                  bot/read-feed-at (fn [_ _ _] {:recipients seaside-recipients})]
+      (is (= :other-recipient (:skip (bot/tx->boost! (msp-ctx) fountain-link-tx))))))
+  (testing "no feed to read: its own reason, narrated, carrying the address"
+    (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] nil)
+                  bot/read-feed-at (fn [_ _ _] nil)]
+      (let [r (bot/tx->boost! (msp-ctx) fountain-link-tx)]
+        (is (= :recipient-unnamed (:skip r)))
+        (is (= "chadf@getalby.com" (:recipient-address r)))
+        (is (= "hF" (:payment-hash r)))
+        (is (contains? bot/skip-reasons (:skip r)))
+        (is (#'bot/narrate-skip? r)))))
+  (testing "a name the payer sent is never looked up or overridden"
+    (let [read? (atom false)]
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] (assoc fountain-link-metadata "name" "Someone"))
+                    bot/read-feed-at (fn [_ _ _] (reset! read? true) {:recipients seaside-recipients})]
+        (is (= :other-recipient (:skip (bot/tx->boost! (msp-ctx) fountain-link-tx))))
+        (is (not @read?)))))
+  (testing "a bot with no recipient filter never reads the feed for a name"
+    (let [read? (atom false)]
+      (with-redefs [bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                    bot/read-feed-at (fn [_ _ _] (reset! read? true) nil)]
+        (let [r (bot/tx->boost! (ctx (atom {}) :boost-link-origins nil) fountain-link-tx)]
+          (is (some? (:boostagram r)))
+          (is (nil? (-> r :boostagram :recipient-name)))
+          (is (not @read?)))))))
+
+(deftest the-built-in-relays-include-chads-catch-all
+  ;; Chad keeps a copy of everything his bots publish on his own relay. It
+  ;; takes writes only from allow-listed pubkeys, so a new bot key must be
+  ;; added there too.
+  (is (= ["wss://relay.damus.io" "wss://nos.lol" "wss://relay.primal.net" "wss://chadf.nostr1.com"]
+         (#'bot/csv bot/default-relays))))
+
+(deftest filter-env-vars-parse-to-case-folded-sets
+  (let [folded #'bot/folded-set]
+    (is (= #{"msp 2.0"} (folded "MSP 2.0")))
+    (is (= #{"boost" "auto"} (folded " Boost , AUTO ")))
+    (is (= #{} (folded "")))
+    (is (= #{"msp 2.0 - music side project studio"}
+           (bot/generator-set " MSP 2.0 - Music Side Project Studio "))
+        "a generator keeps its spaces and hyphen; only a comma separates two")))
+
+(deftest a-typo-in-the-album-list-stops-the-bot
+  (let [guids #'bot/feed-guid-set]
+    (is (= #{"c90e609a-df1e-596a-bd5e-57bcc8aad6cc" "917393e3-1b1e-5cef-ace4-edaa54e1f810"}
+           (guids " C90E609A-DF1E-596A-BD5E-57BCC8AAD6CC , 917393e3-1b1e-5cef-ace4-edaa54e1f810")))
+    (is (= #{} (guids "")) "no list means every album")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"c90e609a-df1e-596a-bd5e-57bcc8aad6c"
+                          (guids "c90e609a-df1e-596a-bd5e-57bcc8aad6c"))
+        "a guid one character short is refused, not silently matched against nothing")))
+
+;; A wallet in many shows' splits gets a boostagram on nearly every payment,
+;; about 2 KB each. relay.getalby.com passed a page of 20 (39 KB) and silently
+;; dropped a page of 50 -- the request just timed out, on every poll.
+(deftest transactions-are-read-in-pages-the-relay-will-carry
+  (let [wallet (vec (for [i (range 25)] {"payment_hash" (str "h" i) "settled_at" (- 1000 i)}))
+        limits (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ {:keys [limit offset]}]
+                                           (swap! limits conj limit)
+                                           (->> wallet (drop offset) (take limit) vec))]
+      (is (= wallet (bot/fetch-transactions! ::session 0)) "paging still reaches everything")
+      (is (every? #(<= % 10) @limits) (pr-str @limits)))))
+
+(defn- paged-wallet
+  "A fake list_transactions over `n` transactions, newest first."
+  [n]
+  (let [wallet (vec (for [i (range n)] {"payment_hash" (str "h" i) "settled_at" (- 100000 i)}))]
+    [wallet (fn [_ {:keys [limit offset]}] (->> wallet (drop offset) (take limit) vec))]))
+
+(def timed-out (ex-info "NWC request timed out" {:method "list_transactions" :timeout? true}))
+
+;; relay.getalby.com stops answering after about sixty requests a minute. A
+;; backfill walking hundreds of pages back to back hit it on the 61st, and a
+;; poll that fails there restarts the same walk and hits it again, forever.
+(deftest a-long-walk-is-paced-and-a-poll-is-not
+  (let [pauses (atom [])]
+    (testing "every page after the first waits its turn"
+      (let [[wallet list-txs] (paged-wallet 25)]
+        (with-redefs [nwc/list-transactions! list-txs
+                      bot/pause! (fn [ms] (swap! pauses conj ms))]
+          (is (= wallet (bot/fetch-transactions! ::session 0)))
+          (is (= 2 (count @pauses)) "three pages, two gaps")
+          (is (every? pos? @pauses)))))
+    (testing "an ordinary poll reads one page and never waits"
+      (reset! pauses [])
+      (let [[_ list-txs] (paged-wallet 3)]
+        (with-redefs [nwc/list-transactions! list-txs
+                      bot/pause! (fn [ms] (swap! pauses conj ms))]
+          (bot/fetch-transactions! ::session 0)
+          (is (empty? @pauses)))))))
+
+(deftest a-timed-out-page-is-waited-out-and-read-again
+  (let [[wallet list-txs] (paged-wallet 25)
+        calls (atom 0)
+        pauses (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [s {:keys [offset] :as p}]
+                                           (if (and (= 10 offset) (= 1 (swap! calls inc)))
+                                             (throw timed-out)
+                                             (list-txs s p)))
+                  bot/pause! (fn [ms] (swap! pauses conj ms))]
+      (is (= wallet (bot/fetch-transactions! ::session 0))
+          "the walk finishes rather than failing the whole poll")
+      (is (some #(>= % 30000) @pauses) "and it waited long enough for the limit to clear"))))
+
+(deftest a-page-that-never-answers-still-fails-the-poll
+  (let [attempts (atom 0)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] (swap! attempts inc) (throw timed-out))
+                  bot/pause! (fn [_])]
+      (is (thrown? clojure.lang.ExceptionInfo (bot/fetch-transactions! ::session 0))
+          "loud, so the cursor holds and the next poll starts again")
+      (is (< 1 @attempts 10) (str @attempts " attempts")))))
+
+(deftest a-wallet-error-is-not-retried
+  (let [attempts (atom 0)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] (swap! attempts inc)
+                                           (throw (ex-info "NWC error: RESTRICTED" {:code "RESTRICTED"})))
+                  bot/pause! (fn [_])]
+      (is (thrown? clojure.lang.ExceptionInfo (bot/fetch-transactions! ::session 0)))
+      (is (= 1 @attempts) "a refusal will not change by asking again"))))
+
 (deftest only-the-skips-worth-finding-are-narrated
   (let [narrate? #'bot/narrate-skip?]
     (testing "an ordinary payment and a stream are constant traffic, so only counted"
       (is (not (narrate? {:skip :no-boostagram})))
-      (is (not (narrate? {:skip :not-a-boost :action "stream"}))))
+      (is (not (narrate? {:skip :not-a-boost :action "stream"})))
+      (is (not (narrate? {:skip :other-recipient}))
+          "on a shared wallet every other split is another recipient's"))
     (testing "a defect, a dead link and an unexpected action each get a line"
       (is (narrate? {:skip :tlv-unreadable}))
       (is (narrate? {:skip :boost-link-unreadable}))
@@ -608,24 +914,24 @@
   (let [pi-art "https://cdn.example/a.jpg"
         art-param (str "art=" (java.net.URLEncoder/encode pi-art "UTF-8"))
         publish (fn [b pi-answer]
-               (let [calls (atom 0)
-                     published (atom [])]
-                 (with-redefs [bot/feed-context (fn [_ _] nil)
-                               boostbox.podcastindex/feed-by-guid
-                               (fn [_ _] (swap! calls inc) pi-answer)
-                               bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
-                               relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
-                   (bot/publish-boost! (ctx (atom {}) :pi-key "K" :pi-secret "S") {}
-                                       {:payment-hash "h1" :settled-at 100
-                                        :received-msat 111000 :boostagram b}))
-                 {:calls @calls :banner (banner-of (first @published))}))]
+                  (let [calls (atom 0)
+                        published (atom [])]
+                    (with-redefs [bot/feed-context (fn [_ _] nil)
+                                  boostbox.podcastindex/feed-by-guid
+                                  (fn [_ _] (swap! calls inc) pi-answer)
+                                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+                      (bot/publish-boost! (ctx (atom {}) :pi-key "K" :pi-secret "S") {}
+                                          {:payment-hash "h1" :settled-at 100
+                                           :received-msat 111000 :boostagram b}))
+                    {:calls @calls :banner (banner-of (first @published))}))]
 
     (testing "the v4vmusic case: the app sent a feed address, the feed gave no
               cover, and the API's cover lands on the banner of the published note"
       (let [{:keys [calls banner]}
             (publish (bg/normalize {"action" "boost" "guid" show-guid "url" podhome
-                                 "podcast" "These Four Walls"})
-                  {:url podhome :artwork pi-art})]
+                                    "podcast" "These Four Walls"})
+                     {:url podhome :artwork pi-art})]
         (is (str/includes? banner art-param))
         (is (= 1 calls))))
 
@@ -633,7 +939,575 @@
               two, and the banner goes out without a picture"
       (let [{:keys [calls banner]}
             (publish (bg/normalize {"action" "boost" "guid" show-guid
-                                 "podcast" "These Four Walls"})
-                  {:url podhome :artwork nil})]
+                                    "podcast" "These Four Walls"})
+                     {:url podhome :artwork nil})]
         (is (not (str/includes? banner "art=")))
         (is (= 1 calls) "the answer from resolve-feed is not asked for twice")))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Forwarding to MSP ~~~~~~~~~~~~~~~~~~~
+
+(defn- stream [hash settled-at]
+  {:payment-hash hash :settled-at settled-at :received-msat 1000
+   :boostagram (bg/normalize {"action" "stream" "name" "MSP 2.0"
+                              "guid" "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"})})
+
+(defn- fwd-ctx [a & {:as overrides}]
+  (merge (ctx a
+              :forward-url "https://msp.example/api/boosts/ingest"
+              :forward-token "tok"
+              :forward-actions #{"boost" "auto" "stream"}
+              :recipient-names #{"msp 2.0"}
+              :actions #{"boost" "auto"})
+         overrides))
+
+(defn- hashes [records] (mapv #(get % "payment_hash") records))
+
+(deftest a-stream-is-forwarded-and-never-published
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (empty? @published))
+      (is (= ["s1"] (hashes @sent))))))
+
+(deftest a-boost-is-forwarded-once-its-note-is-out
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["h1"] (hashes @sent)))
+      (is (fwd/forwarded? @a "h1") "and the saved state says so"))))
+
+(deftest a-boost-whose-note-failed-is-not-forwarded-yet
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? false :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (empty? @sent)))))
+
+(deftest msp-being-down-queues-without-holding-the-cursor
+  (let [a (atom {"cursor" 50 "recent" []})]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? false :status 503})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= 100 (get @a "cursor")) "the note went out, so the cursor moves on")
+      (is (= ["h1"] (hashes (get @a "forward-pending")))))))
+
+(deftest a-listed-album-is-published
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{"c90e609a-df1e-596a-bd5e-57bcc8aad6cc"})
+                      ::session)
+      (is (= 1 (count @published))))))
+
+(deftest nothing-is-forwarded-without-a-recipient-filter
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :recipient-names #{}) ::session)
+      (is (empty? @sent)))))
+
+;; The five tests above stub nwc/transaction->boost as a map, which ignores its
+;; second argument (the opts) whenever the key is present -- so they would all
+;; still pass even if poll-once! passed plain `ctx` instead of the widened
+;; `read-ctx`. These two use a real function stub that honours `opts` the way
+;; nwc/transaction->boost actually does, so they are the ones that catch a
+;; regression in that wiring.
+(defn- honest-stream-stub [result]
+  (fn [_tx opts]
+    (if (contains? (:actions opts) "stream")
+      result
+      {:skip :not-a-boost :action "stream"})))
+
+(deftest a-forwarding-bot-reads-a-stream-it-would-otherwise-skip
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost (honest-stream-stub (stream "s1" 100))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["s1"] (hashes @sent)) "forwarding is on, so :actions was widened to include \"stream\"")
+      (is (empty? @published)))))
+
+(deftest a-bot-without-forwarding-still-skips-streams
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1])
+                  nwc/transaction->boost (honest-stream-stub (stream "s1" 100))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (ctx a) ::session)
+      (is (empty? @sent) "forwarding is off, so :actions was never widened and the stream stays a skip")
+      (is (empty? @published)))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Forwarding survives a crash ~~~~~~~~~~~~~~~~~~~
+
+;; A transaction the wallet hands back, carrying the time the cursor moves to.
+(defn- tx [hash settled-at] {"payment_hash" hash "settled_at" settled-at})
+
+(defn- wallet-after
+  "list_transactions over `txs`, answering only what settled after `from` -- so a
+   poll whose cursor has moved past a payment never reads it again."
+  [txs]
+  (fn [_ {:keys [from]}] (filterv #(> (get % "settled_at") from) txs)))
+
+(deftest a-stream-is-saved-in-the-queue-before-it-is-sent
+  (let [a (atom {"cursor" 50 "recent" []})
+        at-send (atom nil)
+        t1 (tx "s1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (stream "s1" 100)}
+                  fwd/send! (fn [_ _] (reset! at-send @a) (throw (ex-info "killed mid-send" {})))]
+      (is (thrown? Exception (bot/poll-once! (fwd-ctx a) ::session)))
+      (is (= ["s1"] (hashes (get @at-send "forward-pending")))
+          "the saved state held the stream before any send began")
+      (is (= 100 (get @at-send "cursor")) "in the same save that moved the cursor past it"))))
+
+(deftest an-unlisted-album-is-forwarded-and-never-published
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])
+        published (atom [])
+        t1 (tx "h1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] (throw (AssertionError. "an unlisted boost is not stored")))
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{"917393e3-1b1e-5cef-ace4-edaa54e1f810"})
+                      ::session)
+      (is (empty? @published) "its artist never agreed")
+      (is (= ["h1"] (hashes @sent)) "the chart still counts it")
+      (is (= 100 (get @a "cursor")) "and it is never read again"))))
+
+(def ^:private artist "1a197bac-95ae-53bd-bf6d-40ba8b551088")
+(def ^:private album-guid "fe17f4f6-074f-4b2c-a450-611faccfaea2")
+
+(defn- i-tags [e] (set (for [[k v] (:tags e) :when (= "i" k)] v)))
+
+(deftest an-artist-on-the-list-is-published-from-any-of-their-albums
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        t1 (tx "h1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (boost "h1" 100)}
+                  bot/feed-context (fn [_ _] {:publisher-guid artist})
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{artist}) ::session)
+      (is (= 1 (count @published)) "the album is not listed, but its artist is")
+      (is (contains? (i-tags (first @published)) (str "podcast:publisher:guid:" artist))
+          "and the note names the artist as NIP-73's publisher id"))))
+
+(deftest a-music-show-boost-is-listed-by-the-songs-own-album
+  ;; The show's feed names the show's publisher, not the artist. The song's
+  ;; album is the remote feed, and blip-10 carries no address for it, so the
+  ;; bot finds it from what an earlier boost taught it.
+  (let [a (atom {"cursor" 50 "recent" [] "feeds" {album-guid "https://x.example/album.xml"}})
+        published (atom [])
+        t1 (tx "h1" 100)
+        b (assoc-in (boost "h1" 100) [:boostagram :remote-feed-guid] album-guid)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 b}
+                  bot/read-feed-at (fn [_ url _]
+                                     (when (= url "https://x.example/album.xml") {:publisher-guid artist}))
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{artist} :feed-lookup? true) ::session)
+      (is (= 1 (count @published)))
+      (is (contains? (i-tags (first @published)) (str "podcast:publisher:guid:" artist))))))
+
+(deftest a-feed-that-cannot-be-read-lists-no-artist
+  (let [a (atom {"cursor" 50 "recent" []})
+        published (atom [])
+        sent (atom [])
+        t1 (tx "h1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (boost "h1" 100)}
+                  bot/feed-context (fn [_ _] nil)
+                  bot/store-boost! (fn [_ _] (throw (AssertionError. "an unlisted boost is not stored")))
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :publish-feed-guids #{artist}) ::session)
+      (is (empty? @published) "nothing says whose album it is, so it is nobody's")
+      (is (= ["h1"] (hashes @sent)) "and the chart still counts it"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Only feeds built with MSP ~~~~~~~~~~~~~~~~~~~
+
+(def ^:private msp-generator "MSP 2.0 - Music Side Project Studio")
+(def ^:private msp-generators #{"msp 2.0 - music side project studio"})
+
+(defn- generator-poll!
+  "One poll of one boost on a forwarding bot that publishes only feeds built
+   with MSP. Answers what was published and what was forwarded."
+  [b & {:keys [feed-context read-feed-at state overrides]}]
+  (let [a (atom (merge {"cursor" 50 "recent" []} state))
+        published (atom [])
+        sent (atom [])
+        t1 (tx (:payment-hash b) 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 b}
+                  bot/feed-context (fn [_ _] feed-context)
+                  bot/read-feed-at (fn [_ url _] (get read-feed-at url))
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (apply fwd-ctx a (mapcat identity (merge {:publish-generators msp-generators}
+                                                               overrides)))
+                      ::session)
+      {:published @published :sent (hashes @sent) :cursor (get @a "cursor")})))
+
+(deftest a-feed-built-with-msp-is-announced
+  (let [{:keys [published sent]} (generator-poll! (boost "h1" 100)
+                                                  :feed-context {:generator msp-generator})]
+    (is (= 1 (count published)))
+    (is (= ["h1"] sent))))
+
+(deftest a-feed-not-built-with-msp-is-forwarded-and-never-announced
+  ;; A show that adds an MSP 2.0 split only to support MSP: the recipient
+  ;; filter lets it through, its own generator does not.
+  (let [{:keys [published sent cursor]}
+        (generator-poll! (boost "h1" 100)
+                         :feed-context {:generator "Podhome (https://www.podhome.fm)"})]
+    (is (empty? published))
+    (is (= ["h1"] sent) "the chart still counts it")
+    (is (= 100 cursor) "and it is never read again")))
+
+(deftest a-music-show-boost-is-announced-when-the-songs-album-was-built-with-msp
+  (let [b (assoc-in (boost "h1" 100) [:boostagram :remote-feed-guid] album-guid)
+        {:keys [published]}
+        (generator-poll! b
+                         :state {"feeds" {album-guid "https://x.example/album.xml"}}
+                         :feed-context {:generator "Sovereign Feeds"}
+                         :read-feed-at {"https://x.example/album.xml" {:generator msp-generator}}
+                         :overrides {:feed-lookup? true})]
+    (is (= 1 (count published)) "the show was not built with MSP, the song's album was")))
+
+(deftest a-feed-that-cannot-be-read-was-built-by-nothing
+  (let [{:keys [published sent]} (generator-poll! (boost "h1" 100) :feed-context nil)]
+    (is (empty? published) "nothing says MSP built it, so it is not announced")
+    (is (= ["h1"] sent))))
+
+(deftest the-album-list-and-the-generator-must-both-agree
+  (let [{:keys [published]}
+        (generator-poll! (boost "h1" 100)
+                         :feed-context {:generator msp-generator}
+                         :overrides {:publish-feed-guids #{"917393e3-1b1e-5cef-ace4-edaa54e1f810"}})]
+    (is (empty? published) "built with MSP, but not the album the list names")))
+
+(deftest an-unlisted-boost-says-which-generators-its-feeds-named
+  (let [h (str "gen-" (System/nanoTime))
+        logs (atom [])]
+    (with-redefs [mulog-core/log* (fn [_ event pairs]
+                                    (swap! logs conj (assoc (apply hash-map pairs) :event event)))]
+      (generator-poll! (boost h 100) :feed-context {:generator "Podhome (https://www.podhome.fm)"}))
+    (is (= [["Podhome (https://www.podhome.fm)"]]
+           (map :generators (filter #(= ::bot/boost-not-listed (:event %)) @logs))))))
+
+(deftest a-generator-list-needs-the-feed-read
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"BBN_FEED_LOOKUP"
+                        (bot/check-publish-generators! {:publish-generators msp-generators
+                                                        :feed-lookup? false}))
+      "with no feed read, nothing could ever match")
+  (is (nil? (bot/check-publish-generators! {:publish-generators msp-generators :feed-lookup? true})))
+  (is (nil? (bot/check-publish-generators! {:publish-generators #{} :feed-lookup? false}))
+      "the Boostr bot, which names no generator"))
+
+(deftest a-published-boost-is-saved-in-the-queue-before-it-is-sent
+  (let [a (atom {"cursor" 50 "recent" []})
+        at-send (atom nil)]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::tx1])
+                  nwc/transaction->boost {::tx1 (boost "h1" 100)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ _] (reset! at-send @a) (throw (ex-info "killed mid-send" {})))]
+      (is (thrown? Exception (bot/poll-once! (fwd-ctx a) ::session)))
+      (is (= ["h1"] (hashes (get @at-send "forward-pending"))))
+      (is (= 100 (get @at-send "cursor"))))))
+
+(deftest the-poll-after-a-crash-sends-what-was-queued
+  (let [a (atom {"cursor" 50 "recent" []})
+        crash? (atom true)
+        sent (atom [])
+        t1 (tx "s1" 100)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 (stream "s1" 100)}
+                  fwd/send! (fn [_ batch]
+                              (when @crash? (throw (ex-info "killed mid-send" {})))
+                              (swap! sent into batch)
+                              {:ok? true :status 200})]
+      (is (thrown? Exception (bot/poll-once! (fwd-ctx a) ::session)))
+      (reset! crash? false)
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["s1"] (hashes @sent)) "sent from the queue, though the wallet no longer returns it")
+      (is (fwd/forwarded? @a "s1"))
+      (is (empty? (get @a "forward-pending"))))))
+
+(deftest a-dry-run-bot-forwards-nothing
+  (let [a (atom {"cursor" 50 "recent" []})
+        sent (atom [])]
+    (with-redefs [nwc/list-transactions! (fn [_ _] [::s1 ::tx1])
+                  nwc/transaction->boost {::s1 (stream "s1" 100) ::tx1 (boost "h1" 200)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] (throw (AssertionError. "dry run must not publish")))
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a :dry-run? true) ::session)
+      (is (empty? @sent) "a dry run never records event_id, so it must not forward either")
+      (is (empty? (get @a "forward-pending")) "nor queue anything to send later"))))
+
+(deftest a-full-queue-says-which-payments-it-dropped
+  (let [old (mapv #(fwd/->record (stream (str "q" %) (+ 1000 %))) (range fwd/max-pending))
+        a (atom {"cursor" 50 "recent" [] "forward-pending" old})
+        logs (atom [])
+        t1 (tx "s1" 5000)
+        t2 (tx "s2" 5001)]
+    (with-redefs [nwc/list-transactions! (wallet-after [t2 t1])
+                  nwc/transaction->boost {t1 (stream "s1" 5000) t2 (stream "s2" 5001)}
+                  fwd/send! (fn [_ _] {:ok? false :status 503})
+                  mulog-core/log* (fn [_ event pairs]
+                                    (swap! logs conj (assoc (apply hash-map pairs) :event event)))]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (let [dropped (filter #(= ::bot/forward-pending-dropped (:event %)) @logs)]
+        (is (= 1 (count dropped)) "one line for the poll")
+        (is (= {:dropped 2 :oldest-dropped-time 1000 :newest-dropped-time 1001}
+               (select-keys (first dropped) [:dropped :oldest-dropped-time :newest-dropped-time]))
+            "the times a backfill must reach back to"))
+      (is (= fwd/max-pending (count (get @a "forward-pending"))))
+      (is (= ["s1" "s2"] (take-last 2 (hashes (get @a "forward-pending"))))
+          "queued oldest first, whatever order the wallet answered in"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ One boost, two payments ~~~~~~~~~~~~~~~~~~~
+
+;; v4vmusic.com pays the bot a split of its own on every boost, and an episode
+;; whose feed also lists the bot is paid a second time, as the feed's split,
+;; with a uuid of its own: two payments, two notes (2026-10-27, 2026-11-07).
+(defn- v4vms-leg
+  [hash settled-at recipient msat uuid & {:as fields}]
+  {:payment-hash hash
+   :settled-at settled-at
+   :received-msat msat
+   :boostagram (bg/normalize (merge {"action" "boost"
+                                     "app_name" "v4vmusic-com"
+                                     "sender_name" "Sir TJ The Wrathful"
+                                     "sender_id" "v4vmusic-com-anon-osx6b042ff"
+                                     "message" "Great episode, thanks Matt and inpc😎"
+                                     "podcast" "V4V Music Spotlight (Phafe Presents)"
+                                     "guid" "31e6e997-df26-59d5-9301-1f5928809566"
+                                     "episode_guid" "06fa0fb3-880f-46b5-928e-096c21a2b5c0"
+                                     "ts" 5714
+                                     "value_msat_total" 777000
+                                     "name" recipient
+                                     "value_msat" msat
+                                     "uuid" uuid}
+                                    fields))})
+
+(def ^:private app-split-tx (tx "h-app" 1793111016))
+(def ^:private feed-split-tx (tx "h-feed" 1793111034))
+(def ^:private app-split
+  (v4vms-leg "h-app" 1793111016 "Boostr Bot - Boost to Nostr" 4000
+             "e6cc7c2b-12cc-4ce5-8fb5-fdf90672d2fc"))
+(def ^:private feed-split
+  (v4vms-leg "h-feed" 1793111034 "Boostr" 8000 "5569d650-8cec-4542-8719-2499b1498cdc"))
+
+(defn- two-payments-poll!
+  "Poll over `txs`, read as `boosts`, and answer what was stored and published."
+  [a c txs boosts & {:keys [polls] :or {polls 1}}]
+  (let [stored (atom [])
+        published (atom [])]
+    (with-redefs [nwc/list-transactions! (wallet-after txs)
+                  nwc/transaction->boost boosts
+                  bot/store-boost! (fn [_ p]
+                                     (swap! stored conj p)
+                                     {:id (str "01ID" (count @stored))
+                                      :url (str "https://tardbox.com/boost/01ID" (count @stored))})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})
+                  fwd/send! (fn [_ _] {:ok? true :status 200})]
+      (dotimes [_ polls] (bot/poll-once! c ::session)))
+    {:stored @stored :published @published}))
+
+(deftest one-boost-paid-to-the-wallet-twice-is-announced-once
+  (testing "both payments in one poll"
+    (let [a (atom {"cursor" 1793111000 "recent" []})
+          {:keys [stored published]} (two-payments-poll!
+                                      a (ctx a) [app-split-tx feed-split-tx]
+                                      {app-split-tx app-split feed-split-tx feed-split})]
+      (is (= 1 (count published)) "one boost, one note")
+      (is (= 1 (count stored)) "and one record: a second would be a second card")
+      (is (= 1793111034 (get @a "cursor")) "the second payment is done with, not pending")
+      (is (= {"payment_hash" "h-feed" "skipped" "duplicate" "duplicate_of" "h-app"}
+             (get (#'bot/seen-index @a) "h-feed"))
+          "remembered, and says which payment was announced")))
+
+  (testing "the second payment arriving a poll later, as it did on 2026-11-07"
+    (let [a (atom {"cursor" 1793111000 "recent" []})
+          {:keys [published]} (two-payments-poll!
+                               a (ctx a) [app-split-tx]
+                               {app-split-tx app-split})
+          later (two-payments-poll! a (ctx a) [app-split-tx feed-split-tx]
+                                    {app-split-tx app-split feed-split-tx feed-split})]
+      (is (= 1 (count published)))
+      (is (empty? (:published later)) "the state file carries what the first note was")
+      (is (empty? (:stored later)))))
+
+  (testing "a dry run shows the same one note"
+    (let [a (atom {"cursor" 1793111000 "recent" []})
+          stored (:stored (two-payments-poll!
+                           a (ctx a :dry-run? true) [app-split-tx feed-split-tx]
+                           {app-split-tx app-split feed-split-tx feed-split}))]
+      (is (= 1 (count stored))))))
+
+(deftest a-second-boost-is-still-a-boost
+  (testing "the same boost again, after the window"
+    (let [late (+ 1793111016 bot/duplicate-window-sec 1)
+          t2 (tx "h-again" late)
+          again (v4vms-leg "h-again" late "Boostr" 8000 "0b0e-again")
+          a (atom {"cursor" 1793111000 "recent" []})]
+      (is (= 2 (count (:published (two-payments-poll!
+                                   a (ctx a) [app-split-tx t2]
+                                   {app-split-tx app-split t2 again})))))))
+
+  (testing "another listener saying the same thing"
+    (let [t2 (tx "h-other" 1793111034)
+          other (v4vms-leg "h-other" 1793111034 "Boostr" 8000 "0b0e-other"
+                           "sender_id" "v4vmusic-com-anon-someone-else")
+          a (atom {"cursor" 1793111000 "recent" []})]
+      (is (= 2 (count (:published (two-payments-poll!
+                                   a (ctx a) [app-split-tx t2]
+                                   {app-split-tx app-split t2 other})))))))
+
+  (testing "an app that names no sender: two boosts that read alike stay two"
+    (let [a (atom {"cursor" 50 "recent" []})
+          t1 (tx "h1" 100)
+          t2 (tx "h2" 118)]
+      (is (= 2 (count (:published (two-payments-poll!
+                                   a (ctx a) [t1 t2]
+                                   {t1 (boost "h1" 100) t2 (boost "h2" 118)}))))))))
+
+(deftest a-payment-announced-in-anothers-note-still-reaches-msp
+  (let [a (atom {"cursor" 1793111000 "recent" []})
+        sent (atom [])
+        msp (fn [leg] (update leg :boostagram assoc :recipient-name "MSP 2.0"))]
+    (with-redefs [nwc/list-transactions! (wallet-after [app-split-tx feed-split-tx])
+                  nwc/transaction->boost {app-split-tx (msp app-split)
+                                          feed-split-tx (msp feed-split)}
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ _] {:ok? true :results []})
+                  fwd/send! (fn [_ batch] (swap! sent into batch) {:ok? true :status 200})]
+      (bot/poll-once! (fwd-ctx a) ::session)
+      (is (= ["h-app" "h-feed"] (hashes @sent))
+          "the chart counts payments, and both were paid"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Rewind ~~~~~~~~~~~~~~~~~~~
+
+(deftest a-rewind-moves-the-cursor-back-once
+  (let [now 1790600000
+        to (- now 3600)
+        state {"cursor" (- now 60) "recent" [{"payment_hash" "p" "event_id" "e"}]}
+        {s :state rewound? :rewound?} (bot/rewind-cursor state to now)]
+    (is rewound?)
+    (is (= to (get s "cursor")))
+    (is (= (get state "recent") (get s "recent"))
+        "the de-duplication set is what keeps a re-read boost from being announced twice")
+    (testing "a restart with the variable still set does not pull the cursor back again"
+      (let [later (assoc s "cursor" (- now 10))]
+        (is (= {:state later :rewound? false} (bot/rewind-cursor later to now)))))
+    (testing "never forward"
+      (is (not (:rewound? (bot/rewind-cursor {"cursor" (- to 10)} to now)))))
+    (testing "no cursor is a first run, not something to rewind"
+      (is (= {:state {} :rewound? false} (bot/rewind-cursor {} to now))))
+    (testing "unset is a no-op"
+      (is (= {:state state :rewound? false} (bot/rewind-cursor state nil now))))))
+
+(deftest a-rewind-the-dedupe-set-may-not-cover-is-refused
+  (let [now 1790600000]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (bot/rewind-cursor {"cursor" now} (- now bot/max-rewind-sec 1) now)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (bot/rewind-cursor {"cursor" now} (+ now 60) now)))))
+
+(deftest a-rewind-re-reads-a-skipped-boost-and-publishes-it-once
+  (let [a (atom {"cursor" 1790599000 "recent" []})
+        published (atom [])
+        c (ctx a :actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}
+               :boost-link-origins nil :feed-lookup? true :pi-key "k" :pi-secret "s")]
+    (with-redefs [nwc/list-transactions! (fn [_ {:keys [from]}]
+                                           (if (<= from 1790595877) [fountain-link-tx] []))
+                  bot/fetch-boost-metadata! (fn [_] fountain-link-metadata)
+                  boostbox.podcastindex/feed-by-guid (fn [_ _] {:url seaside-url})
+                  bot/read-feed-at (fn [_ _ _] {:recipients seaside-recipients})
+                  bot/store-boost! (fn [_ _] {:id "01NEW" :url "https://tardbox.com/boost/01NEW"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (reset! @#'bot/link-feed-urls {})
+      (bot/poll-once! c ::session)
+      (is (empty? @published) "past the cursor, the boost is not re-read")
+      (reset! a (:state (bot/rewind-cursor @a 1790595600 1790600000)))
+      (bot/poll-once! c ::session)
+      (is (= 1 (count @published)))
+      (bot/poll-once! c ::session)
+      (reset! a (assoc @a "cursor" 1790595600))
+      (bot/poll-once! c ::session)
+      (is (= 1 (count @published)) "re-read again, it is already published"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Lookup caches ~~~~~~~~~~~~~~~~~~~
+
+(deftest a-remembered-miss-expires-and-a-hit-does-not
+  (let [memoized! #'bot/memoized!
+        cache (atom {})
+        calls (atom 0)
+        miss #(do (swap! calls inc) nil)
+        hit #(do (swap! calls inc) "https://x.example/feed.xml")
+        age! (fn [k] (swap! cache update-in [k :at] - @#'bot/miss-ttl-ms 1))]
+    (testing "a miss is believed for a while: one lookup per burst, not per payment"
+      (memoized! cache 8 :a miss)
+      (memoized! cache 8 :a miss)
+      (is (= 1 @calls)))
+    (testing "then asked again: a Podcast Index timeout must not hide a feed until restart"
+      (age! :a)
+      (memoized! cache 8 :a miss)
+      (is (= 2 @calls)))
+    (testing "a found value is kept however old"
+      (memoized! cache 8 :b hit)
+      (age! :b)
+      (is (= "https://x.example/feed.xml" (memoized! cache 8 :b hit)))
+      (is (= 3 @calls)))
+    (testing "cleared rather than evicted when full"
+      (memoized! cache 2 :c hit)
+      (is (= [:c] (keys @cache))))))
+
+(deftest a-rewind-is-applied-at-startup-once
+  (let [a (atom {"cursor" (quot (System/currentTimeMillis) 1000)})
+        to (- (quot (System/currentTimeMillis) 1000) 3600)
+        c (ctx a :rewind-to to)]
+    (#'bot/apply-rewind! c)
+    (is (= to (get @a "cursor")))
+    (swap! a assoc "cursor" (+ to 60))
+    (#'bot/apply-rewind! c)
+    (is (= (+ to 60) (get @a "cursor")) "the same value never rewinds twice")
+    (#'bot/apply-rewind! (ctx a))
+    (is (= (+ to 60) (get @a "cursor")) "unset is a no-op")))

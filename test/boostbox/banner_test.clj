@@ -60,6 +60,20 @@
     (is (nil? (banner/clean-line "   " 44)))
     (is (nil? (banner/clean-line nil 44)))))
 
+(deftest the-account-can-sign-its-own-banner
+  ;; An MSP 2.0 note naming "MSP 2.0" in its client tag must not carry a
+  ;; picture signed BOOSTR_BOT: one note, two names for one publisher.
+  (let [png #(vec (banner/banner-png %1 %2))]
+    (is (= (png {:title "X"} "MSP 2.0") (png {:title "X" :by "MSP 2.0"} "tardbox.com"))
+        "`by` takes the place of the server's wordmark")
+    (is (not= (png {:title "X"} "tardbox.com") (png {:title "X" :by "MSP 2.0"} "tardbox.com")))
+    (is (= (png {:title "X"} "tardbox.com") (png {:title "X" :by " \n "} "tardbox.com"))
+        "a blank `by` is no `by`")
+    (let [long-name (apply str (repeat 100 "M"))]
+      (is (= (png {:title "X"} (banner/clean-line long-name banner/max-by-length))
+             (png {:title "X" :by long-name} "tardbox.com"))
+          "bounded like every other line of query text"))))
+
 (deftest sats-is-a-number-or-nothing
   (is (= "2,100" (banner/clean-sats "2100")))
   (is (= "1" (banner/clean-sats "1")))

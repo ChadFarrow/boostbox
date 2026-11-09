@@ -1,7 +1,8 @@
 (ns boostbox.nwc-test
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.nwc :as nwc]
-            [boostbox.nostr :as nostr]))
+            [boostbox.nostr :as nostr]
+            [jsonista.core :as json]))
 
 (def wallet-pubkey (apply str (repeat 64 "a")))
 (def secret (apply str (repeat 64 "b")))
@@ -113,6 +114,26 @@
   (testing "a payment with no boostagram is not a boost"
     (is (= :no-boostagram (:skip (nwc/transaction->boost {"payment_hash" "x" "amount" 1000}))))))
 
+(deftest a-boost-carries-its-tlv-exactly-as-the-payer-wrote-it
+  ;; bg/normalize folds boost_link into :url; MSP's song resolver keys on boost_link,
+  ;; so the forwarder needs the original, not the normalized map
+  (let [tlv (json/write-value-as-string {"action" "boost" "name" "MSP 2.0"
+                                         "boost_link" "https://v4vmusic.com/songs/x"
+                                         "value_msat_total" 2100000})
+        tx {"payment_hash" "h" "amount" 21000 "settled_at" 1
+            "metadata" {"tlv_records" [{"type" 7629169
+                                        "value" (nostr/bytes->hex (.getBytes tlv "UTF-8"))}]}}
+        b (nwc/transaction->boost tx)]
+    (is (= tlv (:tlv-json b)) "byte for byte, boost_link included")
+    (is (nil? (:wallet-boostagram b)))))
+
+(deftest a-wallet-parsed-boost-carries-the-wallets-map
+  (let [parsed {"action" "boost" "podcast" "Show" "name" "MSP 2.0"}
+        b (nwc/transaction->boost {"payment_hash" "h" "amount" 1 "settled_at" 1
+                                   "metadata" {"boostagram" parsed}})]
+    (is (= parsed (:wallet-boostagram b)))
+    (is (nil? (:tlv-json b)))))
+
 (deftest a-skipped-transaction-says-why
   (testing "the reasons are distinct, because a count cannot tell a stream from a defect"
     (is (= :no-boostagram (:skip (nwc/transaction->boost {})))
@@ -149,6 +170,57 @@
                 {"metadata" {"boostagram" {"action" "stream"}}}]]
       (is (contains? nwc/skip-reasons (:skip (nwc/transaction->boost tx)))
           (pr-str tx)))))
+
+;; A real v4vmusic auto-boost, as it reached the node's main wallet on the
+;; MSP 2.0 community-support split every MSP feed carries.
+(def msp-auto-json
+  (str "{\"action\":\"auto\",\"value_msat_total\":33000,\"app_name\":\"v4vmusic-com\","
+       "\"url\":\"https://phafe.com/wp-content/uploads/rssfeed/music/matt_finlay/various_assorted/Various___Assorted.xml\","
+       "\"ts\":229,\"time\":\"00:03:49\",\"app_version\":\"0.17.6\",\"speed\":\"1\","
+       "\"sender_id\":\"v4vmusic-com-anon-5vg8yozuig4\",\"sender_name\":\"Sir TJ The Wrathful\","
+       "\"name\":\"MSP 2.0\","
+       "\"message\":\"Auto boost from Sir TJ The Wrathful for \\\"Will You Wait For Me? (Demo)\\\" by Matt Finlay sent from v4vmusic.com\","
+       "\"podcast\":\"Various &amp; Assorted\",\"episode\":\"Will You Wait For Me? (Demo)\","
+       "\"guid\":\"fe17f4f6-074f-4b2c-a450-611faccfaea2\","
+       "\"episode_guid\":\"40537e7c-3125-4eaa-8ab7-ecc2893e6913\","
+       "\"boost_link\":\"https://v4vmusic.com/songs/cmo5qidwa0052od0jb4qdmizg\","
+       "\"boost_uuid\":\"551862d7-5565-464c-ae2f-b10e4777caeb\","
+       "\"uuid\":\"221e04e9-97d4-4e76-bdcb-7bd9f092b650\"}"))
+
+(defn- msp-tx [json]
+  {"payment_hash" "hMSP" "amount" 1320 "settled_at" 1758800000
+   "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv json)}]}})
+
+(def msp-only {:actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}})
+
+(deftest the-msp-split-is-picked-out-of-a-shared-wallet
+  (testing "the MSP 2.0 auto-boost publishes when auto is asked for"
+    (let [r (nwc/transaction->boost (msp-tx msp-auto-json) msp-only)]
+      (is (nil? (:skip r)))
+      (is (= "auto" (-> r :boostagram :action)))
+      (is (= "MSP 2.0" (-> r :boostagram :recipient-name)))
+      (is (= "fe17f4f6-074f-4b2c-a450-611faccfaea2" (-> r :boostagram :feed-guid)))
+      (is (= 1320 (:received-msat r)))))
+
+  (testing "without options nothing changes: an auto-boost is still not a boost"
+    (let [r (nwc/transaction->boost (msp-tx msp-auto-json))]
+      (is (= :not-a-boost (:skip r)))
+      (is (= "auto" (:action r)))))
+
+  (testing "a split to anyone else is another recipient's, whatever its action"
+    (doseq [action ["boost" "auto" "stream"]]
+      (let [json (-> msp-auto-json
+                     (clojure.string/replace "\"MSP 2.0\"" "\"Some Other Show\"")
+                     (clojure.string/replace "\"action\":\"auto\"" (str "\"action\":\"" action "\"")))]
+        (is (= :other-recipient (:skip (nwc/transaction->boost (msp-tx json) msp-only)))
+            action))))
+
+  (testing "a stream on the MSP split is still a stream"
+    (let [json (clojure.string/replace msp-auto-json "\"action\":\"auto\"" "\"action\":\"stream\"")]
+      (is (= :not-a-boost (:skip (nwc/transaction->boost (msp-tx json) msp-only))))))
+
+  (testing "the new reason is a declared one"
+    (is (contains? nwc/skip-reasons :other-recipient))))
 
 (deftest podcast-guru-sends-both-url-and-boost-link
   (testing "the feed address wins over the app deep link, and the boost publishes"

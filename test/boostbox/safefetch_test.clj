@@ -103,3 +103,19 @@
         latin (String. utf8 "ISO-8859-1")]
     (is (= (seq utf8) (seq (sf/body-bytes latin))))
     (is (= "héllo 🚀 podcast" (String. (sf/body-bytes latin) "UTF-8")))))
+
+(deftest a-feed-address-is-escaped-not-judged
+  (testing "the Podcast Index's address for an MSP album on headstarts.uk"
+    (is (= "https://headstarts.uk/msp/longy/songs%20from%20the%20seaside/Songs_From_The_Seaside.xml"
+           (sf/escape-url "https://headstarts.uk/msp/longy/songs from the seaside/Songs_From_The_Seaside.xml"))))
+  (testing "an address already escaped, or with nothing to escape, is left alone"
+    (doseq [u ["https://headstarts.uk/msp/longy/songs%20from%20the%20seaside/x.xml"
+               "https://headstarts.uk/msp/longy/You%27ve%20Got/you've.xml?a=1&b=2#f"
+               "https://wavlake.com/feed/music/4403575a-c0b8-48df-8738-285ee6c826d7"]]
+      (is (= u (sf/escape-url u)))))
+  (testing "non-ASCII is one UTF-8 sequence, a character outside the BMP included"
+    (is (= "https://x.example/caf%C3%A9/%F0%9F%8E%B8.xml"
+           (sf/escape-url "https://x.example/café/🎸.xml"))))
+  (testing "control characters and the other illegal ones"
+    (is (= "https://x.example/a%09b%7Cc%22%3C%3E" (sf/escape-url "https://x.example/a\tb|c\"<>"))))
+  (is (nil? (sf/escape-url nil))))

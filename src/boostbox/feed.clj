@@ -1,6 +1,10 @@
 (ns boostbox.feed
-  "The two things a boost note needs out of an RSS feed and nothing else: the
-   npubs the feed declares for its people, and a cover image.
+  "The things a boost note needs out of an RSS feed and nothing else: the npubs
+   the feed declares for its people, a cover image, the guid of the publisher
+   feed it names -- for music, the artist -- the splits the boosted item pays,
+   which name a recipient a boost link gives only by address, and the program
+   that wrote it, which tells an MSP-built album from a show that only
+   supports MSP.
 
    Modelled on boostmebitch's lib/feed-xml.ts so the two apps agree about what
    a feed says. Two rules carry over from there, and both are load-bearing:
@@ -17,6 +21,7 @@
    number of items walked, the number of npubs returned, and the length of any
    URL handed back."
   (:require [clojure.string :as str]
+            [boostbox.boostagram :as bg]
             [boostbox.nostr :as nostr]))
 
 (def max-feed-npubs
@@ -82,23 +87,25 @@
 
    One forward pass: each step starts from the end of the previous hit, so the
    work is linear in the document rather than in the number of candidate
-   matches."
-  [^String xml ^String name]
-  (let [needle (str "<" name)
-        n (count needle)]
-    (loop [from 0, out []]
-      (if-let [open (str/index-of xml needle from)]
-        (let [next-ch (when (< (+ open n) (.length xml)) (.charAt xml (+ open n)))]
-          (if-not (contains? #{\space \tab \newline \return \/ \>} next-ch)
-            ;; <podcast:person> must not match <podcast:personality>
-            (recur (+ open n) out)
-            (if-let [end (tag-end xml open)]
-              (let [raw (subs xml (+ open n) (dec end))
-                    self? (str/ends-with? (str/trimr raw) "/")
-                    attrs (if self? (str/trimr (subs raw 0 (dec (count (str/trimr raw))))) raw)]
-                (recur end (conj out {:attrs attrs :self-closing? self? :after end})))
-              out)))
-        out))))
+   matches. With `limit`, it stops at that many: a caller that only ever looks
+   at the first N must not pay for walking 200k."
+  ([^String xml ^String name] (find-tags xml name Long/MAX_VALUE))
+  ([^String xml ^String name limit]
+   (let [needle (str "<" name)
+         n (count needle)]
+     (loop [from 0, out []]
+       (if-let [open (when (< (count out) limit) (str/index-of xml needle from))]
+         (let [next-ch (when (< (+ open n) (.length xml)) (.charAt xml (+ open n)))]
+           (if-not (contains? #{\space \tab \newline \return \/ \>} next-ch)
+             ;; <podcast:person> must not match <podcast:personality>
+             (recur (+ open n) out)
+             (if-let [end (tag-end xml open)]
+               (let [raw (subs xml (+ open n) (dec end))
+                     self? (str/ends-with? (str/trimr raw) "/")
+                     attrs (if self? (str/trimr (subs raw 0 (dec (count (str/trimr raw))))) raw)]
+                 (recur end (conj out {:attrs attrs :self-closing? self? :after end})))
+               out)))
+         out)))))
 
 (defn- close-positions
   "Where every `</name` sits, in one forward pass."
@@ -130,16 +137,17 @@
    for from each open tag. Scanning per open tag is the quadratic shape this
    namespace exists to avoid, and it does not announce itself: 200k unclosed
    `<podcast:txt>` opens measured 72 s that way and 30 ms this way, on a
-   document a feed can serve by accident."
-  [^String xml ^String name]
-  (let [closes (close-positions xml name)]
-    (for [{:keys [after self-closing?] :as hit} (find-tags xml name)]
-      (assoc hit :inner
-             (if self-closing?
-               ""
-               (if-let [i (first-at-or-after closes after)]
-                 (subs xml after i)
-                 ""))))))
+   document a feed can serve by accident. `limit` is find-tags'."
+  ([^String xml ^String name] (find-blocks xml name Long/MAX_VALUE))
+  ([^String xml ^String name limit]
+   (let [closes (close-positions xml name)]
+     (for [{:keys [after self-closing?] :as hit} (find-tags xml name limit)]
+       (assoc hit :inner
+              (if self-closing?
+                ""
+                (if-let [i (first-at-or-after closes after)]
+                  (subs xml after i)
+                  "")))))))
 
 (def ^:private entities
   {"amp" "&" "lt" "<" "gt" ">" "quot" "\"" "apos" "'" "#39" "'" "#34" "\""})
@@ -197,13 +205,11 @@
    order is data: the show's own npub should survive a feed that lists a dozen
    guests."
   [^String xml]
-  (let [txt (for [{:keys [attrs inner]} (take max-npub-tags-scanned
-                                              (find-blocks xml "podcast:txt"))
+  (let [txt (for [{:keys [attrs inner]} (find-blocks xml "podcast:txt" max-npub-tags-scanned)
                   :let [purpose (some-> (read-attr attrs "purpose") str/lower-case)]
                   :when (contains? nostr-txt-purposes purpose)]
               (decode-npub (decode-xml-text inner)))
-        person (for [{:keys [attrs]} (take max-npub-tags-scanned
-                                           (find-tags xml "podcast:person"))]
+        person (for [{:keys [attrs]} (find-tags xml "podcast:person" max-npub-tags-scanned)]
                  (decode-npub (read-attr attrs "npub")))]
     (->> (concat txt person)
          (remove nil?)
@@ -246,38 +252,155 @@
         ends (keep #(str/index-of xml % start) ["<item" "<podcast:liveItem"])]
     (subs xml start (if (seq ends) (apply min ends) (count xml)))))
 
-(defn item-art
-  "The cover on the `<item>` whose guid matches, or nil.
+(defn- item-markup
+  "The inner markup of the `<item>` whose guid matches, or nil.
 
    Matched on the guid the boostagram carries rather than on position: an item
-   list is not ordered by anything we know, and the wrong item's art is a
-   picture of a different episode."
+   list is not ordered by anything we know, and the wrong item is a different
+   episode."
   [^String xml item-guid]
   (when-not (str/blank? (str item-guid))
     (let [needle (str/trim (str item-guid))]
       (some (fn [{:keys [inner]}]
               (when (some #(= needle (str/trim (decode-xml-text (:inner %))))
                           (find-blocks inner "guid"))
-                (image-in inner)))
-            (take max-items-scanned (find-blocks xml "item"))))))
+                inner))
+            (find-blocks xml "item" max-items-scanned)))))
+
+(defn- item-or-channel
+  "`f` of the item's markup when that answers, else of the channel's. The
+   rule for everything a boost reads per episode: an item's own cover or
+   value block replaces the show's rather than adding to it."
+  [f item channel]
+  (or (some-> item f) (f channel)))
 
 (defn feed-art
   "The best cover for this boost: the episode's own, else the show's."
   [^String xml item-guid]
-  (or (item-art xml item-guid)
-      (image-in (channel-slice xml))))
+  (item-or-channel image-in (item-markup xml item-guid) (channel-slice xml)))
+
+;; ~~~~~~~~~~~~~~~~~~~ Publisher ~~~~~~~~~~~~~~~~~~~
+
+(defn publisher-guid
+  "The `<podcast:guid>` of the publisher feed this feed names, lower-cased, or
+   nil. For music that publisher is the artist: every album carries
+   `<podcast:publisher><podcast:remoteItem medium=\"publisher\" feedGuid=…>`,
+   so it is the one guid an artist's albums share.
+
+   Read only inside `<podcast:publisher>`, and only from a remoteItem whose
+   medium says publisher: a podroll lists other people's feeds with the same
+   tag, and one of those read as this feed's artist would name a stranger."
+  [^String xml]
+  (first (for [{:keys [inner]} (find-blocks xml "podcast:publisher")
+               {:keys [attrs]} (find-tags inner "podcast:remoteItem")
+               :when (= "publisher" (some-> (read-attr attrs "medium") str/lower-case))
+               :let [guid (read-attr attrs "feedGuid")]
+               :when (bg/valid-feed-guid? guid)]
+           (str/lower-case guid))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Value recipients ~~~~~~~~~~~~~~~~~~~
+
+(def max-value-recipients
+  "How many `<podcast:valueRecipient>`s are read from one value block. Real
+   splits run to a dozen or two; past this it is not a split list."
+  100)
+
+(defn- recipients-in
+  "{:name :address} for each recipient in the first `<podcast:value>` of
+   `slice`, or nil when it has none.
+
+   A `<podcast:valueTimeSplit>` is cut out first: the recipients inside one are
+   paid only for a stretch of the episode, often under other names, and read
+   as the item's own they would make an address look like someone else's.
+
+   The close is found exactly rather than with `find-blocks`, whose search for
+   `</podcast:value` would stop at the first `</podcast:valueTimeSplit` and
+   lose every recipient listed after one."
+  [^String slice]
+  (when-let [{:keys [after self-closing?]} (first (find-tags slice "podcast:value" 1))]
+    (let [inner (if self-closing?
+                  ""
+                  (subs slice after (or (str/index-of slice "</podcast:value>" after)
+                                        (count slice))))
+          own (reduce (fn [s {split :inner}]
+                        (if (str/blank? split) s (str/replace s split "")))
+                      inner
+                      (find-blocks inner "podcast:valueTimeSplit" max-value-recipients))]
+      (not-empty
+       (vec (for [{:keys [attrs]} (find-tags own "podcast:valueRecipient" max-value-recipients)
+                  :let [address (read-attr attrs "address")]
+                  :when address]
+              {:name (read-attr attrs "name") :address address}))))))
+
+(defn value-recipients
+  "The splits a boost on this item paid: the item's own value block when it has
+   one, the channel's otherwise -- Podcasting 2.0's rule, an item's block
+   replacing the channel's rather than adding to it."
+  [^String xml item-guid]
+  (item-or-channel recipients-in (item-markup xml item-guid) (channel-slice xml)))
+
+(defn recipient-name
+  "The name `recipients` give `address`, or nil.
+
+   For a payment whose metadata says where it went but not to whom -- Fountain's
+   boost link carries `recipient_address` and no name. The name comes from the
+   feed, which the podcaster wrote, never from the payer. Only an address with
+   exactly one name answers: one listed twice under different names could be
+   either split, and guessing would file the payment under the wrong one."
+  [recipients address]
+  (let [fold #(some-> % str str/trim str/lower-case not-empty)
+        a (fold address)
+        names (when a
+                (distinct (keep #(when (= a (fold (:address %)))
+                                   (some-> (:name %) str/trim not-empty))
+                                recipients)))]
+    (when (= 1 (count (distinct (map str/lower-case names))))
+      (first names))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Generator ~~~~~~~~~~~~~~~~~~~
+
+(def max-generator-length
+  "Longer than this is not the name of a program that wrote a feed."
+  200)
+
+(defn generator
+  "The channel's `<generator>` -- the program that wrote the feed -- trimmed,
+   or nil. MSP 2.0 writes a fixed `MSP 2.0 - Music Side Project Studio` into
+   every feed it builds, which is how a boost on an MSP album is told apart
+   from one on a show that only carries an `MSP 2.0` support split.
+
+   `channel` is the channel's own markup (channel-slice): an item is not the
+   feed. Over the bound it is refused rather than cut down, so a long string
+   can never be trimmed into one that matches."
+  [^String channel]
+  (some-> (first (find-blocks channel "generator" 1))
+          :inner
+          decode-xml-text
+          (str/replace #"\p{Cntrl}" "")
+          str/trim
+          not-empty
+          (as-> g (when (<= (count g) max-generator-length) g))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Entry point ~~~~~~~~~~~~~~~~~~~
 
 (defn read-feed
-  "{:npubs :art} for one feed document. Returns nil for anything unusable, so
-   a caller has one thing to test rather than several."
+  "{:npubs :art :publisher-guid :recipients :generator} for one feed document.
+   Returns nil for anything unusable, so a caller has one thing to test rather
+   than several."
   [^String xml item-guid]
   (try
     (when-not (str/blank? xml)
       (let [clean (strip-comments xml)
             npubs (feed-npubs clean)
-            art (feed-art clean item-guid)]
-        (when (or (seq npubs) art)
-          {:npubs npubs :art art})))
+            ;; feed-art and value-recipients, with the item and channel found
+            ;; once between them rather than once each
+            item (item-markup clean item-guid)
+            channel (channel-slice clean)
+            art (item-or-channel image-in item channel)
+            publisher (publisher-guid clean)
+            recipients (item-or-channel recipients-in item channel)
+            built-by (generator channel)]
+        (when (or (seq npubs) art publisher recipients built-by)
+          {:npubs npubs :art art :publisher-guid publisher :recipients recipients
+           :generator built-by})))
     (catch Exception _ nil)))

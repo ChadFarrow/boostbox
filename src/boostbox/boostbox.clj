@@ -452,6 +452,16 @@
        ".boost-card .boost-label { color: rgba(255,255,255,0.4); font-size: 0.75rem; }"
        ".boost-card .boost-value { color: rgba(255,255,255,0.9); font-size: 0.85rem; }"
        ".boost-card .boost-value.sats { color: #f7931a; font-weight: 600; }"
+       ;; A split boost's leg list, under its card's rows
+       ".boost-card-main { text-decoration: none; color: inherit; display: block; }"
+       ".boost-legs { margin-top: 0.6rem; padding-top: 0.5rem; border-top: 1px solid rgba(255,255,255,0.08); }"
+       ".boost-legs-title { color: rgba(255,255,255,0.4); font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; "
+       "text-transform: uppercase; margin-bottom: 0.2rem; }"
+       ".boost-leg { display: flex; justify-content: space-between; gap: 0.75rem; padding: 0.3rem 0.5rem; margin: 0 -0.5rem; "
+       "border-radius: 6px; color: rgba(255,255,255,0.85); font-size: 0.82rem; text-decoration: none; }"
+       ".boost-leg:hover { background: rgba(247,147,26,0.1); color: #fff; }"
+       ".boost-leg-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"
+       ".boost-leg-sats { color: #f7931a; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }"
 
        ;; Empty state
        ".empty-state { color: rgba(255,255,255,0.4); font-size: 1rem; padding: 3rem 2rem; "
@@ -481,6 +491,8 @@
 
        ;; Section headers
        ".section { margin-bottom: 0.25rem; }"
+       ;; the same space .overlay-middle's gap puts between unsectioned cards
+       ".section .boost-card-link + .boost-card-link { margin-top: 0.75rem; }"
        ".section-header { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.25rem; }"
        ".section-line { flex: 1; height: 1px; background: rgba(255,255,255,0.1); }"
        ".section-title { color: rgba(255,255,255,0.7); font-size: 0.8rem; font-weight: 600; white-space: nowrap; }"
@@ -496,11 +508,42 @@
        "main { padding: 0 0.75rem; } "
        "}"))
 
+(defn- leg-name
+  "Who a leg paid: its recipient's name, else its address. Both are written by
+   the app that POSTed, and render as escaped text."
+  [leg]
+  (or (some #(let [v (get leg %)] (when (and (string? v) (not (str/blank? v))) v))
+            ["recipient_name" "recipient_address"])
+      "(unnamed)"))
+
+(defn boost-legs
+  "One line per leg of a split boost, each linking to its own record.
+   \"Recorded\", not \"paid\": an app POSTs before it pays, so a record is not
+   proof a payment settled, and a keysend leg the app never POSTed is missing
+   from the list without anything being wrong."
+  [legs]
+  (into [:div.boost-legs
+         [:div.boost-legs-title (str "Legs recorded (" (count legs) ")")]]
+        (for [leg legs
+              :let [v (get leg "value_msat")
+                    sats (when (number? v) (format-sats v))]]
+          [:a.boost-leg {:href (str "/boost/" (get leg "id"))}
+           [:span.boost-leg-name (leg-name leg)]
+           [:span.boost-leg-sats (if sats (str "⚡ " sats " sats") "–")]])))
+
 (defn boost-card
-  "Renders a single boost as a card for the homepage overlay"
+  "Renders a single boost as a card for the homepage overlay. Every card lists
+   its legs -- a boost of one record as its one leg -- because the card's
+   amount is the whole boost's: half of tardbox's cards are one record of a
+   split boost, and only the leg line says who that record paid, and how much."
   [boost]
-  [:a.boost-card-link {:href (str "/boost/" (get boost "id"))}
-   (into [:div.boost-card] (boost-detail-rows boost))])
+  ;; Links cannot nest, so a card is a box of links: its rows open the first
+  ;; leg, and each leg line opens its own record.
+  [:div.boost-card-link
+   [:div.boost-card
+    (into [:a.boost-card-main {:href (str "/boost/" (get boost "id"))}]
+          (boost-detail-rows boost))
+    (boost-legs (or (seq (::legs boost)) [boost]))]])
 
 (defn homepage-head []
   (html/html
@@ -575,13 +618,137 @@
       [:script (html/raw npub-resolve-js)]])))
 
 
-(defn homepage [storage]
+;; ~~~~~~~~~~~~~~~~~~~ Homepage cache ~~~~~~~~~~~~~~~~~~~
+(def homepage-ttl-ms
+  "How long a rendered homepage is served before it is rendered again. POST
+   /boost clears the cache at once, so this only bounds how long a write that
+   did not come through this process -- a hand edit on the volume, another
+   writer to the bucket -- takes to show."
+  60000)
+
+(defn page-cache
+  "Rendered pages, each kept for `ttl-ms`. Built by `serve`, outside the
+   handler factory: in DEV that factory runs on every request, and a cache
+   built inside it would never be hit."
+  [ttl-ms]
+  {:ttl-ms ttl-ms :pages (atom {})})
+
+(defn invalidate-pages! [{:keys [pages]}]
+  (reset! pages {}))
+
+(defn cached-page
+  "The page cached under `k`, rendered by `render` when there is none or it
+   is older than the cache's ttl.
+
+   The homepage reads and parses every stored boost, and a crawler burst of
+   those renders, all at once, was the web app's memory peak -- one that grew
+   with the boost count. Concurrent misses therefore share one render: the
+   entry is a delay, installed before anything is read, so a burst arriving on
+   an empty cache waits on a single read of storage. Installing first is also
+   what makes invalidation safe: an entry that exists when the cache is
+   cleared is dropped with it, and one installed after reads after the write.
+
+   A render that throws is dropped rather than kept, so a storage error is
+   retried by the next request instead of being served until the ttl runs out."
+  [{:keys [ttl-ms pages]} k render]
+  (let [now (System/currentTimeMillis)
+        entry (-> (swap! pages
+                         (fn [m]
+                           (let [e (get m k)]
+                             (if (and e (< (- now (long (:at e))) (long ttl-ms)))
+                               m
+                               (assoc m k {:at now :page (delay (render))})))))
+                  (get k))]
+    (try
+      @(:page entry)
+      (catch Exception e
+        (swap! pages #(if (identical? entry (get % k)) (dissoc % k) %))
+        (throw e)))))
+
+(defn homepage-sort
+  "The `sort` parameter as one of the four orders the page offers. The page is
+   cached per order, so anything else -- a typo, a repeated parameter, a
+   crawler's garbage -- must fold into the default rather than become a cache
+   entry of its own."
+  [param]
+  (get #{"date" "amount" "podcast" "from"} param "date"))
+
+(def leg-window-ms
+  "How long after a boost's first leg another leg may still join its card.
+   On 2026-09-26 the slowest of tardbox's 699 split boosts landed its last leg
+   54 minutes after its first (median 14 s, 95th percentile 67 s). The bound
+   exists because a group id is not proof of anything: the bot files a keysend
+   under whatever `uuid` its payer wrote, so a few sats can claim any group,
+   and a leg claiming an older boost would otherwise be listed under it."
+  (* 60 60 1000))
+
+(defn- leg-time
+  "When the server minted this record's id, in epoch ms, or nil if the id is
+   not a ULID. The id is the one field no app writes, so it dates a leg."
+  [b]
+  (let [id (get b "id")]
+    (when (and (string? id) (= 26 (count id)))
+      (try (ulid/ulid->timestamp id) (catch Exception _ nil)))))
+
+(defn one-card-per-boost
+  "`boosts` with one card per split boost: the first leg, carrying every leg
+   in order under `::legs` when there is more than one.
+
+   BoostBox stores a record per payment leg, and the legs of one boost share a
+   `group`: a boost split five ways over LNURL is five records, and drawing a
+   card for each counted it five times -- on 2026-09-26 the homepage showed
+   2,983 cards for 1,463 boosts, and every count and section total with them.
+
+   The card is the first leg exactly as stored, never a merge: each leg is
+   written by whoever paid, so letting a later one fill in a field would let
+   any payer who learns a group id write onto someone else's card. The legs
+   are listed, not merged, and only those within `leg-window-ms` of the first.
+   A record with no group, a blank one, or an id that is not a ULID is its
+   own boost, and so is a leg outside the window. Order is kept."
+  [boosts]
+  (let [group-of (fn [b] (let [g (get b "group")]
+                           (when (and (string? g) (not (str/blank? g)) (leg-time b)) g)))
+        first-leg (reduce (fn [m b]
+                            (if-let [g (group-of b)]
+                              (update m g #(if (and % (neg? (compare (get % "id") (get b "id"))))
+                                             %
+                                             b))
+                              m))
+                          {}
+                          boosts)
+        joins? (fn [b] (when-let [g (group-of b)]
+                         (let [f (first-leg g)]
+                           (and (not (identical? b f))
+                                (<= (- (leg-time b) (leg-time f)) leg-window-ms)))))
+        more-legs (group-by group-of (filter joins? boosts))]
+    (keep (fn [b]
+            (let [g (group-of b)]
+              (cond
+                (and g (identical? b (first-leg g)))
+                (if-let [more (seq (more-legs g))]
+                  (assoc b ::legs (vec (sort-by #(get % "id") (cons b more))))
+                  b)
+                (joins? b) nil
+                :else b)))
+          boosts)))
+
+(defn render-homepage ^bytes [boosts sort-param]
+  (.getBytes (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts sort-param) "</html>")
+             "UTF-8"))
+
+(defn homepage [storage pages]
   (fn [request]
-    (let [boosts (try (.list-all storage) (catch Exception _ []))
-          sort-param (get (:query-params request) "sort" "date")]
+    (let [sort-param (homepage-sort (get (:query-params request) "sort"))
+          ^bytes page (try
+                        (cached-page pages sort-param
+                                     #(render-homepage (one-card-per-boost (.list-all storage))
+                                                       sort-param))
+                        ;; The empty state, as before, but never cached.
+                        (catch Exception _ (render-homepage [] sort-param)))]
       {:status 200
-       :headers {"content-type" "text/html; charset=utf-8"}
-       :body (str "<!DOCTYPE html><html>" (homepage-head) (homepage-body boosts sort-param) "</html>")})))
+       :headers {"content-type" "text/html; charset=utf-8"
+                 "content-length" (str (alength page))}
+       :body (java.io.ByteArrayInputStream. page)})))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Boost Schemas ~~~~~~~~~~~~~~~~~~~
 
@@ -597,7 +764,7 @@
    #_[:id {:optional true} :string]
    ;; provided by boost client
    [:action {:decode/json str/lower-case
-             :decode/string str/lower-case} [:enum "boost" "stream"]]
+             :decode/string str/lower-case} [:enum "boost" "stream" "auto"]]
    [:split {:json-schema/default 1.0} [:double {:min 0.0}]]
    [:value_msat {:json-schema/default 2222000} [:int {:min 1}]]
    [:value_msat_total {:json-schema/default 2222000} [:int {:min 1}]]
@@ -754,7 +921,7 @@
       (str "rss::payment::" action " " url separator new-message))
     (str "rss::payment::" action " " url)))
 
-(defn add-boost [cfg storage]
+(defn add-boost [cfg storage pages]
   (fn [{{body-params :body} :parameters :as request}]
     (let [id (gen-ulid)
           url (str (:base-url cfg) "/boost/" id)
@@ -769,7 +936,10 @@
         (catch Exception e
           {:status 500
            ::exception e
-           :body {:error "error during boost storage"}})))))
+           :body {:error "error during boost storage"}})
+        ;; Even a store that threw may have written the boost.
+        (finally
+          (invalidate-pages! pages))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ GET /boosts ~~~~~~~~~~~~~~~~~~~
 (defn list-boosts [cfg storage]
@@ -800,7 +970,7 @@
       (:remote-addr request)))
 
 (defn boost-banner
-  "The picture a boost note carries: GET /og/boost.png?art=&title=&ep=&sats=
+  "The picture a boost note carries: GET /og/boost.png?art=&title=&ep=&sats=&by=
 
    THIS URL IS A PERMANENT PUBLIC CONTRACT. Every boost note the bot publishes
    writes it into a signed kind:1, which cannot be edited, so renaming the path
@@ -810,7 +980,9 @@
 
    The parameter names are boostmebitch's, deliberately: the two routes are
    then interchangeable, and a note published by either app renders the same
-   way."
+   way. `by` is ours alone: the name of the account that signed the note, in
+   place of this server's wordmark, for a bot publishing under a key of its
+   own."
   [cfg]
   (fn [request]
     (if-not (banner/allow? (client-address request))
@@ -825,7 +997,8 @@
                            "boostbox")
               png (banner/banner-png
                    {:title (get q "title") :ep (get q "ep") :sats (get q "sats")
-                    :art (get q "art") :art2 (get q "art2") :art3 (get q "art3")}
+                    :art (get q "art") :art2 (get q "art2") :art3 (get q "art3")
+                    :by (get q "by")}
                    wordmark)]
           {:status 200
            :headers {"content-type" "image/png"
@@ -851,8 +1024,8 @@
                "cache-control" "public, max-age=31536000, immutable"}
      :body (java.io.ByteArrayInputStream. bytes)}))
 
-(defn routes [cfg storage]
-  [["/" {:get {:no-doc true :handler (homepage storage)}}]
+(defn routes [cfg storage pages]
+  [["/" {:get {:no-doc true :handler (homepage storage pages)}}]
    ["/og/boost.png" {:get {:no-doc true :handler (boost-banner cfg)}}]
    [(:path images/v4vbox) {:get {:no-doc true :handler (asset-handler images/v4vbox)}}]
    [(:path images/favicon) {:get {:no-doc true :handler (asset-handler images/favicon)}}]
@@ -876,7 +1049,7 @@
                      :summary "List all boosts"
                      :swagger {:security [{"auth" []}]}
                      :responses {200 {:body [:vector :map]}}}}]
-   ["/boost" {:post {:handler (add-boost cfg storage)
+   ["/boost" {:post {:handler (add-boost cfg storage pages)
                      :tags #{"boosts"}
                      :middleware [(auth-middleware (:allowed-keys cfg))]
                      :summary "Store boost metadata"
@@ -930,10 +1103,10 @@
           {:status 413 :body {:error "payload too large"}}
           (handler request))))))
 
-(defn http-handler [cfg storage]
+(defn http-handler [cfg storage pages]
   (ring/ring-handler
    (ring/router
-    (routes cfg storage)
+    (routes cfg storage pages)
     {:data {:muuntaja muuntaja/instance
             :coercion (reitit.coercion.malli/create
                        {:error-keys #{:in :humanized}
@@ -1013,7 +1186,8 @@
   [cfg storage]
   (let [env (:env cfg)
         dev (= env "DEV")
-        handler-factory (fn [] (runner (http-handler cfg storage)))
+        pages (page-cache homepage-ttl-ms)
+        handler-factory (fn [] (runner (http-handler cfg storage pages)))
         handler (if dev (ring/reloading-ring-handler handler-factory) (handler-factory))]
     (httpd/start-server
      handler

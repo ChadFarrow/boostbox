@@ -115,6 +115,9 @@
      :sender-id (->str (get* m "sender_id"))
      :sender-npub (->str (get* m "sender_npub"))
      :recipient-name (clean (get* m "name" "recipient_name") max-name-length)
+     ;; BoostBox's own spelling; Fountain's boost link sends this and no name,
+     ;; so the name is looked up in the feed -- see nostrbot/with-feed-recipient
+     :recipient-address (clean (get* m "recipient_address") max-name-length)
      ;; blip-10 names these "podcast" and "episode", but senders that model
      ;; their payload on BoostBox's own schema (BoostMeBitch, for one) send
      ;; "feed_title" and "item_title" instead. Accept both, exactly as the guid
@@ -136,6 +139,10 @@
      :item-guid (->str (get* m "episode_guid" "item_guid"))
      :remote-feed-guid (->str (get* m "remote_feed_guid"))
      :remote-item-guid (->str (get* m "remote_item_guid"))
+     ;; One id shared by every leg of a split boost. blip-10 calls it "uuid";
+     ;; BoostBox stores it as "group", and the homepage draws one card per
+     ;; group -- a leg stored without it is a boost of its own there.
+     :group (clean (get* m "uuid" "group") max-name-length)
      ;; "ts" is seconds into the episode, NOT a wall clock. "time" is a
      ;; human "HH:MM:SS" of the same thing. Neither is when the boost happened.
      ;; BoostBox's own schema calls the same thing "position".
@@ -146,10 +153,84 @@
      :value-msat-total (->int (get* m "value_msat_total"))}))
 
 (defn boost?
-  "Only manual boosts are worth republishing. Per-minute streaming sats would
-   flood the relays with near-empty notes."
+  "Only manual boosts are worth republishing by default. Per-minute streaming
+   sats would flood the relays with near-empty notes.
+
+   `actions` widens that for a bot that asks: v4vmusic sends \"auto\" for the
+   automatic boost it makes on each song, and on the MSP 2.0 split those are
+   most of what arrives."
+  ([b] (boost? b #{"boost"}))
+  ([b actions] (contains? actions (:action b))))
+
+(defn recipient-match?
+  "Whether this boostagram was addressed to one of `names`, or `names` is empty.
+
+   On a wallet shared with other splits the recipient name is the only thing
+   saying which split a payment was -- the feed cannot, since the MSP 2.0
+   support split rides on feeds hosted anywhere. Trimmed and case-folded, which
+   is exactly how MSP-2.0's own `isMspSplit` reads it: the paying app copies
+   the name out of the feed's value block, and a stray space must not drop a
+   real split. `names` is expected already lower-cased."
+  [b names]
+  (or (empty? names)
+      (contains? names (some-> (:recipient-name b) str/trim str/lower-case))))
+
+(defn feed-listed?
+  "Whether this boostagram names one of `guids` as its feed or its remote feed,
+   or one of `publisher-guids` is -- or `guids` is empty.
+
+   The list is the albums and artists who agreed to have their boosts
+   announced, so it errs towards silence: a boost naming no feed guid matches
+   nothing. The remote feed counts because a boost sent from a music show
+   carries the show's guid as its feed and the song's album only as the remote
+   one. `publisher-guids` are the artists those feeds name in their own
+   `<podcast:publisher>`, read by the caller -- never a guid the payer wrote.
+   `guids` is expected already lower-cased."
+  ([b guids] (feed-listed? b guids nil))
+  ([b guids publisher-guids]
+   (or (empty? guids)
+       (boolean (some #(contains? guids (some-> % str str/trim str/lower-case))
+                      (concat [(:feed-guid b) (:remote-feed-guid b)] publisher-guids))))))
+
+(defn generator-listed?
+  "Whether one of `generators` wrote one of the boost's feeds, or `generators`
+   is empty. `feed-generators` are the `<generator>`s the caller read from the
+   boost's feed and its remote feed, so a music show's boost counts when the
+   song's album was built with MSP.
+
+   It exists because the recipient name cannot tell an artist's MSP split from
+   a show that adds an `MSP 2.0` split only to support MSP: the album's own
+   generator can. Whole-name equality, trimmed and case-folded like the
+   recipient name, never a prefix. A feed that could not be read names no
+   generator, so the rule errs towards silence. `generators` is expected
+   already lower-cased."
+  [generators feed-generators]
+  (or (empty? generators)
+      (boolean (some #(contains? generators (some-> % str str/trim str/lower-case))
+                     feed-generators))))
+
+(defn boost-key
+  "What the payments of one boost have in common and two boosts do not, as a
+   hex digest -- or nil when the boostagram does not say who sent it.
+
+   An app sends every split of a boost the same metadata, apart from what the
+   split is: its recipient name, its share (`value_msat`) and, from an app that
+   pays in more than one pass, its uuid (`group`). v4vmusic.com pays the bot a
+   split of its own on every boost, and on an episode whose feed also lists the
+   bot it pays it again, as the feed's split, under a second uuid -- so `group`
+   cannot say those two payments are one boost (2026-10-27, 2026-11-07).
+
+   No sender id, no key: anonymous boosts of one amount on one episode read
+   alike, and two listeners' boosts must never be taken for one."
   [b]
-  (= "boost" (:action b)))
+  (when-let [sender (some-> (:sender-id b) str/trim not-empty)]
+    (->> [(:app-name b) sender (:sender-name b) (:action b)
+          (:feed-guid b) (:item-guid b) (:remote-feed-guid b) (:remote-item-guid b)
+          (:position b) (:value-msat-total b) (:message b)]
+         pr-str
+         (#(.getBytes ^String % StandardCharsets/UTF_8))
+         nostr/sha256
+         nostr/bytes->hex)))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Boost links ~~~~~~~~~~~~~~~~~~~
 ;;
@@ -279,7 +360,8 @@
            "item_guid" (:item-guid b)
            "item_title" (:episode b)
            "remote_feed_guid" (:remote-feed-guid b)
-           "remote_item_guid" (:remote-item-guid b)})))
+           "remote_item_guid" (:remote-item-guid b)
+           "group" (:group b)})))
 
 ;; ~~~~~~~~~~~~~~~~~~~ NIP-73 tags ~~~~~~~~~~~~~~~~~~~
 
@@ -330,12 +412,19 @@
    so it is emitted once per kind rather than once per id -- a second identical
    `k` says nothing the first did not. Ids are de-duplicated because apps that
    send a remote item routinely repeat the host feed's guid in both fields, and
-   the same `i` tag twice is noise a relay has to store forever."
-  [b]
-  (->> nip73-id-fields
-       (keep (fn [{:keys [field kind valid? norm]}]
-               (let [v (get b field)]
-                 (when (valid? v) [kind (norm v)]))))
+   the same `i` tag twice is noise a relay has to store forever.
+
+   `publisher-guids` come last: they are not in the boostagram but in the feeds
+   it names, read by the bot -- for music, the artist every album shares."
+  [b publisher-guids]
+  (->> (concat
+        (keep (fn [{:keys [field kind valid? norm]}]
+                (let [v (get b field)]
+                  (when (valid? v) [kind (norm v)])))
+              nip73-id-fields)
+        (for [g publisher-guids
+              :when (valid-feed-guid? g)]
+          ["podcast:publisher:guid" (str/lower-case (str/trim g))]))
        (distinct)
        (reduce (fn [[tags seen] [kind v]]
                  [(cond-> (conj tags ["i" (str kind ":" v)])
@@ -358,10 +447,10 @@
    attribute the bot's own note to software that never signed it. `app` is the
    app that SENT the boost, the convention boostmebitch uses on its kind:3369
    receipts. It is payer-written text, so it is a claim, not a fact."
-  [b {:keys [boost-url npubs banner-url client-name total-msat]}]
+  [b {:keys [boost-url npubs banner-url client-name total-msat publisher-guids]}]
   (let [banner-item (when banner-url (str "url " banner-url))
         sender (sender-npub b)]
-    (cond-> (nip73-id-tags b)
+    (cond-> (nip73-id-tags b publisher-guids)
       boost-url
       (conj ["r" boost-url])
 
@@ -441,18 +530,26 @@
    parameters; never repurpose one.
 
    Returns nil with no base URL, so a bot with nowhere to serve a picture from
-   publishes a note with no picture rather than a broken link."
-  [base-url b art total-msat]
-  (when-not (str/blank? (str base-url))
-    (let [enc #(java.net.URLEncoder/encode (str %) "UTF-8")
-          sats (quot (long (or total-msat 0)) 1000)
-          params (cond-> []
-                   art (conj (str "art=" (enc art)))
-                   (:podcast b) (conj (str "title=" (enc (:podcast b))))
-                   (:episode b) (conj (str "ep=" (enc (:episode b))))
-                   (pos? sats) (conj (str "sats=" sats)))]
-      (str (str/replace (str base-url) #"/+$" "") "/og/boost.png"
-           (when (seq params) (str "?" (str/join "&" params)))))))
+   publishes a note with no picture rather than a broken link.
+
+   `by` is the signing account's name, for a bot with a key of its own, so the
+   picture and the `client` tag agree. The default name adds nothing -- the
+   server's wordmark already says it -- which keeps the URLs of every bot on
+   the default byte-identical to the ones published before `by` existed."
+  ([base-url b art total-msat] (banner-url base-url b art total-msat nil))
+  ([base-url b art total-msat by]
+   (when-not (str/blank? (str base-url))
+     (let [enc #(java.net.URLEncoder/encode (str %) "UTF-8")
+           sats (quot (long (or total-msat 0)) 1000)
+           by (when-not (or (str/blank? (str by)) (= by default-client-name)) by)
+           params (cond-> []
+                    art (conj (str "art=" (enc art)))
+                    (:podcast b) (conj (str "title=" (enc (:podcast b))))
+                    (:episode b) (conj (str "ep=" (enc (:episode b))))
+                    (pos? sats) (conj (str "sats=" sats))
+                    by (conj (str "by=" (enc by))))]
+       (str (str/replace (str base-url) #"/+$" "") "/og/boost.png"
+            (when (seq params) (str "?" (str/join "&" params))))))))
 
 (defn ->note-content
   "The human-readable body of the kind:1 note, laid out as boostmebitch lays

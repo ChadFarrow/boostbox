@@ -106,6 +106,70 @@
                           (apply str (repeat 700 "a")) ".png\"/></channel></rss>")
                      nil))))))
 
+(deftest the-publisher-feed-names-the-artist
+  ;; From a real MSP album: Matt Finlay's "Various & Assorted" names his
+  ;; publisher feed, which is the one guid all of his albums share.
+  (let [album (fn [publisher]
+                (str "<rss><channel><title>Various &amp; Assorted</title>"
+                     "<podcast:guid>fe17f4f6-074f-4b2c-a450-611faccfaea2</podcast:guid>"
+                     publisher
+                     "<item><guid>s1</guid></item></channel></rss>"))
+        artist "1a197bac-95ae-53bd-bf6d-40ba8b551088"]
+    (is (= artist (:publisher-guid
+                   (feed/read-feed (album (str "<podcast:publisher>"
+                                               "<podcast:remoteItem medium=\"publisher\" feedGuid=\""
+                                               (str/upper-case artist) "\" feedUrl=\"https://x/a.xml\" />"
+                                               "</podcast:publisher>"))
+                                   nil)))
+        "lower-cased like every podcast:guid, and enough on its own for a result")
+    (testing "only a publisher, only inside podcast:publisher, only its own attribute"
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:publisher><podcast:remoteItem medium=\"music\" feedGuid=\""
+                                             artist "\"/></podcast:publisher>"))
+                                 nil))))
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:podroll><podcast:remoteItem medium=\"publisher\" feedGuid=\""
+                                             artist "\"/></podcast:podroll>"))
+                                 nil))))
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:publisher><podcast:remoteItem medium=\"publisher\" x-feedGuid=\""
+                                             artist "\"/></podcast:publisher>"))
+                                 nil)))))
+    (testing "a guid that is not a podcast:guid names nobody"
+      (is (nil? (:publisher-guid
+                 (feed/read-feed (album (str "<podcast:publisher><podcast:remoteItem medium=\"publisher\" "
+                                             "feedGuid=\"matt-finlay\"/></podcast:publisher>"))
+                                 nil)))))))
+
+(deftest the-generator-says-what-built-the-feed
+  ;; From a real MSP album: Longy's "Songs From The Seaside", on headstarts.uk.
+  (let [msp "MSP 2.0 - Music Side Project Studio"
+        channel (fn [inner] (str "<rss><channel><title>Songs From The Seaside</title>"
+                                 inner "<item><guid>s1</guid></item></channel></rss>"))]
+    (is (= msp (:generator (feed/read-feed (channel (str "<generator>\n  " msp "  \n</generator>")) nil)))
+        "trimmed, and enough on its own for a result")
+    (testing "entities and CDATA are decoded"
+      (is (= "Podhome (https://www.podhome.fm)"
+             (:generator (feed/read-feed (channel "<generator><![CDATA[Podhome (https://www.podhome.fm)]]></generator>") nil))))
+      (is (= "Sovereign Feeds & Co"
+             (:generator (feed/read-feed (channel "<generator>Sovereign Feeds &amp; Co</generator>") nil)))))
+    (testing "only the channel's own, live and readable"
+      (is (nil? (:generator (feed/read-feed (str "<rss><channel><title>x</title><item><guid>s1</guid>"
+                                                 "<generator>" msp "</generator></item></channel></rss>")
+                                            nil)))
+          "an item's generator is not the feed's")
+      (is (nil? (:generator (feed/read-feed (channel (str "<!-- <generator>" msp "</generator> -->")) nil))))
+      (is (nil? (:generator (feed/read-feed (channel "<generator>   </generator>") nil))))
+      (is (nil? (:generator (feed/read-feed (channel "<generator/>") nil)))))
+    (testing "too long is refused, never cut down to something that matches"
+      (is (nil? (:generator (feed/read-feed (channel (str "<generator>" msp (apply str (repeat 300 "x"))
+                                                          "</generator>"))
+                                            nil)))))
+    (testing "control characters are stripped"
+      (is (= msp (:generator (feed/read-feed (channel (str "<generator>MSP 2.0 -\u0007 Music Side Project Studio"
+                                                           "</generator>"))
+                                             nil)))))))
+
 (deftest a-feed-that-says-nothing-answers-nil
   (is (nil? (feed/read-feed "<rss></rss>" nil)))
   (is (nil? (feed/read-feed "" nil)))
@@ -122,7 +186,12 @@
            ["200k unclosed <podcast:txt> opens"
             (str "<rss>" (apply str (repeat 200000 "<podcast:txt purpose=\"nostr\">")) "</rss>")]
            ["200k unclosed <item> opens"
-            (str "<rss><channel>" (apply str (repeat 200000 "<item>")) "</channel></rss>")]]]
+            (str "<rss><channel>" (apply str (repeat 200000 "<item>")) "</channel></rss>")]
+           ["200k unclosed time splits in a value block"
+            (str "<rss><channel><podcast:value>"
+                 (apply str (repeat 200000 "<podcast:valueTimeSplit>")) "</channel></rss>")]
+           ["200k unclosed <generator> opens"
+            (str "<rss><channel>" (apply str (repeat 200000 "<generator>")) "</channel></rss>")]]]
     (let [t0 (System/currentTimeMillis)
           _ (feed/read-feed doc "g1")
           ms (- (System/currentTimeMillis) t0)]
@@ -140,3 +209,74 @@
         ms (- (System/currentTimeMillis) t0)]
     (is (= "https://cdn/100.png" (:art r)))
     (is (< ms 5000) (str "5000 items took " ms " ms"))))
+
+;; ~~~~~~~~~~~~~~~~~~~ Value recipients ~~~~~~~~~~~~~~~~~~~
+
+(def split-feed
+  "Songs From The Seaside's shape: the channel's splits, all lightning
+   addresses, and an item that repeats them. A second item has its own block,
+   and a third a time split whose recipients are not the item's."
+  (str "<rss><channel><title>Songs From The Seaside</title>"
+       "<podcast:value type=\"lightning\" method=\"lnaddress\">"
+       "<podcast:valueRecipient name=\"longy\" address=\"longy@fountain.fm\" split=\"78\" type=\"lnaddress\" />"
+       "<podcast:valueRecipient name=\"MSP 2.0\" address=\"chadf@getalby.com\" split=\"1\" type=\"lnaddress\" />"
+       "</podcast:value>"
+       "<item><guid>no-block</guid></item>"
+       "<item><guid isPermaLink=\"false\">31561378-6997-4298-9baf-c1671ae6f42e</guid>"
+       "<podcast:value type=\"lightning\" method=\"lnaddress\">"
+       "<podcast:valueRecipient name=\"longy\" address=\"longy@fountain.fm\" split=\"78\" type=\"lnaddress\" />"
+       "<podcast:valueRecipient name=\"Guest\" address=\"guest@getalby.com\" split=\"21\" type=\"lnaddress\" />"
+       "</podcast:value></item>"
+       "<item><guid>split-item</guid>"
+       "<podcast:value type=\"lightning\" method=\"lnaddress\">"
+       "<podcast:valueRecipient name=\"Host\" address=\"host@getalby.com\" split=\"99\" />"
+       "<podcast:valueTimeSplit startTime=\"60\" duration=\"120\" remotePercentage=\"95\">"
+       "<podcast:valueRecipient name=\"Someone Else\" address=\"chadf@getalby.com\" split=\"1\" />"
+       "</podcast:valueTimeSplit>"
+       "<podcast:valueRecipient name=\"MSP 2.0\" address=\"chadf@getalby.com\" split=\"1\" />"
+       "</podcast:value></item>"
+       "</channel></rss>"))
+
+(deftest an-item-without-its-own-splits-pays-the-channels
+  (is (= [{:name "longy" :address "longy@fountain.fm"}
+          {:name "MSP 2.0" :address "chadf@getalby.com"}]
+         (feed/value-recipients split-feed "no-block")))
+  (is (= (feed/value-recipients split-feed "no-block")
+         (feed/value-recipients split-feed "not-in-this-feed"))
+      "an unknown episode reads the channel's, as a player would pay it"))
+
+(deftest an-items-own-splits-replace-the-channels
+  (let [rs (feed/value-recipients split-feed "31561378-6997-4298-9baf-c1671ae6f42e")]
+    (is (= ["longy" "Guest"] (map :name rs)))
+    (is (nil? (feed/recipient-name rs "chadf@getalby.com"))
+        "the channel's MSP split is not this item's")))
+
+(deftest a-time-split-is-not-the-items-own
+  (let [rs (feed/value-recipients split-feed "split-item")]
+    (is (= ["Host" "MSP 2.0"] (map :name rs))
+        "and the recipient after the time split is still read")
+    (is (= "MSP 2.0" (feed/recipient-name rs "chadf@getalby.com")))))
+
+(deftest a-recipient-is-named-only-when-its-address-is-unambiguous
+  (let [rs [{:name "MSP 2.0" :address "chadf@getalby.com"}
+            {:name "ChadF" :address "me@getalby.com"}
+            {:name "ChadF" :address "me@getalby.com"}
+            {:name "One" :address "two@getalby.com"}
+            {:name "Two" :address "two@getalby.com"}
+            {:name nil :address "nameless@getalby.com"}]]
+    (is (= "MSP 2.0" (feed/recipient-name rs " ChadF@GetAlby.com ")) "addresses fold case")
+    (is (= "ChadF" (feed/recipient-name rs "me@getalby.com")) "a repeated name is one name")
+    (is (nil? (feed/recipient-name rs "two@getalby.com")) "two names could be either split")
+    (is (nil? (feed/recipient-name rs "nameless@getalby.com")))
+    (is (nil? (feed/recipient-name rs "absent@getalby.com")))
+    (is (nil? (feed/recipient-name rs nil)))))
+
+(deftest read-feed-carries-the-splits
+  (is (= "MSP 2.0" (-> (feed/read-feed split-feed "no-block")
+                       :recipients
+                       (feed/recipient-name "chadf@getalby.com"))))
+  (testing "a feed with only a value block is still a feed worth answering for"
+    (is (some? (feed/read-feed (str "<rss><channel><podcast:value>"
+                                    "<podcast:valueRecipient name=\"A\" address=\"a@b.c\"/>"
+                                    "</podcast:value></channel></rss>")
+                               nil)))))
