@@ -153,7 +153,15 @@
     :label "AntennaPod"
     :show (fn [{:keys [feed-url]}]
             (when feed-url
-              (str "https://antennapod.org/deeplink/subscribe?url=" (enc feed-url))))}])
+              (str "https://antennapod.org/deeplink/subscribe?url=" (enc feed-url))))}
+
+   ;; Not in podcast-platform-links. Its share links are internal short ids
+   ;; (/s/205) that no boost carries, so there is no deep link to build: the
+   ;; front page is the most we can point at. Swap in a guid route if the site
+   ;; ever grows one. It sends app_name "v4vmusic-com".
+   {:names ["v4vmusiccom" "v4vmusic"]
+    :label "V4V Music"
+    :show (fn [_] "https://v4vmusic.com")}])
 
 (def ^:private by-name
   (into {} (for [p platforms, n (:names p)] [n p])))

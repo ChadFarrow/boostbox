@@ -290,20 +290,36 @@
    API closes that on the very first boost. An address the API returns is
    memoized like any other, so a show is looked up once rather than per boost.
 
-   Returns {:state :boostagram :artwork}. `:artwork` is the API's own cover,
-   used only if the feed read finds none -- the feed is the better source,
-   since it can carry the episode's art rather than the show's."
+   Returns {:state :boostagram :artwork :pi-asked?}. `:artwork` is the API's
+   own cover, used only if the feed read finds none -- the feed is the better
+   source, since it can carry the episode's art rather than the show's.
+   `:pi-asked?` says the API has already answered for this boost, so
+   `build-note` does not ask it a second time (see `pi-cover`)."
   [ctx state b]
   (let [b' (with-known-feed state b)]
     (if (or (some-> (:url b') str str/trim not-empty)
             (not (pi/configured? ctx))
             (nil? (:feed-guid b)))
-      {:state state :boostagram b' :artwork nil}
+      {:state state :boostagram b' :artwork nil :pi-asked? false}
       (if-let [{:keys [url artwork]} (pi/feed-by-guid ctx (:feed-guid b))]
         (let [b'' (cond-> b' url (assoc :url url))]
           (u/log ::feed-address-resolved :feed-guid (:feed-guid b) :found-url (some? url))
-          {:state (remember-feed state b'') :boostagram b'' :artwork artwork})
-        {:state state :boostagram b' :artwork nil}))))
+          {:state (remember-feed state b'') :boostagram b'' :artwork artwork :pi-asked? true})
+        {:state state :boostagram b' :artwork nil :pi-asked? true}))))
+
+(defn- pi-cover
+  "The Podcast Index's cover for a show whose feed read gave us none.
+
+   `resolve-feed` only asks the API when a boost arrives with no feed address,
+   so a boost that carried one -- from an app sending an address that turned
+   out unreadable, or a feed with no image at all -- would otherwise publish
+   a banner with no picture while the API knew the show's cover all along.
+   Nil with no credentials or no feed guid, as everything here is."
+  [ctx b]
+  (when (and (pi/configured? ctx) (:feed-guid b))
+    (let [art (:artwork (pi/feed-by-guid ctx (:feed-guid b)))]
+      (u/log ::cover-from-podcast-index :feed-guid (:feed-guid b) :found (some? art))
+      art)))
 
 (def duplicate-window-sec
   "How far apart two payments with one bg/boost-key may settle and still be one
@@ -622,7 +638,9 @@
 
    `fallback-art` is the Podcast Index's cover for the show, used only when the
    feed read finds none. The feed is preferred because it can carry the art of
-   the episode that was actually boosted; the API only knows the show.
+   the episode that was actually boosted; the API only knows the show. When
+   the feed finds none and the API has not been asked yet (`pi-asked?`), it is
+   asked here: a feed address the app sent is no guarantee of a cover.
 
    The note is dated when the boost was paid (`settled-at`), not when it was
    published. For a live boost those are a minute apart; for a backfill they
@@ -630,14 +648,17 @@
    followers' feeds in one burst. Never later than now: a wallet clock running
    ahead would otherwise date a note in the future, which relays refuse."
   [{:keys [seckey client-name] :as ctx} boostagram
-   {:keys [boost-url received-msat fallback-art settled-at feed-ctx remote-ctx publisher-guids]}]
+   {:keys [boost-url received-msat fallback-art settled-at feed-ctx remote-ctx publisher-guids pi-asked?]}]
   (let [now (quot (System/currentTimeMillis) 1000)
         ctxt (or feed-ctx (feed-context ctx boostagram))
         publisher-guids (or publisher-guids (keep :publisher-guid [ctxt remote-ctx]))
         total (bg/note-total-msat boostagram received-msat)
         ;; the album that was boosted before the show it was played in
-        banner (bg/banner-url (:boostbox-url ctx) boostagram
-                              (or (:art remote-ctx) (:art ctxt) fallback-art) total client-name)]
+        art (or (:art remote-ctx)
+                (:art ctxt)
+                fallback-art
+                (when-not pi-asked? (pi-cover ctx boostagram)))
+        banner (bg/banner-url (:boostbox-url ctx) boostagram art total client-name)]
     (nostr/sign-event seckey
                       {:kind 1
                        :created-at (if settled-at (min (long settled-at) now) now)
@@ -730,7 +751,7 @@
   (let [;; one app's boost teaches the next one where this feed lives, and the
         ;; Podcast Index answers for a show no app has told us about
         state (remember-feed state boostagram)
-        {state :state boostagram :boostagram pi-artwork :artwork}
+        {state :state boostagram :boostagram pi-artwork :artwork pi-asked? :pi-asked?}
         (resolve-feed ctx state boostagram)
         seen (get (seen-index state) payment-hash)
         k (bg/boost-key boostagram)
@@ -815,6 +836,7 @@
                                    :received-msat received-msat
                                    :settled-at settled-at
                                    :fallback-art pi-artwork
+                                   :pi-asked? pi-asked?
                                    :feed-ctx host
                                    :remote-ctx remote
                                    :publisher-guids publishers})]
