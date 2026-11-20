@@ -1,6 +1,7 @@
 (ns boostbox.nostrbot
   "The boost bot: watch an Alby Hub sub-wallet over NWC, store each incoming
-   boostagram in BoostBox, and republish it to Nostr with NIP-73 tags.
+   boostagram in BoostBox, and announce it -- to Nostr with NIP-73 tags, and to
+   Mastodon when one is configured.
 
    Runs as its own process from the same uberjar as the web app:
 
@@ -23,6 +24,8 @@
             [boostbox.safefetch :as sf]
             [boostbox.podcastindex :as pi]
             [boostbox.feed :as feed]
+            [boostbox.banner :as banner]
+            [boostbox.mastodon :as mastodon]
             [boostbox.relay :as relay]
             [boostbox.zaps :as zaps]))
 
@@ -143,6 +146,16 @@
       :rewind-to (some-> (bb/get-env "BBN_REWIND_TO" nil) str/trim not-empty Long/parseLong)
       :dry-run? (truthy? (bb/get-env "BBN_DRY_RUN" "false"))
       :state-key (bb/get-env "BBN_STATE_KEY" "nostrbot/state.json")
+      ;; Mastodon: the second destination, and off entirely without both an
+      ;; instance and a token. See boostbox.mastodon.
+      :mastodon-url (some-> (bb/get-env "BBN_MASTODON_URL" nil)
+                            (str/replace #"/+$" ""))
+      :mastodon-token (bb/get-env "BBN_MASTODON_TOKEN" nil)
+      :mastodon-visibility (bb/get-env "BBN_MASTODON_VISIBILITY" "public")
+      :mastodon-max-chars (Long/parseLong
+                           (bb/get-env "BBN_MASTODON_MAX_CHARS"
+                                       (str bg/default-mastodon-max-chars)))
+      :mastodon-timeout-ms (Long/parseLong (bb/get-env "BBN_MASTODON_TIMEOUT_MS" "15000"))
       :publish-profile? (truthy? (bb/get-env "BBN_PUBLISH_PROFILE" "false"))
       :profile {:name (bb/get-env "BBN_PROFILE_NAME" nil)
                 :display_name (bb/get-env "BBN_PROFILE_NAME" nil)
@@ -583,7 +596,8 @@
                nil))))))))
 
 (defn feed-context
-  "The show's npubs and cover art, read from the feed the boostagram names.
+  "The show's npubs, fediverse account and cover art, read from the feed the
+   boostagram names.
 
    Two things about this are deliberate.
 
@@ -630,6 +644,17 @@
        (take feed/max-feed-npubs)
        vec))
 
+(defn- note-art
+  "The cover a boost is announced with: the album that was boosted before the
+   show it was played in, then the show, then the Podcast Index's cover the
+   caller already has (`fallback-art`), and only then a Podcast Index lookup,
+   when the caller has not asked it yet (`pi-asked?`)."
+  [ctx boostagram {:keys [feed-ctx remote-ctx fallback-art pi-asked?]}]
+  (or (:art remote-ctx)
+      (:art feed-ctx)
+      fallback-art
+      (when-not pi-asked? (pi-cover ctx boostagram))))
+
 (defn build-note
   "The signed kind:1 event for a boost.
 
@@ -646,18 +671,24 @@
    published. For a live boost those are a minute apart; for a backfill they
    are months apart, and stamping months of boosts \"now\" lands all of them in
    followers' feeds in one burst. Never later than now: a wallet clock running
-   ahead would otherwise date a note in the future, which relays refuse."
+   ahead would otherwise date a note in the future, which relays refuse.
+
+   `feed-ctx` is feed-context's answer, read once by the caller and shared with
+   the Mastodon post, so one boost costs one feed read however many places it
+   is announced. `art`, when given, is note-art's answer, worked out once by the
+   caller for the same reason and so the post's picture is the note's."
   [{:keys [seckey client-name] :as ctx} boostagram
-   {:keys [boost-url received-msat fallback-art settled-at feed-ctx remote-ctx publisher-guids pi-asked?]}]
+   {:keys [boost-url received-msat fallback-art settled-at feed-ctx remote-ctx publisher-guids pi-asked? art]
+    :as opts}]
   (let [now (quot (System/currentTimeMillis) 1000)
         ctxt (or feed-ctx (feed-context ctx boostagram))
         publisher-guids (or publisher-guids (keep :publisher-guid [ctxt remote-ctx]))
         total (bg/note-total-msat boostagram received-msat)
-        ;; the album that was boosted before the show it was played in
-        art (or (:art remote-ctx)
-                (:art ctxt)
-                fallback-art
-                (when-not pi-asked? (pi-cover ctx boostagram)))
+        art (if (contains? opts :art)
+              art
+              (note-art ctx boostagram {:feed-ctx ctxt :remote-ctx remote-ctx
+                                        :fallback-art fallback-art
+                                        :pi-asked? pi-asked?}))
         banner (bg/banner-url (:boostbox-url ctx) boostagram art total client-name)]
     (nostr/sign-event seckey
                       {:kind 1
@@ -710,6 +741,67 @@
       (let [{:keys [ok? results]} (relay/publish-to-relays! relays event)]
         (u/log ::relay-list-published :accepted ok? :results results)))
     event))
+
+(defn publish-mastodon!
+  "Announce the boost on Mastodon. Answers the status id, or nil.
+
+   Never throws, and the caller does not treat a nil as a reason to retry. That
+   is the deliberate asymmetry between the two destinations: a relay rejection
+   holds the cursor, because Nostr is the announcement of record and a second
+   attempt is free. Mastodon cannot work that way -- holding the cursor to
+   retry a post would stop every later boost being announced anywhere, so a
+   failed post is logged and the boost moves on. At-most-once here, at-least-
+   once there.
+
+   Nothing is retried, but a retry would still be safe: post-status! sends the
+   payment hash as an Idempotency-Key, so a crash between posting and recording
+   the id cannot put the same boost in the timeline twice.
+
+   The banner is drawn in this process rather than fetched from the web app's
+   /og/boost.png. It is the same uberjar and the same function that serves that
+   route, from the same parameters the note's URL is built from, so the picture
+   on the post and the picture the note points at cannot disagree -- and the
+   post keeps its picture even when the web app is unreachable. `art` and
+   `fediverse` are worked out once by publish-boost!, for the note and the post
+   alike."
+  [{:keys [dry-run?] :as ctx} boostagram
+   {:keys [payment-hash received-msat fediverse art]}]
+  (when (mastodon/configured? ctx)
+    (try
+      (let [total (bg/note-total-msat boostagram received-msat)
+            text (bg/->mastodon-content boostagram
+                                        {:received-msat received-msat
+                                         :fediverse fediverse
+                                         :max-chars (:mastodon-max-chars ctx)})]
+        (if dry-run?
+          (do (u/log ::dry-run-mastodon :payment-hash payment-hash :status text)
+              nil)
+          (let [png (try
+                      (banner/banner-png (bg/banner-params boostagram art total
+                                                           (:client-name ctx))
+                                         (or (not-empty (str (:banner-wordmark (:bb-cfg ctx))))
+                                             bg/default-client-name))
+                      (catch Exception e
+                        ;; a picture is worth having, not worth losing the post
+                        (u/log ::banner-render-failed :error (ex-message e))
+                        nil))
+                media (when png
+                        (mastodon/upload-media!
+                         ctx png (bg/banner-alt-text boostagram total)))
+                {:keys [ok? id error]} (mastodon/post-status!
+                                        ctx
+                                        {:text text
+                                         :media-ids (when media [media])
+                                         :idempotency-key payment-hash})]
+            (if ok?
+              (do (u/log ::mastodon-posted :payment-hash payment-hash
+                         :status-id id :media (boolean media))
+                  id)
+              (do (u/log ::mastodon-failed :payment-hash payment-hash :error error)
+                  nil)))))
+      (catch Exception e
+        (u/log ::mastodon-error :payment-hash payment-hash :error (ex-message e))
+        nil))))
 
 (declare first-sighting!)
 
@@ -827,22 +919,34 @@
                                               "boost_id" (:id stored)
                                               "url" (:url stored)}))
                 _ (save-state! (:state-io ctx) state)
-                event (build-note ctx
-                                  (with-spent-total ctx boostagram
-                                    {:received-msat received-msat
-                                     :settled-at settled-at
-                                     :payment-hash payment-hash})
+                ;; worked out once and shared by the note and the Mastodon
+                ;; post, so the two describe the same boost with the same
+                ;; amount and the same picture
+                announced-b (with-spent-total ctx boostagram
+                              {:received-msat received-msat
+                               :settled-at settled-at
+                               :payment-hash payment-hash})
+                art (note-art ctx boostagram {:feed-ctx host :remote-ctx remote
+                                              :fallback-art pi-artwork
+                                              :pi-asked? pi-asked?})
+                mastodon-opts {:payment-hash payment-hash
+                               :received-msat received-msat
+                               :art art
+                               ;; the album's account before the show's, as
+                               ;; with the npubs and the art
+                               :fediverse (or (:fediverse remote) (:fediverse host))}
+                event (build-note ctx announced-b
                                   {:boost-url (:url stored)
                                    :received-msat received-msat
                                    :settled-at settled-at
-                                   :fallback-art pi-artwork
-                                   :pi-asked? pi-asked?
+                                   :art art
                                    :feed-ctx host
                                    :remote-ctx remote
                                    :publisher-guids publishers})]
             (if dry-run?
               (do (u/log ::dry-run-note :boost-url (:url stored)
                          :event (nostr/event->json event))
+                  (publish-mastodon! ctx announced-b mastodon-opts)
                   state)
               (let [{:keys [ok? results]} (relay/publish-to-relays! relays event)]
                 (when-not ok?
@@ -856,12 +960,27 @@
                 ;; recover -- and an unpersisted event_id would make this boost look
                 ;; stored-but-unpublished, so the next poll would mint a second note
                 ;; for it on the relays.
-                (let [state (remember state (keyed {"payment_hash" payment-hash
-                                                    "boost_id" (:id stored)
-                                                    "url" (:url stored)
-                                                    "event_id" (:id event)}))]
-                  (save-state! (:state-io ctx) state)
-                  state)))))))))
+                (let [entry (keyed {"payment_hash" payment-hash
+                                    "boost_id" (:id stored)
+                                    "url" (:url stored)
+                                    "event_id" (:id event)})
+                      state (remember state entry)
+                      _ (save-state! (:state-io ctx) state)
+                      ;; Only after the event_id is saved: a slow or failing
+                      ;; Mastodon post must not widen the window in which a
+                      ;; crash would mint a second note. Never throws.
+                      status-id (publish-mastodon! ctx announced-b mastodon-opts)]
+                  (if-not (mastodon/configured? ctx)
+                    state
+                    (let [state (remember state
+                                          (if status-id
+                                            (assoc entry "status_id" status-id)
+                                            ;; recorded so a Mastodon outage is
+                                            ;; visible in the state file, not
+                                            ;; only in the logs
+                                            (assoc entry "mastodon" "failed")))]
+                      (save-state! (:state-io ctx) state)
+                      state)))))))))))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Poll ~~~~~~~~~~~~~~~~~~~
 
@@ -1192,6 +1311,12 @@
 ;; ~~~~~~~~~~~~~~~~~~~ Main ~~~~~~~~~~~~~~~~~~~
 
 (defn -main [& _]
+  ;; Before anything can load an AWT class. The bot draws the boost banner with
+  ;; Java2D for its Mastodon attachment, and on a server with no display an
+  ;; un-headless JVM throws HeadlessException on the first draw. The web app
+  ;; gets this from its own -main and from the Dockerfile CMD; the bot's start
+  ;; command (set in the Railway dashboard) runs `java -cp`, so it has neither.
+  (System/setProperty "java.awt.headless" "true")
   (let [cfg (config)
         _ (check-state-durability! cfg)
         _ (check-publish-generators! cfg)
@@ -1204,6 +1329,7 @@
            :relays (:relays cfg)
            :boostbox (:boostbox-url cfg)
            :wallet-relay (first (:relays (:nwc cfg)))
+           :mastodon (when (mastodon/configured? cfg) (:mastodon-url cfg))
            :publish-feed-guids (count (:publish-feed-guids cfg))
            ;; the values, not a count: a value pasted with its quotes
            ;; matches nothing, and only the text shows it
