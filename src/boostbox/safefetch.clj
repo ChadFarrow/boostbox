@@ -225,6 +225,30 @@
   ^bytes [^String body]
   (.getBytes body "ISO-8859-1"))
 
+(def ^:private url-illegal
+  "Characters RFC 3986 allows nowhere in a URI. `%` is not among them: an
+   address that is already escaped stays as it is."
+  #{\space \" \< \> \\ \^ \` \{ \| \}})
+
+(defn escape-url
+  "A feed address with the characters a URI cannot hold percent-encoded, so
+   `fetchable-url?` can parse it. Publishers write them anyway -- MSP albums on
+   headstarts.uk live under `…/songs from the seaside/…`, and the Podcast Index
+   hands that address back with the spaces in -- and `java.net.URI` refuses the
+   lot, which reads as no feed at all. Only escapes; it never decides anything,
+   so every check still runs on the result."
+  [^String url]
+  (when url
+    (let [sb (StringBuilder.)]
+      ;; by code point, so a character outside the BMP is one UTF-8 sequence
+      (doseq [cp (iterator-seq (.iterator (.codePoints url)))]
+        (let [cp (int cp)]
+          (if (or (< cp 0x21) (> cp 0x7e) (contains? url-illegal (char cp)))
+            (doseq [b (.getBytes (String. (Character/toChars cp)) "UTF-8")]
+              (.append sb (format "%%%02X" (bit-and (int b) 0xff))))
+            (.appendCodePoint sb cp))))
+      (.toString sb))))
+
 (defn fetch-pinned!
   "The whole guarded GET: shape, destination, pinned socket, capped body.
 

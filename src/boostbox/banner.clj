@@ -40,6 +40,10 @@
 
 (def max-title-length 44)
 (def max-episode-length 52)
+(def max-by-length
+  "The account name in the corner. It shares that corner with nothing, but a
+   name longer than this is not a name."
+  32)
 (def max-art-url-length 600)
 (def max-art-bytes (* 2 1024 1024))
 (def max-art-pixels
@@ -248,12 +252,15 @@
       (finally (.dispose g)))))
 
 (defn banner-png
-  "Query params in, PNG bytes out. The whole route, minus the HTTP."
-  [{:keys [title ep sats art art2 art3]} wordmark]
+  "Query params in, PNG bytes out. The whole route, minus the HTTP.
+
+   `by` names the account that published the note, for a bot signing with a
+   key of its own; without it the corner carries the server's `wordmark`."
+  [{:keys [title ep sats art art2 art3 by]} wordmark]
   (render {:title (clean-line title max-title-length)
            :episode (clean-line ep max-episode-length)
            :sats (clean-sats sats)
-           :wordmark wordmark
+           :wordmark (or (clean-line by max-by-length) wordmark)
            :art (fetch-art [art art2 art3])}))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Rate limit ~~~~~~~~~~~~~~~~~~~

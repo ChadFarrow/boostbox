@@ -79,6 +79,59 @@
   (is (not (bg/boost? (bg/normalize (assoc fountain-tlv "action" "stream")))))
   (is (not (bg/boost? (bg/normalize {})))))
 
+(deftest the-actions-republished-can-be-widened
+  (let [auto (bg/normalize (assoc fountain-tlv "action" "auto"))]
+    (is (not (bg/boost? auto)) "the default is still manual boosts only")
+    (is (bg/boost? auto #{"boost" "auto"}) "v4vmusic's auto-boosts, when asked for")
+    (is (not (bg/boost? (bg/normalize (assoc fountain-tlv "action" "stream")) #{"boost" "auto"}))
+        "naming other actions does not let streams through")))
+
+(deftest recipient-names-pick-out-one-split
+  (let [msp (bg/normalize (assoc fountain-tlv "name" " MSP 2.0 "))]
+    (is (bg/recipient-match? msp nil) "no names means every recipient")
+    (is (bg/recipient-match? msp #{}) "no names means every recipient")
+    (is (bg/recipient-match? msp #{"msp 2.0"})
+        "trimmed and case-folded, as MSP-2.0's own isMspSplit reads it")
+    (is (not (bg/recipient-match? msp #{"boostr"})))
+    (is (not (bg/recipient-match? (bg/normalize (dissoc fountain-tlv "name")) #{"msp 2.0"}))
+        "a boostagram naming no recipient is nobody's split")))
+
+(deftest feed-guids-pick-out-the-albums-that-agreed
+  (let [album "c90e609a-df1e-596a-bd5e-57bcc8aad6cc"
+        song-feed "917393e3-1b1e-5cef-ace4-edaa54e1f810"
+        show (bg/normalize fountain-tlv)
+        remote (bg/normalize (assoc fountain-tlv
+                                    "guid" "8d9ea0ef-ca36-5e1f-9a1a-ea7fc1dd4b77"
+                                    "remote_feed_guid" (str/upper-case song-feed)))]
+    (is (bg/feed-listed? show nil) "no list means every feed")
+    (is (bg/feed-listed? show #{}) "no list means every feed")
+    (is (bg/feed-listed? show #{album}) "the feed the boost was sent on")
+    (is (bg/feed-listed? remote #{song-feed})
+        "the remote song's feed, case-folded: a music show's boost names the artist's album there")
+    (is (not (bg/feed-listed? remote #{album})))
+    (is (not (bg/feed-listed? (bg/normalize (dissoc fountain-tlv "guid")) #{album}))
+        "a boost naming no feed is nobody's album")
+    (is (bg/feed-listed? show #{song-feed} [(str/upper-case song-feed)])
+        "or the artist, from the publisher feed the album names")
+    (is (not (bg/feed-listed? show #{song-feed} [nil])))))
+
+(deftest generators-pick-out-the-feeds-built-with-msp
+  (let [msp "MSP 2.0 - Music Side Project Studio"
+        listed #{(str/lower-case msp)}]
+    (is (bg/generator-listed? nil ["Fountain"]) "no generators means every feed")
+    (is (bg/generator-listed? #{} []) "no generators means every feed, read or not")
+    (is (bg/generator-listed? listed [msp]))
+    (is (bg/generator-listed? listed [(str "  " (str/upper-case msp) " ")])
+        "trimmed and case-folded, as the recipient name is")
+    (is (bg/generator-listed? listed ["Podhome (https://www.podhome.fm)" msp])
+        "either feed: a music show's boost is MSP's when the song's album is")
+    (is (not (bg/generator-listed? listed ["MSP 2.0"])) "the whole name, not a prefix")
+    (is (not (bg/generator-listed? listed [(str msp " (fork)")])))
+    (is (not (bg/generator-listed? listed ["Sovereign Feeds" "Fountain"]))
+        "a show that only supports MSP with a split")
+    (is (not (bg/generator-listed? listed [])) "a feed that could not be read was built by nothing")
+    (is (not (bg/generator-listed? listed [nil])))))
+
 (deftest boost-payload-mapping
   (let [b (bg/normalize fountain-tlv)
         p (bg/->boost-payload b {:received-msat 21000 :settled-at 1757275200})]
@@ -92,6 +145,18 @@
     (is (= "c90e609a-df1e-596a-bd5e-57bcc8aad6cc" (get p "feed_guid")))
     (is (= "d98d189b-dc7b-45b1-8720-d4b98690f31f" (get p "item_guid")))
     (is (not (contains? p "value_usd")) "absent fields are omitted, not sent as null")))
+
+;; BoostBox stores one record per payment leg and ties a boost's legs together
+;; with `group`; blip-10 calls the same id `uuid`, and BoostMeBitch sends it on
+;; every leg. A keysend leg stored without it is a boost of its own on the
+;; homepage, beside the LNURL legs the app stored itself.
+(deftest a-stored-leg-keeps-its-boost-group
+  (let [uuid "48964d4a-51d1-4328-a1b2-02a6bb4aed97"
+        payload #(bg/->boost-payload (bg/normalize %) {})]
+    (is (= uuid (get (payload (assoc fountain-tlv "uuid" uuid)) "group")))
+    (is (= uuid (get (payload (assoc fountain-tlv "group" uuid)) "group"))
+        "BoostBox's own spelling")
+    (is (not (contains? (payload fountain-tlv) "group")))))
 
 (deftest received-amount-beats-the-apps-claim
   (let [b (bg/normalize (assoc fountain-tlv "value_msat" 999999))
@@ -132,6 +197,21 @@
                                       :pubkey "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"}]
                              :banner-url "https://tardbox.com/og/boost.png?sats=2100"
                              :total-msat 2100000}))))
+
+  (testing "the artist, from the album feed's podcast:publisher, is NIP-73's
+            publisher id: one guid every album of theirs shares. Validated and
+            lower-cased like a feed guid, and named once however many feeds
+            named it"
+    (is (= [["i" "podcast:guid:c90e609a-df1e-596a-bd5e-57bcc8aad6cc"]
+            ["k" "podcast:guid"]
+            ["i" "podcast:item:guid:d98d189b-dc7b-45b1-8720-d4b98690f31f"]
+            ["k" "podcast:item:guid"]
+            ["i" "podcast:publisher:guid:1a197bac-95ae-53bd-bf6d-40ba8b551088"]
+            ["k" "podcast:publisher:guid"]]
+           (take 6 (bg/->nip73-tags (bg/normalize fountain-tlv)
+                                    {:publisher-guids ["1A197BAC-95AE-53BD-BF6D-40BA8B551088"
+                                                       "1a197bac-95ae-53bd-bf6d-40ba8b551088"
+                                                       "not-a-guid" nil]})))))
 
   (testing "Alby's parsed struct drops every GUID, so a boost through it is
             publishable but untagged -- the constants and the paying app are
@@ -421,6 +501,19 @@
       (is (str/includes? u "%26sats%3D999999"))
       (is (= 1 (count (re-seq #"[?&]sats=" u))))))
 
+  (testing "an account signing with its own name says so in `by`, added last so
+            every URL published before it stays byte-identical"
+    (is (= "https://tardbox.com/og/boost.png?sats=2100&by=MSP+2.0"
+           (bg/banner-url "https://tardbox.com" (bg/normalize {"action" "boost"})
+                          nil 2100000 "MSP 2.0"))))
+
+  (testing "the default name adds nothing: that is the server's wordmark already"
+    (is (= "https://tardbox.com/og/boost.png?sats=2100"
+           (bg/banner-url "https://tardbox.com" (bg/normalize {"action" "boost"})
+                          nil 2100000 bg/default-client-name)
+           (bg/banner-url "https://tardbox.com" (bg/normalize {"action" "boost"})
+                          nil 2100000 nil))))
+
   (testing "no base URL means no picture, never a broken link"
     (is (nil? (bg/banner-url nil (bg/normalize fountain-tlv) "https://cdn.x/a.png" 1000)))
     (is (nil? (bg/banner-url "  " (bg/normalize fountain-tlv) nil 1000))))
@@ -552,6 +645,48 @@
 
   (testing "short text is untouched"
     (is (= "row of ducks" (:message (bg/normalize {"action" "boost" "message" "row of ducks"}))))))
+
+;; The two payments v4vmusic.com made to boostr@ for one boost on 2026-10-27
+;; (tardbox 01M5YVXJ0TE31VHMMN55BDFPGV and 01M5YVY42FE12VG1HDJM726JZB): its own
+;; split, then the feed's. They differ only in what each split is -- its name,
+;; its share, and a uuid v4vmusic minted for each pass.
+(def v4vms-leg
+  {"action" "boost"
+   "app_name" "v4vmusic-com"
+   "app_version" "0.17.15"
+   "sender_name" "Sir TJ The Wrathful"
+   "sender_id" "v4vmusic-com-anon-osx6b042ff"
+   "message" "Great episode, thanks Matt and inpc😎"
+   "podcast" "V4V Music Spotlight (Phafe Presents)"
+   "episode" "v4vms 007 inpc"
+   "guid" "31e6e997-df26-59d5-9301-1f5928809566"
+   "episode_guid" "06fa0fb3-880f-46b5-928e-096c21a2b5c0"
+   "ts" 5714
+   "value_msat_total" 777000})
+
+(deftest the-legs-of-one-boost-share-a-key
+  (let [app-split (bg/normalize (assoc v4vms-leg "name" "Boostr Bot - Boost to Nostr"
+                                       "value_msat" 4000
+                                       "uuid" "e6cc7c2b-12cc-4ce5-8fb5-fdf90672d2fc"))
+        feed-split (bg/normalize (assoc v4vms-leg "name" "Boostr"
+                                        "value_msat" 8000
+                                        "uuid" "5569d650-8cec-4542-8719-2499b1498cdc"))
+        k (bg/boost-key app-split)]
+    (is (string? k))
+    (is (= k (bg/boost-key feed-split))
+        "the recipient, the share and the uuid are the split's, not the boost's")
+    (testing "anything that makes it another boost makes it another key"
+      (doseq [[field v] {"message" "Another one"
+                         "value_msat_total" 1554000
+                         "ts" 5800
+                         "sender_id" "v4vmusic-com-anon-someone-else"
+                         "episode_guid" "c498fddf-ce54-4e1c-a967-4e84958108ad"
+                         "app_name" "Fountain"
+                         "action" "auto"}]
+        (is (not= k (bg/boost-key (bg/normalize (assoc v4vms-leg field v)))) field)))
+    (testing "no sender id, no key: two listeners' boosts must never be taken for one"
+      (is (nil? (bg/boost-key (bg/normalize (dissoc v4vms-leg "sender_id")))))
+      (is (nil? (bg/boost-key (bg/normalize (assoc v4vms-leg "sender_id" "  "))))))))
 
 (deftest boost-id-comes-off-the-end-of-the-url
   (is (= "01M1Z3KRQ0E27RZ2T0CT1B2NEE"

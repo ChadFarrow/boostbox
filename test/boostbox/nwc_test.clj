@@ -1,7 +1,8 @@
 (ns boostbox.nwc-test
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.nwc :as nwc]
-            [boostbox.nostr :as nostr]))
+            [boostbox.nostr :as nostr]
+            [jsonista.core :as json]))
 
 (def wallet-pubkey (apply str (repeat 64 "a")))
 (def secret (apply str (repeat 64 "b")))
@@ -102,10 +103,151 @@
         "sanity: type matched even as a string"))
 
   (testing "streams are not republished"
-    (let [stream-json (clojure.string/replace blip10-json "\"boost\"" "\"stream\"")]
-      (is (nil? (nwc/transaction->boost
-                 {"payment_hash" "x" "amount" 1000
-                  "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv stream-json)}]}})))))
+    (let [stream-json (clojure.string/replace blip10-json "\"boost\"" "\"stream\"")
+          r (nwc/transaction->boost
+             {"payment_hash" "x" "amount" 1000
+              "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv stream-json)}]}})]
+      (is (nil? (:boostagram r)))
+      (is (= :not-a-boost (:skip r)))
+      (is (= "stream" (:action r)) "so the log line says what it actually was")))
 
   (testing "a payment with no boostagram is not a boost"
-    (is (nil? (nwc/transaction->boost {"payment_hash" "x" "amount" 1000})))))
+    (is (= :no-boostagram (:skip (nwc/transaction->boost {"payment_hash" "x" "amount" 1000}))))))
+
+(deftest a-boost-carries-its-tlv-exactly-as-the-payer-wrote-it
+  ;; bg/normalize folds boost_link into :url; MSP's song resolver keys on boost_link,
+  ;; so the forwarder needs the original, not the normalized map
+  (let [tlv (json/write-value-as-string {"action" "boost" "name" "MSP 2.0"
+                                         "boost_link" "https://v4vmusic.com/songs/x"
+                                         "value_msat_total" 2100000})
+        tx {"payment_hash" "h" "amount" 21000 "settled_at" 1
+            "metadata" {"tlv_records" [{"type" 7629169
+                                        "value" (nostr/bytes->hex (.getBytes tlv "UTF-8"))}]}}
+        b (nwc/transaction->boost tx)]
+    (is (= tlv (:tlv-json b)) "byte for byte, boost_link included")
+    (is (nil? (:wallet-boostagram b)))))
+
+(deftest a-wallet-parsed-boost-carries-the-wallets-map
+  (let [parsed {"action" "boost" "podcast" "Show" "name" "MSP 2.0"}
+        b (nwc/transaction->boost {"payment_hash" "h" "amount" 1 "settled_at" 1
+                                   "metadata" {"boostagram" parsed}})]
+    (is (= parsed (:wallet-boostagram b)))
+    (is (nil? (:tlv-json b)))))
+
+(deftest a-skipped-transaction-says-why
+  (testing "the reasons are distinct, because a count cannot tell a stream from a defect"
+    (is (= :no-boostagram (:skip (nwc/transaction->boost {})))
+        "an ordinary payment, and the common case on a wallet that also takes them")
+
+    (is (= :tlv-unreadable
+           (:skip (nwc/transaction->boost
+                   {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}})))
+        "a TLV record was there and neither hex nor base64 read it")
+
+    (is (= :tlv-unreadable
+           (:skip (nwc/transaction->boost
+                   {"metadata" {"tlv_records"
+                                [{"type" 7629169 "value" (hex-tlv "[1,2,3]")}]}})))
+        "valid JSON that is not an object is no more a boostagram than garbage"))
+
+  (testing "an unreadable TLV still falls back to the wallet's parsed copy"
+    (let [r (nwc/transaction->boost
+             {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]
+                          "boostagram" {"action" "boost" "podcast" "P"}}})]
+      (is (nil? (:skip r)))
+      (is (= "P" (:podcast (:boostagram r))))))
+
+  (testing "a TLV for some other record type is not a boostagram at all"
+    (is (= :no-boostagram
+           (:skip (nwc/transaction->boost
+                   {"metadata" {"tlv_records"
+                                [{"type" 133773310 "value" (hex-tlv "whatever")}]}})))))
+
+  (testing "every reason the classifier can emit is a declared one"
+    (doseq [tx [{}
+                {"metadata" {"tlv_records" [{"type" 7629169 "value" "zzzz"}]}}
+                {"metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv "[1,2,3]")}]}}
+                {"metadata" {"boostagram" {"action" "stream"}}}]]
+      (is (contains? nwc/skip-reasons (:skip (nwc/transaction->boost tx)))
+          (pr-str tx)))))
+
+;; A real v4vmusic auto-boost, as it reached the node's main wallet on the
+;; MSP 2.0 community-support split every MSP feed carries.
+(def msp-auto-json
+  (str "{\"action\":\"auto\",\"value_msat_total\":33000,\"app_name\":\"v4vmusic-com\","
+       "\"url\":\"https://phafe.com/wp-content/uploads/rssfeed/music/matt_finlay/various_assorted/Various___Assorted.xml\","
+       "\"ts\":229,\"time\":\"00:03:49\",\"app_version\":\"0.17.6\",\"speed\":\"1\","
+       "\"sender_id\":\"v4vmusic-com-anon-5vg8yozuig4\",\"sender_name\":\"Sir TJ The Wrathful\","
+       "\"name\":\"MSP 2.0\","
+       "\"message\":\"Auto boost from Sir TJ The Wrathful for \\\"Will You Wait For Me? (Demo)\\\" by Matt Finlay sent from v4vmusic.com\","
+       "\"podcast\":\"Various &amp; Assorted\",\"episode\":\"Will You Wait For Me? (Demo)\","
+       "\"guid\":\"fe17f4f6-074f-4b2c-a450-611faccfaea2\","
+       "\"episode_guid\":\"40537e7c-3125-4eaa-8ab7-ecc2893e6913\","
+       "\"boost_link\":\"https://v4vmusic.com/songs/cmo5qidwa0052od0jb4qdmizg\","
+       "\"boost_uuid\":\"551862d7-5565-464c-ae2f-b10e4777caeb\","
+       "\"uuid\":\"221e04e9-97d4-4e76-bdcb-7bd9f092b650\"}"))
+
+(defn- msp-tx [json]
+  {"payment_hash" "hMSP" "amount" 1320 "settled_at" 1758800000
+   "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv json)}]}})
+
+(def msp-only {:actions #{"boost" "auto"} :recipient-names #{"msp 2.0"}})
+
+(deftest the-msp-split-is-picked-out-of-a-shared-wallet
+  (testing "the MSP 2.0 auto-boost publishes when auto is asked for"
+    (let [r (nwc/transaction->boost (msp-tx msp-auto-json) msp-only)]
+      (is (nil? (:skip r)))
+      (is (= "auto" (-> r :boostagram :action)))
+      (is (= "MSP 2.0" (-> r :boostagram :recipient-name)))
+      (is (= "fe17f4f6-074f-4b2c-a450-611faccfaea2" (-> r :boostagram :feed-guid)))
+      (is (= 1320 (:received-msat r)))))
+
+  (testing "without options nothing changes: an auto-boost is still not a boost"
+    (let [r (nwc/transaction->boost (msp-tx msp-auto-json))]
+      (is (= :not-a-boost (:skip r)))
+      (is (= "auto" (:action r)))))
+
+  (testing "a split to anyone else is another recipient's, whatever its action"
+    (doseq [action ["boost" "auto" "stream"]]
+      (let [json (-> msp-auto-json
+                     (clojure.string/replace "\"MSP 2.0\"" "\"Some Other Show\"")
+                     (clojure.string/replace "\"action\":\"auto\"" (str "\"action\":\"" action "\"")))]
+        (is (= :other-recipient (:skip (nwc/transaction->boost (msp-tx json) msp-only)))
+            action))))
+
+  (testing "a stream on the MSP split is still a stream"
+    (let [json (clojure.string/replace msp-auto-json "\"action\":\"auto\"" "\"action\":\"stream\"")]
+      (is (= :not-a-boost (:skip (nwc/transaction->boost (msp-tx json) msp-only))))))
+
+  (testing "the new reason is a declared one"
+    (is (contains? nwc/skip-reasons :other-recipient))))
+
+(deftest podcast-guru-sends-both-url-and-boost-link
+  (testing "the feed address wins over the app deep link, and the boost publishes"
+    ;; A real PodcastGuru payload. Its `boost_link` is an app.podcastguru.io
+    ;; deep link, NOT a BoostBox permalink and NOT a feed -- so reading it as
+    ;; the feed address would cost the note its cover art and every p tag.
+    (let [json (str "{\"value_msat\":3000,\"app_version\":\"2.3.2-beta2\","
+                    "\"sender_name\":\"Silvie\",\"episode\":\"007. The show must go one\","
+                    "\"message\":\"enjoyed the rewind, Chad\",\"value_msat_total\":333000,"
+                    "\"url\":\"https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53\","
+                    "\"sender_id\":\"fd4fdc23-2836-4eeb-86b0-8627b9bf51cb\","
+                    "\"boost_link\":\"https://app.podcastguru.io/podcast/X686874\","
+                    "\"app_name\":\"PodcastGuru\","
+                    "\"episode_guid\":\"8c82416b-4adf-43aa-8836-e79257362fd5\","
+                    "\"podcast\":\"Chad and Reeds Podcast\",\"name\":\"boostr\","
+                    "\"guid\":\"7c6f7875-2b73-491e-b32c-e2c8d6e91d53\","
+                    "\"action\":\"boost\",\"ts\":4910}")
+          r (nwc/transaction->boost
+             {"payment_hash" "7f4e94e3" "amount" 105000 "settled_at" 1789000000
+              "metadata" {"tlv_records" [{"type" 7629169 "value" (hex-tlv json)}]}})
+          b (:boostagram r)]
+      (is (nil? (:skip r)) "this is a publishable boost")
+      (is (= "https://serve.podhome.fm/rss/7c6f7875-2b73-491e-b32c-e2c8d6e91d53" (:url b))
+          "url wins over boost_link")
+      (is (= "7c6f7875-2b73-491e-b32c-e2c8d6e91d53" (:feed-guid b)))
+      (is (= "8c82416b-4adf-43aa-8836-e79257362fd5" (:item-guid b)))
+      (is (= "boostr" (:recipient-name b)))
+      (is (= 333000 (:value-msat-total b)) "the whole boost, not this split")
+      (is (= 105000 (:received-msat r)) "what actually arrived")
+      (is (= 4910 (:position b)) "ts is seconds into the episode"))))

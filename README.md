@@ -172,7 +172,7 @@ Configuration is handled via environment variables.
 | `BB_BASE_URL`     |    No    | `http://localhost:8080` | The public base URL of the service (e.g., `https://my-boostbox.com`). Used to construct response URLs.             |
 | `BB_ALLOWED_KEYS` |    No    | `v4v4me`                | Comma-separated list of API keys clients must provide in the `X-Api-Key` header to use the `POST /boost` endpoint. |
 | `BB_MAX_BODY`     |    No    | `102400`                | Maximum allowed size for request bodies in bytes (approximately 100KB by default).                                 |
-| `BB_BANNER_WORDMARK` |  No   | `Boostr_Bot`                | What the boost banner (`/og/boost.png`) signs itself with. The banner only ever appears on the bot's notes, so it carries the bot's name, not this host's. Set it to empty to fall back to the host in `BB_BASE_URL`. |
+| `BB_BANNER_WORDMARK` |  No   | `Boostr_Bot`                | What the boost banner (`/og/boost.png`) signs itself with. The banner only ever appears on the bot's notes, so it carries the bot's name, not this host's. Set it to empty to fall back to the host in `BB_BASE_URL`. A banner URL carrying `by=` names its own account instead: a bot with a `BBN_CLIENT_NAME` of its own adds it. |
 | `BB_STORAGE`      |    No    | `FS`                    | The backend for storing metadata: `FS` (filesystem) or `S3`.                                                       |
 
 ### Filesystem Storage Configuration
@@ -254,8 +254,15 @@ java -cp boostbox.jar boostbox.nostrbot
 
 It is deliberately not part of the web server: it holds a Nostr signing key and
 a wallet credential, and it is a long-lived loop with at-least-once delivery.
-Deploy it as a separate service (on Railway, a second service from this same
-repo with the start command above and no healthcheck).
+Deploy it as a separate service (on Railway, a service from this same repo with
+the start command above and no healthcheck).
+
+Cap its memory: Railway bills memory by the minute, and an uncapped JVM keeps
+whatever heap it grows into. On Railway, set the service variable
+`JAVA_TOOL_OPTIONS` to `-Xms32m -Xmx192m -XX:+UseSerialGC
+-XX:+ExitOnOutOfMemoryError`; the JVM reads it directly, so the start command
+stays as above. Set the restart policy to Always. The web app's own caps are in
+the Dockerfile `CMD`; set `JAVA_OPTS` on that service to replace them.
 
 ### Bot Configuration
 
@@ -268,7 +275,9 @@ already seen; if it is lost, the bot restarts from a `now` watermark and every
 boost that arrived while it was down is silently dropped, unpublished. A second
 Railway service gets a fresh filesystem on every deploy, so `BB_STORAGE=FS` is
 refused outside `ENV=DEV` unless you set `BBN_ALLOW_EPHEMERAL_STATE=1` to say
-the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
+the filesystem really is a mounted volume. Use `BB_STORAGE=S3`, or attach a
+volume to the bot's service, point `BB_FS_ROOT_PATH` at it and set
+`BBN_ALLOW_EPHEMERAL_STATE=1`.
 
 | Variable                | Required | Default                                                    | Description                                                                                     |
 | ----------------------- | :------: | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
@@ -276,11 +285,19 @@ the filesystem really is a mounted volume. Use `BB_STORAGE=S3`.
 | `BBN_NOSTR_SECKEY`      |   Yes    | N/A                                                        | The bot's Nostr signing key, as 64-char hex or `nsec1...`.                                        |
 | `BBN_BOOSTBOX_API_KEY`  |   Yes    | N/A                                                        | API key for `POST /boost`; must be one of the server's `BB_ALLOWED_KEYS`.                         |
 | `BBN_BOOSTBOX_URL`      |    No    | `https://tardbox.com`                                      | BoostBox instance to store boosts in.                                                             |
-| `BBN_RELAYS`            |    No    | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net` | Comma-separated relays to publish to. One acceptance counts as success.                           |
+| `BBN_RELAYS`            |    No    | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net,wss://chadf.nostr1.com` | Comma-separated relays to publish to. One acceptance counts as success. The last default is the operator's own relay, which accepts only allow-listed pubkeys. |
 | `BBN_POLL_INTERVAL_SEC` |    No    | `60`                                                       | How often to poll the wallet. Notifications short-circuit the wait; polling guarantees delivery.  |
 | `BBN_MIN_SATS`          |    No    | `0`                                                        | Skip boosts below this many sats. `0` publishes every boost.                                      |
-| `BBN_CLIENT_NAME`       |    No    | `Boostr_Bot`                                                   | NIP-89 `client` tag: the app that signed the note, which is this bot. Clients render it as "via ...". Never the paying app -- that gets its own `app` tag. |
-| `BBN_FEED_LOOKUP`       |    No    | `true`                                                     | Read the show's RSS feed to find its npubs and cover art. Off is supported: the note still publishes, with no picture and no `p` tags. |
+| `BBN_ACTIONS` | No | `boost` | Comma-separated blip-10 actions to publish. `boost,auto` adds v4vmusic's automatic per-song boosts. Streams are never worth a note. |
+| `BBN_RECIPIENT_NAMES` | No | *(empty)* | Only publish splits addressed to these recipient names (comma-separated, case-insensitive). Empty publishes every boost. For a wallet shared with other splits, e.g. `MSP 2.0`. |
+| `BBN_PUBLISH_FEED_GUIDS` | No | *(empty)* | Only publish boosts whose feed or remote feed is one of these `<podcast:guid>`s, or whose feed names one of them as its `<podcast:publisher>` -- for music, the artist (comma-separated). Empty publishes every album. Publishing only: an unlisted boost is still forwarded. An entry that is not a guid stops the bot. |
+| `BBN_PUBLISH_GENERATORS` | No | *(empty)* | Only publish boosts whose feed or remote feed was written by one of these `<generator>`s (comma-separated, whole name, case-insensitive) -- `MSP 2.0 - Music Side Project Studio` for albums built with MSP. ANDed with `BBN_PUBLISH_FEED_GUIDS`; empty publishes every feed. A feed that cannot be read matches nothing. Needs `BBN_FEED_LOOKUP`, or the bot refuses to start. Publishing only: an unlisted boost is still forwarded. |
+| `BBN_FORWARD_URL` | No | *(unset)* | MSP-2.0's `/api/boosts/ingest`. With a token and `BBN_RECIPIENT_NAMES`, every matching split payment is forwarded to MSP's chart. |
+| `BBN_FORWARD_TOKEN` | No | *(unset)* | Bearer token for that ingest; equals MSP-2.0's `MSP_BOT_INGEST_TOKEN`. |
+| `BBN_FORWARD_ACTIONS` | No | `boost,auto,stream` | Which blip-10 actions are forwarded. Streams are forwarded but never published. |
+| `BBN_CLIENT_NAME`       |    No    | `Boostr_Bot`                                                   | NIP-89 `client` tag: the app that signed the note, which is this bot. Clients render it as "via ...". Never the paying app -- that gets its own `app` tag. Any name but the default also goes on the banner as `by`, so the picture and the tag agree. |
+| `BBN_FEED_LOOKUP`       |    No    | `true`                                                     | Read the show's RSS feed to find its npubs and cover art. Off is supported: the note still publishes, with no picture and no `p` tags -- except with `BBN_PUBLISH_GENERATORS` set, which reads the feed, so the bot refuses to start. |
+| `BBN_APP_ZAP_LOOKUP` | No | `true` | For a Fountain boost that names its sender, read the zap receipt Fountain published for it and put what the listener spent in the note (123 sats where `value_msat_total` says 101: Fountain keeps the difference). Only receipts signed by Fountain's key count; none found leaves `value_msat_total`. The BoostBox record is unchanged. |
 | `BBN_FEED_TIMEOUT_MS`   |    No    | `8000`                                                     | How long to wait on that feed read before giving up on it.                                        |
 | `BBN_PI_KEY`            |    No    | —                                                          | Podcast Index API key. With it, a boost that names a feed guid but no feed address resolves on its first boost instead of waiting for some other app to send the address. |
 | `BBN_PI_SECRET`         |    No    | —                                                          | Podcast Index API secret. Both must be set or neither does anything. Never logged — only the SHA-1 digest is sent. |
@@ -370,6 +387,47 @@ backfilled — and by the same rule, a post that fails is not retried later.
 Per-minute `stream` payments are skipped. Only `action: boost` is published,
 with or without a message. A payment that carries no boostagram at all is
 ignored.
+
+### Working out why a boost was not published
+
+Every transaction the poll sees either publishes or says why it did not. The
+per-poll `boostbox.nostrbot/poll` line carries a `:skipped` breakdown, and a
+skip worth looking up also gets its own `boostbox.nostrbot/transaction-skipped`
+line with the payment hash the wallet shows, so a single boost can be searched
+for by id. That line is written once per payment per process, however many polls
+re-read it:
+
+| `:reason`                | Meaning                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `:no-boostagram`         | An ordinary payment: no TLV and no boost link. Only counted.                                                                         |
+| `:not-a-boost`           | A boostagram we read, for something we do not republish. The `:action` says which. A `stream` is only counted; anything else is logged. |
+| `:tlv-unreadable`        | TLV `7629169` was present and neither hex nor base64 yielded a JSON object.                                                          |
+| `:boost-link-unreadable` | The description named a boost link and it did not answer with a boost. The `:url` says which.                                        |
+
+The last two are defects worth reporting. `scripts/nwc-inspect.sh` dumps what
+the wallet actually reports for recent payments, including each one's reason.
+
+One boost can pay the bot twice, through two splits: v4vmusic.com pays it a
+split of its own on every boost, and the episode's feed may list it as well.
+The second payment logs `boostbox.nostrbot/boost-paid-twice` with the payment
+already announced (`:duplicate-of`) and publishes nothing. Two payments are one
+boost when the app, the sender id, the episode, the position, the total and the
+message all agree, and they settled within two minutes of each other.
+
+**No line at all for a boost you can see in the wallet** means either that it
+reached the bot carrying neither a TLV nor a boost link, so it counted as
+`:no-boostagram`, or that the poll never covered it, which is a cursor problem
+rather than a metadata one. For the second, look for
+`boostbox.nostrbot/no-cursor-window-dropped`: it is logged whenever the bot
+starts with no cursor and no `BBN_BACKFILL_SEC`, and it means every boost
+received before that moment was dropped unpublished. On a brand new bot that is
+correct. After a restart it means the state was not durable -- see
+`BBN_ALLOW_EPHEMERAL_STATE` under Bot Configuration above, and the
+`boostbox.nostrbot/ephemeral-state-permitted` line logged at startup when the
+bot is running on a filesystem someone has asserted is a mounted volume. Do not
+reach back over the gap with `BBN_BACKFILL_SEC`: the de-duplication set was lost
+with the cursor, so every boost in that window that was already announced would
+be announced again.
 
 ### Where the metadata comes from
 
