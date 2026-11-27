@@ -40,6 +40,10 @@
 
 (def max-title-length 44)
 (def max-episode-length 52)
+(def max-song-length
+  "The song's title and its artist, each. The line is also fitted to the width
+   it has when drawn, so this only bounds what is worth measuring."
+  60)
 (def max-by-length
   "The account name in the corner. It shares that corner with nothing, but a
    name longer than this is not a name."
@@ -182,6 +186,69 @@
     (.closePath p)
     p))
 
+(defn- note-glyph
+  "A quaver, drawn for the same reason the bolt is: the bundled face has no
+   music sign, and a missing glyph draws as an empty box."
+  [^Graphics2D g ^double x ^double y ^double size]
+  (let [head-w (* 0.46 size)
+        head-h (* 0.34 size)
+        stem-x (+ x (* 0.40 size))
+        stem-w (* 0.09 size)
+        flag (Path2D$Double.)]
+    ;; the head, tilted as engravers draw it
+    (let [t (.getTransform g)]
+      (.rotate g -0.35 (+ x (/ head-w 2)) (+ y (- size (/ head-h 2))))
+      (.fill g (java.awt.geom.Ellipse2D$Double. x (- (+ y size) head-h) head-w head-h))
+      (.setTransform g t))
+    ;; the stem, up from the head's right side
+    (.fill g (java.awt.geom.Rectangle2D$Double. stem-x y stem-w (- size (* 0.18 size))))
+    ;; the flag
+    (.moveTo flag (+ stem-x stem-w) y)
+    (.curveTo flag (+ stem-x (* 0.30 size)) (+ y (* 0.12 size))
+              (+ stem-x (* 0.46 size)) (+ y (* 0.30 size))
+              (+ stem-x (* 0.30 size)) (+ y (* 0.62 size)))
+    (.curveTo flag (+ stem-x (* 0.34 size)) (+ y (* 0.36 size))
+              (+ stem-x (* 0.20 size)) (+ y (* 0.26 size))
+              (+ stem-x stem-w) (+ y (* 0.24 size)))
+    (.closePath flag)
+    (.fill g flag)))
+
+(defn- fit
+  "`s` cut, with an ellipsis, to the widest prefix that fits `max-w` pixels in
+   the font `g` is drawing with. Measured rather than counted: the line shares
+   the banner with the cover, and a character cap that fits \"iiii\" overflows
+   on \"WWWW\"."
+  ^String [^Graphics2D g ^String s ^long max-w]
+  (let [fm (.getFontMetrics g)]
+    (if (<= (.stringWidth fm s) max-w)
+      s
+      (loop [n (dec (count s))]
+        (let [cut (str (str/trimr (subs s 0 (max 0 n))) "…")]
+          (if (or (<= n 0) (<= (.stringWidth fm cut) max-w))
+            cut
+            (recur (dec n))))))))
+
+(defn- draw-song
+  "The song line: the note glyph, the title in bone, ` by <artist>` in muted.
+   The artist gives way to the title only past half the line, so a long title
+   still names who made it."
+  [^Graphics2D g ^String song ^String artist left baseline]
+  (let [size 24.0
+        max-w (- width 30 left)
+        text-x (+ left 34)
+        text-w (- max-w 34)]
+    (.setColor g bolt)
+    (note-glyph g (double left) (double (- baseline size -2)) size)
+    (.setFont g (font-of :regular 27.0))
+    (let [fm (.getFontMetrics g)
+          by (when artist (fit g (str " by " artist) (quot text-w 2)))
+          title (fit g song (- text-w (if by (.stringWidth fm by) 0)))]
+      (.setColor g bone)
+      (.drawString g title (int text-x) (int baseline))
+      (when by
+        (.setColor g muted)
+        (.drawString g by (int (+ text-x (.stringWidth fm title))) (int baseline))))))
+
 (defn- draw-cover
   "The art square, cropped to fill rather than squashed to fit."
   [^Graphics2D g ^BufferedImage art]
@@ -201,10 +268,16 @@
 
    `art` is an already-decoded image or nil; fetching is the caller's job, so
    this stays a pure function of its inputs and can be looked at without a
-   network."
-  ^bytes [{:keys [title episode sats wordmark art]}]
+   network.
+
+   With a `song` and an episode, the lines move up to make room for one more,
+   under the episode; with no episode the song takes its place. Without a song, every coordinate is the one it always was: a banner
+   is drawn on request, so a change here reaches every note ever published,
+   and the notes that name no song must keep the picture they have."
+  ^bytes [{:keys [title episode sats wordmark art song artist]}]
   (let [img (BufferedImage. width height BufferedImage/TYPE_INT_RGB)
-        ^Graphics2D g (.createGraphics img)]
+        ^Graphics2D g (.createGraphics img)
+        lift (if (and song episode) 22 0)]
     (try
       (.setRenderingHint g RenderingHints/KEY_ANTIALIASING RenderingHints/VALUE_ANTIALIAS_ON)
       (.setRenderingHint g RenderingHints/KEY_TEXT_ANTIALIASING
@@ -223,21 +296,25 @@
 
         ;; headline: the bolt, then the amount
         (.setColor g bolt)
-        (.fill g (bolt-glyph left 88.0 44.0))
+        (.fill g (bolt-glyph left (double (- 88 lift)) 44.0))
         (.setFont g (font-of :bold 46.0))
         (.drawString g ^String (if sats (str sats " SATS") "BOOST")
-                     (int (+ left 56)) (int 128))
+                     (int (+ left 56)) (int (- 128 lift)))
 
         ;; the show
         (.setColor g bone)
         (.setFont g (font-of :bold 40.0))
-        (.drawString g ^String (or title wordmark) (int left) (int 186))
+        (.drawString g ^String (or title wordmark) (int left) (int (- 186 lift)))
 
         ;; the episode
         (when episode
           (.setColor g muted)
           (.setFont g (font-of :regular 27.0))
-          (.drawString g ^String episode (int left) (int 228))))
+          (.drawString g ^String episode (int left) (int (- 228 lift))))
+
+        ;; the song, under the episode, or in its place
+        (when song
+          (draw-song g song artist left (if episode (- 270 lift) 228))))
 
       ;; the host, bottom right
       (.setColor g muted)
@@ -255,13 +332,18 @@
   "Query params in, PNG bytes out. The whole route, minus the HTTP.
 
    `by` names the account that published the note, for a bot signing with a
-   key of its own; without it the corner carries the server's `wordmark`."
-  [{:keys [title ep sats art art2 art3 by]} wordmark]
-  (render {:title (clean-line title max-title-length)
-           :episode (clean-line ep max-episode-length)
-           :sats (clean-sats sats)
-           :wordmark (or (clean-line by max-by-length) wordmark)
-           :art (fetch-art [art art2 art3])}))
+   key of its own; without it the corner carries the server's `wordmark`.
+   `song` and `artist` name the song a music show's boost was sent for; an
+   `artist` with no `song` draws nothing."
+  [{:keys [title ep sats art art2 art3 by song artist]} wordmark]
+  (let [song (clean-line song max-song-length)]
+    (render {:title (clean-line title max-title-length)
+             :episode (clean-line ep max-episode-length)
+             :sats (clean-sats sats)
+             :wordmark (or (clean-line by max-by-length) wordmark)
+             :song song
+             :artist (when song (clean-line artist max-song-length))
+             :art (fetch-art [art art2 art3])})))
 
 ;; ~~~~~~~~~~~~~~~~~~~ Rate limit ~~~~~~~~~~~~~~~~~~~
 

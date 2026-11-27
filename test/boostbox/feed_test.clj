@@ -359,3 +359,76 @@
                                     "<podcast:valueRecipient name=\"A\" address=\"a@b.c\"/>"
                                     "</podcast:value></channel></rss>")
                                nil)))))
+
+;; ~~~~~~~~~~~~~~~~~~~ The song ~~~~~~~~~~~~~~~~~~~
+
+(def album-xml
+  "An album as MSP 2.0 writes one: the artist is the channel's author, and the
+   items carry none of their own."
+  (str "<?xml version=\"1.0\"?><rss><channel>"
+       "<title>The EP (Amnesia)</title>"
+       "<itunes:author>Strange Love</itunes:author>"
+       "<podcast:medium>Music</podcast:medium>"
+       "<image><title>The EP (Amnesia)</title><url>https://a.example/ep.jpg</url></image>"
+       "<item><title>The Middle</title><guid isPermaLink=\"false\">aaa</guid></item>"
+       "<item><title>Cats in the Hall</title>"
+       "<guid isPermaLink=\"false\">03990582-c211-4b7a-9bca-a673300727c9</guid></item>"
+       "<item><title><![CDATA[Rock &amp; Roll\nSuicide]]></title><guid>ccc</guid>"
+       "<itunes:author>Guest &amp; Band</itunes:author></item>"
+       "</channel></rss>"))
+
+(deftest the-song-is-read-from-its-own-item
+  (let [f (feed/read-feed album-xml "03990582-c211-4b7a-9bca-a673300727c9")]
+    (is (= "Cats in the Hall" (:item-title f)))
+    (is (= "Strange Love" (:artist f)) "the channel's author, when the item names none")
+    (is (= "music" (:medium f))))
+  (testing "an item's own author wins, and its title is one decoded line"
+    (let [f (feed/read-feed album-xml "ccc")]
+      (is (= "Rock & Roll Suicide" (:item-title f)))
+      (is (= "Guest & Band" (:artist f)))))
+  (testing "a guid that matches no item names no song -- never the album's title"
+    (let [f (feed/read-feed album-xml "not-on-this-album")]
+      (is (nil? (:item-title f)))
+      (is (= "Strange Love" (:artist f)))))
+  (testing "a title longer than any song's is refused, not cut"
+    (is (nil? (:item-title (feed/read-feed (str/replace album-xml "Cats in the Hall"
+                                                        (apply str (repeat 300 "x")))
+                                           "03990582-c211-4b7a-9bca-a673300727c9"))))))
+
+(deftest the-real-msp-album-names-the-song
+  ;; A trimmed copy of the feed MSP hosts for Strange Love's "The EP
+  ;; (Amnesia)" on 2026-11-26, the album the note Chad asked about was sent for.
+  (let [xml (str "<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\" xmlns:podcast=\"https://podcastindex.org/namespace/1.0\">\n"
+                 "    <channel>\n"
+                 "        <title>The EP (Amnesia)</title>\n"
+                 "        <itunes:author>Strange Love</itunes:author>\n"
+                 "        <generator>MSP 2.0 - Music Side Project Studio</generator>\n"
+                 "        <podcast:medium>music</podcast:medium>\n"
+                 "        <podcast:person group=\"music\" role=\"vocalist\">Josh Moroz</podcast:person>\n"
+                 "        <item>\n"
+                 "            <title>Cats in the Hall</title>\n"
+                 "            <pubDate>Mon, 13 Oct 2025 04:22:00 GMT</pubDate>\n"
+                 "            <guid isPermaLink=\"false\">03990582-c211-4b7a-9bca-a673300727c9</guid>\n"
+                 "            <itunes:image href=\"https://phafe.com/wp-content/uploads/strangelove/EP/EPcovernew.jpeg\" />\n"
+                 "        </item>\n"
+                 "    </channel>\n"
+                 "</rss>\n")
+        f (feed/read-feed xml "03990582-c211-4b7a-9bca-a673300727c9")]
+    (is (= ["Cats in the Hall" "Strange Love" "music"] ((juxt :item-title :artist :medium) f)))))
+
+(deftest a-song-the-bot-cannot-read-costs-only-the-song
+  ;; An emoji written as an entity is past U+FFFF, where `char` throws. That
+  ;; once read as no feed at all -- on the msp-bot, no generator, so the boost
+  ;; was not announced.
+  (let [xml (str "<rss><channel><generator>MSP 2.0 - Music Side Project Studio</generator>"
+                 "<podcast:medium>music</podcast:medium>"
+                 "<itunes:author>Band &#x1F3B8;</itunes:author>"
+                 "<item><title>Song &#127925; &#99999999999; &#xD800; &#x110000;</title>"
+                 "<guid>g1</guid></item></channel></rss>")
+        f (feed/read-feed xml "g1")]
+    (is (= "MSP 2.0 - Music Side Project Studio" (:generator f)))
+    (is (= "Song \uD83C\uDFB5 &#99999999999; &#xD800; &#x110000;" (:item-title f))
+        "a real character decodes; a number that names none stays as written")
+    (is (= "Band \uD83C\uDFB8" (:artist f))))
+  (is (= "a\uD83C\uDFB5b" (feed/decode-xml-text "a&#x1F3B5;b")))
+  (is (= "\u00e9" (feed/decode-xml-text "&#233;"))))

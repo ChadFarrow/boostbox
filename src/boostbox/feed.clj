@@ -152,13 +152,28 @@
 (def ^:private entities
   {"amp" "&" "lt" "<" "gt" ">" "quot" "\"" "apos" "'" "#39" "'" "#34" "\""})
 
+(defn- code-point
+  "The character a numeric entity names, or the entity as written when it
+   names none. `char` alone throws past U+FFFF -- an emoji written as
+   `&#127925;` -- and so does parsing more digits than a long holds; either
+   would take the whole feed read down with it, since read-feed answers nil
+   for any throw. A surrogate on its own is not a character, so it stays as
+   written too."
+  [^String digits radix ^String whole]
+  (let [cp (when (<= (count digits) 8)
+             (Long/parseLong digits (int radix)))]
+    (if (and cp (<= cp Character/MAX_CODE_POINT)
+             (not (<= 0xD800 cp 0xDFFF)))
+      (String. (Character/toChars (int cp)))
+      whole)))
+
 (defn decode-xml-text
   "Resolve the entities a feed actually uses, plus numeric ones. Anything else
    is left as written -- a stray `&` in a title is not an error to guess at."
   [^String s]
   (-> (str/replace (str s) #"&#x([0-9a-fA-F]+);"
-                   (fn [[_ hex]] (str (char (Integer/parseInt hex 16)))))
-      (str/replace #"&#(\d+);" (fn [[_ dec]] (str (char (Integer/parseInt dec)))))
+                   (fn [[whole hex]] (code-point hex 16 whole)))
+      (str/replace #"&#(\d+);" (fn [[whole dec]] (code-point dec 10 whole)))
       (str/replace #"&([a-zA-Z]+);" (fn [[whole nm]] (get entities nm whole)))
       (str/replace "<![CDATA[" "")
       (str/replace "]]>" "")))
@@ -476,12 +491,55 @@
           not-empty
           (as-> g (when (<= (count g) max-generator-length) g))))
 
+;; ~~~~~~~~~~~~~~~~~~~ The song ~~~~~~~~~~~~~~~~~~~
+
+(def max-song-text-length
+  "Longer than this is not a song title or an artist's name. Refused rather
+   than cut, as the generator is."
+  200)
+
+(defn- one-line
+  "The text of the first `<name>` block in `slice`, decoded and on one line, or
+   nil. Every control character goes, newlines included: this text is printed
+   into a note the bot signs, and a newline in a feed's title would let the
+   feed forge a line of that note."
+  [^String slice ^String name]
+  (some-> (first (find-blocks slice name 1))
+          :inner
+          decode-xml-text
+          (str/replace #"\p{Cntrl}" " ")
+          (str/replace #"\s+" " ")
+          str/trim
+          not-empty
+          (as-> s (when (<= (count s) max-song-text-length) s))))
+
+(defn item-title
+  "The `<title>` of the item a boost was sent for, or nil.
+
+   The item's own markup only, never item-or-channel: when the guid matches no
+   item, the channel's title is the album's, and printing it as the song would
+   name a song nobody boosted."
+  [item]
+  (when item (one-line item "title")))
+
+(defn artist
+  "Who made the item: its own `<itunes:author>`, else the channel's. MSP 2.0
+   writes the artist as the channel's author and none on the items."
+  [item ^String channel]
+  (item-or-channel #(one-line % "itunes:author") item channel))
+
+(defn medium
+  "The channel's `<podcast:medium>`, lower-cased, or nil. A feed with none is
+   a podcast by the spec's own default."
+  [^String channel]
+  (some-> (one-line channel "podcast:medium") str/lower-case))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Entry point ~~~~~~~~~~~~~~~~~~~
 
 (defn read-feed
-  "{:npubs :art :fediverse :publisher-guid :recipients :generator} for one
-   feed document. Returns nil for anything unusable, so a caller has one thing
-   to test rather than several."
+  "{:npubs :art :fediverse :publisher-guid :recipients :generator :medium
+   :item-title :artist} for one feed document. Returns nil for anything
+   unusable, so a caller has one thing to test rather than several."
   [^String xml item-guid]
   (try
     (when-not (str/blank? xml)
@@ -497,8 +555,18 @@
             art (item-or-channel image-in item channel)
             publisher (publisher-guid clean)
             recipients (item-or-channel recipients-in item channel)
-            built-by (generator channel)]
-        (when (or (seq npubs) art fediverse publisher recipients built-by)
+            built-by (generator channel)
+            ;; read from the item and channel already found, so the song costs
+            ;; no walk of the document of its own -- see the-scan-is-linear.
+            ;; Each on its own: a song the bot cannot read must never cost the
+            ;; note its cover, its p tags or (on the msp-bot) its generator.
+            safely #(try (%) (catch Exception _ nil))
+            kind (safely #(medium channel))
+            title (safely #(item-title item))
+            made-by (safely #(artist item channel))]
+        (when (or (seq npubs) art fediverse publisher recipients built-by
+                  kind title made-by)
           {:npubs npubs :art art :fediverse fediverse :publisher-guid publisher
-           :recipients recipients :generator built-by})))
+           :recipients recipients :generator built-by
+           :medium kind :item-title title :artist made-by})))
     (catch Exception _ nil)))

@@ -827,3 +827,110 @@
             (is (str/includes? url (str (name k) "=")))))))
     (testing "no art, no title, no episode and a zero amount yield no params"
       (is (= {} (bg/banner-params (bg/normalize {}) nil 0))))))
+
+;; ~~~~~~~~~~~~~~~~~~~ The song a music show's boost was sent for ~~~~~~~~~~~~~~~~~~~
+
+(def ^:private homegrown-boost
+  "The record behind the note Chad asked about on 2026-11-26 (tardbox
+   01M8DCMPMFE2A887HJHR3SBGQ4): a BoostMeBitch boost on Homegrown Hits 160,
+   sent for a song inside it. The song is only the two remote guids."
+  (bg/normalize {"action" "boost"
+                 "message" "https://gifs.nostr.build/d7bc445e4104b2fb4203eee116a8086b10f7534a44f6ed3a5e2e5a3d36bf28eb.gif"
+                 "sender_name" "ChadF and 33 others"
+                 "app_name" "BoostMeBitch"
+                 "app_version" "0.1.0"
+                 "feed_title" "Homegrown Hits"
+                 "item_title" "Homegrown Hits Episode 160"
+                 "item_guid" "homegrownhits-160"
+                 "remote_feed_guid" "27735a10-3775-503d-b038-70b4b7d536ab"
+                 "remote_item_guid" "03990582-c211-4b7a-9bca-a673300727c9"
+                 "recipient_name" "MSP 2.0"
+                 "value_msat_total" 333000}))
+
+(def ^:private cats-in-the-hall {:title "Cats in the Hall" :artist "Strange Love"})
+
+(deftest a-note-names-the-song-it-was-sent-for
+  (let [b homegrown-boost
+        song (bg/note-song b cats-in-the-hall)
+        before (bg/->note-content b {:banner-url (bg/banner-url "https://tardbox.com" b nil 333000 "MSP 2.0")})
+        after (bg/->note-content b {:banner-url (bg/banner-url "https://tardbox.com" b nil 333000 "MSP 2.0" song)
+                                    :song song})]
+    (testing "with no song, the note is exactly what it was"
+      (is (= (str "⚡ Boost ⚡\n"
+                  "\n"
+                  "https://gifs.nostr.build/d7bc445e4104b2fb4203eee116a8086b10f7534a44f6ed3a5e2e5a3d36bf28eb.gif\n"
+                  "\n"
+                  "ChadF and 33 others boosted 333 sats → Homegrown Hits\n"
+                  "📻 Homegrown Hits Episode 160\n"
+                  "\n"
+                  "https://tardbox.com/og/boost.png?title=Homegrown+Hits&ep=Homegrown+Hits+Episode+160&sats=333&by=MSP+2.0")
+             before))
+      (is (= before (bg/->note-content b {:banner-url (bg/banner-url "https://tardbox.com" b nil 333000 "MSP 2.0" nil)
+                                          :song nil}))))
+    (testing "with one, the song goes under the episode, and the picture names it"
+      (is (= (str "⚡ Boost ⚡\n"
+                  "\n"
+                  "https://gifs.nostr.build/d7bc445e4104b2fb4203eee116a8086b10f7534a44f6ed3a5e2e5a3d36bf28eb.gif\n"
+                  "\n"
+                  "ChadF and 33 others boosted 333 sats → Homegrown Hits\n"
+                  "📻 Homegrown Hits Episode 160\n"
+                  "🎵 Cats in the Hall by Strange Love\n"
+                  "\n"
+                  "https://tardbox.com/og/boost.png?title=Homegrown+Hits&ep=Homegrown+Hits+Episode+160&sats=333&by=MSP+2.0&song=Cats+in+the+Hall&artist=Strange+Love")
+             after)))))
+
+(deftest which-song-a-note-names
+  (let [b homegrown-boost]
+    (is (= cats-in-the-hall (bg/note-song b cats-in-the-hall)))
+    (is (= {:title "Cats in the Hall"} (bg/note-song b {:title "Cats in the Hall"}))
+        "no artist, no \"by\"")
+    (is (= {:title "Strange Love"} (bg/note-song b {:title "Strange Love" :artist " strange love "}))
+        "an artist that only repeats the title is left out")
+    (is (nil? (bg/note-song b {:title " homegrown hits EPISODE 160 " :artist "X"}))
+        "a title the 📻 line already says is not said twice")
+    (is (nil? (bg/note-song b {:artist "Strange Love"})) "an artist alone names no song")
+    (is (nil? (bg/note-song b {:title "  "})))
+    (is (nil? (bg/note-song b nil)))
+    (testing "feed text is bounded like the payer's: one line, and no longer
+              than a title may be"
+      (let [{:keys [title artist]} (bg/note-song b {:title (str "Cats\nin the Hall" (char 7))
+                                                    :artist (apply str (repeat 300 "a"))})]
+        (is (not (re-find #"\p{Cntrl}" title)))
+        (is (= (inc bg/max-name-length) (count artist)))
+        (is (str/ends-with? artist "…"))))))
+
+(deftest the-song-is-a-new-banner-parameter-and-nothing-else-moves
+  (let [b homegrown-boost
+        url (fn [& [song]] (bg/banner-url "https://tardbox.com" b "https://a.example/c.jpg" 333000 "MSP 2.0" song))]
+    (is (= (url) (bg/banner-url "https://tardbox.com" b "https://a.example/c.jpg" 333000 "MSP 2.0"))
+        "no song, the same URL byte for byte")
+    (is (= (str (url) "&song=Cats+in+the+Hall&artist=Strange+Love") (url cats-in-the-hall))
+        "the two new parameters come last, so every existing one keeps its place")
+    (is (= (str (url) "&song=Cats+in+the+Hall") (url {:title "Cats in the Hall"})))
+    (is (= (url) (url {:artist "Strange Love"})) "an artist with no song adds nothing")
+    (testing "a long title is cut before it reaches the URL, whose imeta tag has
+              a limit of its own"
+      (let [p (bg/banner-params b nil 333000 nil {:title (apply str (repeat 300 "x"))
+                                                  :artist (apply str (repeat 300 "y"))})]
+        (is (= bg/max-banner-song-length (count (:song p))))
+        (is (= bg/max-banner-artist-length (count (:artist p))))))))
+
+(deftest a-post-names-the-song-as-the-note-does
+  (let [b homegrown-boost
+        song (bg/note-song b cats-in-the-hall)]
+    (is (str/includes? (bg/->mastodon-content b {:song song})
+                       "📻 Homegrown Hits Episode 160\n🎵 Cats in the Hall by Strange Love\n"))
+    (is (not (str/includes? (bg/->mastodon-content b {}) "🎵")))
+    (testing "feed text is defanged like the payer's: it cannot mention or tag"
+      (let [out (bg/->mastodon-content b {:song {:title "#cats @dave@example.social"
+                                                 :artist "@band"}})]
+        (is (str/includes? out "#​cats @​dave@​example.social by @​band"))))
+    (testing "the song line counts against the limit, and the message gives way"
+      (let [limit (+ 20 (count (bg/->mastodon-content (assoc b :message nil) {:song song})))
+            out (bg/->mastodon-content b {:song song :max-chars limit})]
+        (is (<= (count out) limit))
+        (is (str/includes? out "🎵 Cats in the Hall by Strange Love"))
+        (is (str/includes? out "…") "the message was cut to make room")))
+    (is (= "Boost banner: 333 sats to Homegrown Hits — Homegrown Hits Episode 160 — Cats in the Hall by Strange Love"
+           (bg/banner-alt-text b 333000 song)))
+    (is (= (bg/banner-alt-text b 333000) (bg/banner-alt-text b 333000 nil)))))

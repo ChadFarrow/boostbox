@@ -520,13 +520,51 @@
   [b received-msat]
   (or (:value-msat-total b) received-msat (:value-msat b)))
 
+(defn note-song
+  "The song a note names, as {:title :artist}, or nil.
+
+   `song` is what the bot read out of the song's own feed (the remote feed of a
+   music show's boost): never anything the payer wrote, since blip-10 carries
+   no song title, only the two remote guids. Nothing is named when the title is
+   the episode's own, which the 📻 line already says, and `:artist` is dropped
+   when it only repeats the title. Both are bounded here, at the boundary, as
+   normalize bounds the payer's fields: a feed is reached by an address whoever
+   paid us could have taught the bot, so its text is only as trustworthy as
+   theirs."
+  [b song]
+  (let [fold #(some-> % str/trim str/lower-case)
+        title (clean (:title song) max-title-length)
+        artist (clean (:artist song) max-name-length)]
+    (when (and title (not= (fold title) (fold (:episode b))))
+      (cond-> {:title title}
+        (and artist (not= (fold artist) (fold title))) (assoc :artist artist)))))
+
+(defn- song-line
+  "\"🎵 Cats in the Hall by Strange Love\", or nil. Takes note-song's answer."
+  [{:keys [title artist]}]
+  (when title
+    (str "🎵 " title (when artist (str " by " artist)))))
+
 (def banner-param-order
   "The order the query string is written in.
 
    Fixed, and not merely the map's iteration order, because the URL itself is
    the contract: two notes describing the same boost must carry byte-identical
-   picture URLs, or a client caches one and refetches the other."
-  [:art :title :ep :sats :by])
+   picture URLs, or a client caches one and refetches the other. `song` and
+   `artist` come last and only for a boost that names a song, so every other
+   URL is byte-identical to the ones published before they existed."
+  [:art :title :ep :sats :by :song :artist])
+
+(def max-banner-song-length
+  "How much of a song's title the picture's URL carries. The banner draws far
+   less than this; the cap is for the URL, whose `imeta` tag is dropped past
+   max-tag-item-length."
+  60)
+
+(def max-banner-artist-length 40)
+
+(defn- cap [s n]
+  (when s (if (> (count s) n) (str (str/trimr (subs s 0 (dec n))) "…") s)))
 
 (defn banner-params
   "The picture's parameters, under the names boostbox.banner reads them by.
@@ -538,11 +576,16 @@
    Naming them once is what keeps the URL on a note and the picture posted
    beside it from describing different boosts.
 
-   The names are boostmebitch's (`by` is ours) and they are a PERMANENT PUBLIC
-   CONTRACT -- see banner-url directly below. `by` is dropped for the default
-   client name, for the reason banner-url gives."
-  ([b art total-msat] (banner-params b art total-msat nil))
-  ([b art total-msat by]
+   The names are boostmebitch's (`by`, `song` and `artist` are ours) and they
+   are a PERMANENT PUBLIC CONTRACT -- see banner-url directly below. `by` is
+   dropped for the default client name, for the reason banner-url gives.
+   `song` is note-song's answer; the title and the artist are two parameters
+   rather than one drawn line, so the picture's layout can change later without
+   a new name (BMB re-ordered its own lines that way, and every old note
+   followed)."
+  ([b art total-msat] (banner-params b art total-msat nil nil))
+  ([b art total-msat by] (banner-params b art total-msat by nil))
+  ([b art total-msat by song]
    (let [sats (quot (long (or total-msat 0)) 1000)
          by (when-not (or (str/blank? (str by)) (= by default-client-name)) by)]
      (cond-> {}
@@ -550,7 +593,10 @@
        (:podcast b) (assoc :title (:podcast b))
        (:episode b) (assoc :ep (:episode b))
        (pos? sats) (assoc :sats sats)
-       by (assoc :by by)))))
+       by (assoc :by by)
+       (:title song) (assoc :song (cap (:title song) max-banner-song-length))
+       (and (:title song) (:artist song))
+       (assoc :artist (cap (:artist song) max-banner-artist-length))))))
 
 (defn banner-url
   "The picture the note carries: the boost banner on the BoostBox web app.
@@ -567,12 +613,14 @@
    `by` is the signing account's name, for a bot with a key of its own, so the
    picture and the `client` tag agree. The default name adds nothing -- the
    server's wordmark already says it -- which keeps the URLs of every bot on
-   the default byte-identical to the ones published before `by` existed."
-  ([base-url b art total-msat] (banner-url base-url b art total-msat nil))
-  ([base-url b art total-msat by]
+   the default byte-identical to the ones published before `by` existed. `song`
+   works the same way: no song, no parameter."
+  ([base-url b art total-msat] (banner-url base-url b art total-msat nil nil))
+  ([base-url b art total-msat by] (banner-url base-url b art total-msat by nil))
+  ([base-url b art total-msat by song]
    (when-not (str/blank? (str base-url))
      (let [enc #(java.net.URLEncoder/encode (str %) "UTF-8")
-           params (banner-params b art total-msat by)
+           params (banner-params b art total-msat by song)
            qs (for [k banner-param-order
                     :let [v (get params k)]
                     :when (some? v)]
@@ -602,14 +650,21 @@
    app the boost came from -- the episode where the app has a route for one,
    the show otherwise -- so a reader can go listen to the thing that was
    boosted. Its origin comes from boostbox.applinks' own table and never from
-   the payment, which is what makes it safe to sign: see that namespace."
-  [b {:keys [received-msat banner-url]}]
+   the payment, which is what makes it safe to sign: see that namespace.
+
+   The song line is the second departure. A music show's boost names the show
+   and the episode, but what the listener boosted was the song playing in it,
+   which the boost carries only as two remote guids. `song` is note-song's
+   answer, read by the bot from the song's own feed; with none, the note is
+   exactly what it was before the line existed."
+  [b {:keys [received-msat banner-url song]}]
   (let [total (note-total-msat b received-msat)
         show (:podcast b)
         episode (:episode b)
         sender (:sender-name b)
         message (:message b)
         app (al/app-link b)
+        song (song-line song)
         links (->> [banner-url] (remove str/blank?) (remove nil?))]
     (->> (concat
           ["⚡ Boost ⚡" ""]
@@ -618,6 +673,7 @@
                 " " (note-sats total)
                 (when show (str " → " show)))]
           (when episode [(str "📻 " episode)])
+          (when song [song])
           ;; label and URL on separate lines: a client that pulls the URL out
           ;; into a preview card would otherwise leave the separator dangling
           ;; at the end of the label, and one that renders links inline reads
@@ -702,13 +758,17 @@
    Built from the same three facts the picture is drawn from, so it describes
    what is actually in the image. Mastodon readers expect alt text and screen
    readers get nothing from the banner without it -- the amount, the show and
-   the episode are the whole content of the picture."
-  [b total-msat]
-  (let [show (:podcast b)
-        episode (:episode b)]
-    (str "Boost banner: " (note-sats total-msat)
-         (when show (str " to " show))
-         (when episode (str " — " episode)))))
+   the episode are the whole content of the picture -- and the song, on a
+   banner that draws one (`song` is note-song's answer)."
+  ([b total-msat] (banner-alt-text b total-msat nil))
+  ([b total-msat song]
+   (let [show (:podcast b)
+         episode (:episode b)
+         {:keys [title artist]} song]
+     (str "Boost banner: " (note-sats total-msat)
+          (when show (str " to " show))
+          (when episode (str " — " episode))
+          (when title (str " — " title (when artist (str " by " artist))))))))
 
 (defn ->mastodon-content
   "The body of the Mastodon status announcing one boost.
@@ -744,14 +804,21 @@
 
    The BoostBox permalink is left out for the same reason ->note-content leaves
    it out: a client renders a bare link as a preview card, and a card whose
-   whole content is a boost id says nothing the post has not already said."
-  [b {:keys [received-msat fediverse max-chars]}]
+   whole content is a boost id says nothing the post has not already said.
+
+   The song line is the note's (`song` is note-song's answer), defanged like
+   the payer's fields: it comes from a feed, and a feed is reached by an
+   address whoever paid us could have taught the bot."
+  [b {:keys [received-msat fediverse max-chars song]}]
   (let [total (note-total-msat b received-msat)
         limit (long (or max-chars default-mastodon-max-chars))
         ;; every one of these four is written by whoever paid -- see defang
         show (defang (:podcast b))
         episode (defang (:episode b))
         sender (defang (:sender-name b))
+        song (song-line (some-> song
+                                (update :title defang)
+                                (cond-> (:artist song) (update :artist defang))))
         app (al/app-link b)
         profile (some-> fediverse str str/trim not-empty)
         head "⚡ Boost ⚡"
@@ -760,6 +827,7 @@
                          " " (note-sats total)
                          (when show (str " → " show)))]
                    (when episode [(str "📻 " episode)])
+                   (when song [song])
                    (when app [(str (if (:episode? app) "▶️ Listen on " "🎧 Find it on ")
                                    (:label app))
                               (:url app)])
