@@ -655,6 +655,21 @@
       fallback-art
       (when-not pi-asked? (pi-cover ctx boostagram))))
 
+(defn note-song
+  "The song a music show's boost was sent for, as bg/note-song gives it, or
+   nil.
+
+   Read from `remote-ctx`, the song's own feed, which publish-boost! already
+   reads for the artist's publisher guid -- so naming the song costs no fetch
+   of its own, and a feed that is slow or missing costs the note only this
+   line. blip-10 carries no song title, so there is nothing to read from the
+   payment first. Only a feed whose `<podcast:medium>` is music names a song:
+   a remote item can be a podcast episode too, and \"🎵\" over an episode
+   would be wrong."
+  [b remote-ctx]
+  (when (= "music" (:medium remote-ctx))
+    (bg/note-song b {:title (:item-title remote-ctx) :artist (:artist remote-ctx)})))
+
 (defn build-note
   "The signed kind:1 event for a boost.
 
@@ -689,14 +704,16 @@
               (note-art ctx boostagram {:feed-ctx ctxt :remote-ctx remote-ctx
                                         :fallback-art fallback-art
                                         :pi-asked? pi-asked?}))
-        banner (bg/banner-url (:boostbox-url ctx) boostagram art total client-name)]
+        song (note-song boostagram remote-ctx)
+        banner (bg/banner-url (:boostbox-url ctx) boostagram art total client-name song)]
     (nostr/sign-event seckey
                       {:kind 1
                        :created-at (if settled-at (min (long settled-at) now) now)
                        :content (bg/->note-content boostagram
                                                    {:boost-url boost-url
                                                     :received-msat received-msat
-                                                    :banner-url banner})
+                                                    :banner-url banner
+                                                    :song song})
                        :tags (bg/->nip73-tags boostagram
                                               {:boost-url boost-url
                                                :npubs (note-npubs remote-ctx ctxt)
@@ -765,20 +782,21 @@
    `fediverse` are worked out once by publish-boost!, for the note and the post
    alike."
   [{:keys [dry-run?] :as ctx} boostagram
-   {:keys [payment-hash received-msat fediverse art]}]
+   {:keys [payment-hash received-msat fediverse art song]}]
   (when (mastodon/configured? ctx)
     (try
       (let [total (bg/note-total-msat boostagram received-msat)
             text (bg/->mastodon-content boostagram
                                         {:received-msat received-msat
                                          :fediverse fediverse
-                                         :max-chars (:mastodon-max-chars ctx)})]
+                                         :max-chars (:mastodon-max-chars ctx)
+                                         :song song})]
         (if dry-run?
           (do (u/log ::dry-run-mastodon :payment-hash payment-hash :status text)
               nil)
           (let [png (try
                       (banner/banner-png (bg/banner-params boostagram art total
-                                                           (:client-name ctx))
+                                                           (:client-name ctx) song)
                                          (or (not-empty (str (:banner-wordmark (:bb-cfg ctx))))
                                              bg/default-client-name))
                       (catch Exception e
@@ -787,7 +805,7 @@
                         nil))
                 media (when png
                         (mastodon/upload-media!
-                         ctx png (bg/banner-alt-text boostagram total)))
+                         ctx png (bg/banner-alt-text boostagram total song)))
                 {:keys [ok? id error]} (mastodon/post-status!
                                         ctx
                                         {:text text
@@ -932,6 +950,8 @@
                 mastodon-opts {:payment-hash payment-hash
                                :received-msat received-msat
                                :art art
+                               ;; build-note works out the same from `remote`
+                               :song (note-song announced-b remote)
                                ;; the album's account before the show's, as
                                ;; with the npubs and the art
                                :fediverse (or (:fediverse remote) (:fediverse host))}

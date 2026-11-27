@@ -1661,3 +1661,78 @@
     (is (= (+ to 60) (get @a "cursor")) "the same value never rewinds twice")
     (#'bot/apply-rewind! (ctx a))
     (is (= (+ to 60) (get @a "cursor")) "unset is a no-op")))
+
+;; ~~~~~~~~~~~~~~~~~~~ The song a music show's boost was sent for ~~~~~~~~~~~~~~~~~~~
+
+(def ^:private song-album
+  "What the bot reads from the song's own album: the remote feed it already
+   reads for the artist's publisher guid."
+  {:medium "music" :item-title "Cats in the Hall" :artist "Strange Love"})
+
+(deftest a-music-show-boost-names-its-song
+  (let [b (bg/normalize {"action" "boost" "podcast" "Homegrown Hits"
+                         "episode" "Homegrown Hits Episode 160"
+                         "remote_feed_guid" album-guid "remote_item_guid" "03990582"
+                         "value_msat_total" 333000})
+        note (fn [remote]
+               (:content (bot/build-note (ctx (atom {}) :feed-lookup? false :client-name "MSP 2.0") b
+                                         {:boost-url "u" :received-msat 3000 :remote-ctx remote})))]
+    (is (str/includes? (note song-album) "📻 Homegrown Hits Episode 160\n🎵 Cats in the Hall by Strange Love\n"))
+    (is (str/includes? (note song-album) "&by=MSP+2.0&song=Cats+in+the+Hall&artist=Strange+Love")
+        "and the picture names it")
+    (testing "no album read, or one that names no song, is the note as it was"
+      (let [before (note nil)]
+        (is (not (str/includes? before "🎵")))
+        (is (not (str/includes? before "song=")))
+        (is (= before (note {:medium "music" :publisher-guid artist})
+               (note {:medium "music" :artist "Strange Love"})))))
+    (testing "only a music feed names a song: a remote item can be an episode"
+      (is (not (str/includes? (note (assoc song-album :medium "podcast")) "🎵")))
+      (is (not (str/includes? (note (dissoc song-album :medium)) "🎵"))))))
+
+(defn- song-poll!
+  "One poll of a music show's boost on the plain bot, with the song's album
+   answering `album` from its read. Answers the published notes."
+  [album]
+  (let [a (atom {"cursor" 50 "recent" [] "feeds" {album-guid "https://x.example/album.xml"}})
+        published (atom [])
+        t1 (tx "h1" 100)
+        b (-> (boost "h1" 100)
+              (assoc-in [:boostagram :remote-feed-guid] album-guid)
+              (assoc-in [:boostagram :remote-item-guid] "03990582"))]
+    (with-redefs [nwc/list-transactions! (wallet-after [t1])
+                  nwc/transaction->boost {t1 b}
+                  bot/feed-context (fn [_ _] nil)
+                  bot/read-feed-at (fn [_ url item]
+                                     (when (and (= url "https://x.example/album.xml") (= item "03990582"))
+                                       (album)))
+                  bot/store-boost! (fn [_ _] {:id "01K9" :url "https://tardbox.com/boost/01K9"})
+                  relay/publish-to-relays! (fn [_ e] (swap! published conj e) {:ok? true :results []})]
+      (bot/poll-once! (ctx a :feed-lookup? true) ::session))
+    @published))
+
+(deftest a-song-is-named-end-to-end-and-a-failed-read-costs-only-the-line
+  (let [[e] (song-poll! (constantly song-album))]
+    (is (str/includes? (:content e) "🎵 Cats in the Hall by Strange Love")))
+  (testing "the album read failing -- read-feed-at answers nil for every
+            failure -- still publishes the note, as it was"
+    (let [published (song-poll! (constantly nil))]
+      (is (= 1 (count published)))
+      (is (not (str/includes? (:content (first published)) "🎵")))
+      (is (str/starts-with? (:content (first published)) "⚡ Boost ⚡\n\nhi\n\nBoosted 2100 sats → Podcasting 2.0")))))
+
+(deftest a-post-names-the-song-the-note-names
+  (let [posts (atom []) media (atom [])]
+    (with-redefs [banner/banner-png (fn [params _] (swap! media conj params) (byte-array 4))
+                  mastodon/upload-media! (fn [_ _ alt] alt)
+                  mastodon/post-status! (fn [_ req] (swap! posts conj req) {:ok? true :id "1"})]
+      (bot/publish-mastodon! (masto-ctx (atom {}))
+                             (bg/normalize {"action" "boost" "podcast" "Homegrown Hits"
+                                            "episode" "Homegrown Hits Episode 160"
+                                            "value_msat_total" 333000})
+                             {:payment-hash "h1" :song {:title "Cats in the Hall" :artist "Strange Love"}}))
+    (is (str/includes? (:text (first @posts)) "\n🎵 Cats in the Hall by Strange Love\n"))
+    (is (= ["Cats in the Hall" "Strange Love"] ((juxt :song :artist) (first @media)))
+        "the attached picture is drawn from the same song")
+    (is (str/ends-with? (first (:media-ids (first @posts))) "— Cats in the Hall by Strange Love")
+        "and its alt text says it")))

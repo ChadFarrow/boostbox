@@ -476,12 +476,55 @@
           not-empty
           (as-> g (when (<= (count g) max-generator-length) g))))
 
+;; ~~~~~~~~~~~~~~~~~~~ The song ~~~~~~~~~~~~~~~~~~~
+
+(def max-song-text-length
+  "Longer than this is not a song title or an artist's name. Refused rather
+   than cut, as the generator is."
+  200)
+
+(defn- one-line
+  "The text of the first `<name>` block in `slice`, decoded and on one line, or
+   nil. Every control character goes, newlines included: this text is printed
+   into a note the bot signs, and a newline in a feed's title would let the
+   feed forge a line of that note."
+  [^String slice ^String name]
+  (some-> (first (find-blocks slice name 1))
+          :inner
+          decode-xml-text
+          (str/replace #"\p{Cntrl}" " ")
+          (str/replace #"\s+" " ")
+          str/trim
+          not-empty
+          (as-> s (when (<= (count s) max-song-text-length) s))))
+
+(defn item-title
+  "The `<title>` of the item a boost was sent for, or nil.
+
+   The item's own markup only, never item-or-channel: when the guid matches no
+   item, the channel's title is the album's, and printing it as the song would
+   name a song nobody boosted."
+  [item]
+  (when item (one-line item "title")))
+
+(defn artist
+  "Who made the item: its own `<itunes:author>`, else the channel's. MSP 2.0
+   writes the artist as the channel's author and none on the items."
+  [item ^String channel]
+  (item-or-channel #(one-line % "itunes:author") item channel))
+
+(defn medium
+  "The channel's `<podcast:medium>`, lower-cased, or nil. A feed with none is
+   a podcast by the spec's own default."
+  [^String channel]
+  (some-> (one-line channel "podcast:medium") str/lower-case))
+
 ;; ~~~~~~~~~~~~~~~~~~~ Entry point ~~~~~~~~~~~~~~~~~~~
 
 (defn read-feed
-  "{:npubs :art :fediverse :publisher-guid :recipients :generator} for one
-   feed document. Returns nil for anything unusable, so a caller has one thing
-   to test rather than several."
+  "{:npubs :art :fediverse :publisher-guid :recipients :generator :medium
+   :item-title :artist} for one feed document. Returns nil for anything
+   unusable, so a caller has one thing to test rather than several."
   [^String xml item-guid]
   (try
     (when-not (str/blank? xml)
@@ -497,8 +540,15 @@
             art (item-or-channel image-in item channel)
             publisher (publisher-guid clean)
             recipients (item-or-channel recipients-in item channel)
-            built-by (generator channel)]
-        (when (or (seq npubs) art fediverse publisher recipients built-by)
+            built-by (generator channel)
+            ;; read from the item and channel already found, so the song costs
+            ;; no walk of the document of its own -- see the-scan-is-linear
+            kind (medium channel)
+            title (item-title item)
+            made-by (artist item channel)]
+        (when (or (seq npubs) art fediverse publisher recipients built-by
+                  kind title made-by)
           {:npubs npubs :art art :fediverse fediverse :publisher-guid publisher
-           :recipients recipients :generator built-by})))
+           :recipients recipients :generator built-by
+           :medium kind :item-title title :artist made-by})))
     (catch Exception _ nil)))

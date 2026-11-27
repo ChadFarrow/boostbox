@@ -91,3 +91,25 @@
     (is (false? (banner/allow? addr)) "one past the allowance is refused")
     (testing "and one caller's burst does not spend another's"
       (is (true? (banner/allow? (str addr "-other")))))))
+
+(deftest a-banner-without-a-song-is-the-banner-it-always-was
+  ;; The picture is drawn on request, so a layout change reaches every note
+  ;; ever published. Notes that name no song must keep the picture they have:
+  ;; the song moves nothing unless it is there.
+  (let [m {:title "Homegrown Hits" :episode "Homegrown Hits Episode 160"
+           :sats "333" :wordmark "MSP 2.0" :art (cover 600 600)}
+        png #(vec (banner/render %))]
+    (is (= (png m) (png (assoc m :song nil :artist nil))))
+    (is (not= (png m) (png (assoc m :song "Cats in the Hall" :artist "Strange Love"))))
+    (testing "an artist with no song draws nothing"
+      (is (= (vec (banner/banner-png {:title "X" :ep "Y"} "tardbox.com"))
+             (vec (banner/banner-png {:title "X" :ep "Y" :artist "Strange Love"} "tardbox.com")))))
+    (testing "a blank song is no song"
+      (is (= (vec (banner/banner-png {:title "X"} "tardbox.com"))
+             (vec (banner/banner-png {:title "X" :song " \n " :artist "Z"} "tardbox.com")))))
+    (doseq [[label m'] [["song and episode" (assoc m :song "Cats in the Hall" :artist "Strange Love")]
+                        ["song, no episode" (assoc (dissoc m :episode) :song "Cats in the Hall")]
+                        ["a song too long for the line"
+                         (assoc m :song (apply str (repeat 60 "W")) :artist (apply str (repeat 60 "W")))]]]
+      (let [img (decode (banner/render m'))]
+        (is (= [banner/width banner/height] [(.getWidth img) (.getHeight img)]) label)))))

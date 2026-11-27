@@ -970,7 +970,8 @@
       (:remote-addr request)))
 
 (defn boost-banner
-  "The picture a boost note carries: GET /og/boost.png?art=&title=&ep=&sats=&by=
+  "The picture a boost note carries:
+   GET /og/boost.png?art=&title=&ep=&sats=&by=&song=&artist=
 
    THIS URL IS A PERMANENT PUBLIC CONTRACT. Every boost note the bot publishes
    writes it into a signed kind:1, which cannot be edited, so renaming the path
@@ -982,7 +983,9 @@
    then interchangeable, and a note published by either app renders the same
    way. `by` is ours alone: the name of the account that signed the note, in
    place of this server's wordmark, for a bot publishing under a key of its
-   own."
+   own. So are `song` and `artist`: the song a music show's boost was sent
+   for, drawn under the episode. A URL without `song` draws exactly the
+   picture it drew before the two existed."
   [cfg]
   (fn [request]
     (if-not (banner/allow? (client-address request))
@@ -998,7 +1001,8 @@
               png (banner/banner-png
                    {:title (get q "title") :ep (get q "ep") :sats (get q "sats")
                     :art (get q "art") :art2 (get q "art2") :art3 (get q "art3")
-                    :by (get q "by")}
+                    :by (get q "by")
+                    :song (get q "song") :artist (get q "artist")}
                    wordmark)]
           {:status 200
            :headers {"content-type" "image/png"
