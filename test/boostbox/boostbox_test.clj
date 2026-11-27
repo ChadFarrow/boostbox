@@ -1,6 +1,7 @@
 (ns boostbox.boostbox-test
   (:require [clojure.test :refer [deftest testing is]]
             [boostbox.boostbox :as bb]
+            [boostbox.banner :as banner]
             [boostbox.images :as images]
             [boostbox.ulid :as ulid]
             [dev.onionpancakes.chassis.core :as html]
@@ -686,3 +687,23 @@
        (is (= "1 boost" (second (re-find #"class=\"boost-count\">([^<]*)" body))))
        (is (= 200 (:status (http/get (str base-url "/boost/" second-id) {:throw false})))
            "the other leg's own page still answers")))))
+
+(deftest the-banner-route-passes-the-song-through
+  ;; /og/boost.png is a permanent contract: a URL without `song` must draw the
+  ;; very picture it drew before, and one with it must reach the renderer.
+  (with-redefs [banner/fetch-art (fn [_] nil)]
+    (let [handler (bb/boost-banner {:banner-wordmark "tardbox.com"})
+          route (fn [q]
+                  (let [r (handler {:query-params q :remote-addr (str "test-" (System/nanoTime))})]
+                    (is (= 200 (:status r)))
+                    (vec (.readAllBytes ^java.io.InputStream (:body r)))))
+          direct (fn [m] (vec (banner/banner-png m "tardbox.com")))]
+      (is (= (direct {:title "Homegrown Hits" :ep "Episode 160" :sats "21"})
+             (route {"title" "Homegrown Hits" "ep" "Episode 160" "sats" "21"})))
+      (is (= (direct {:title "Homegrown Hits" :ep "Episode 160" :sats "21"
+                      :song "Cats in the Hall" :artist "Strange Love"})
+             (route {"title" "Homegrown Hits" "ep" "Episode 160" "sats" "21"
+                     "song" "Cats in the Hall" "artist" "Strange Love"})))
+      (is (not= (route {"title" "Homegrown Hits" "ep" "Episode 160" "sats" "21"})
+                (route {"title" "Homegrown Hits" "ep" "Episode 160" "sats" "21"
+                        "song" "Cats in the Hall"}))))))

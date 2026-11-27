@@ -415,3 +415,20 @@
                  "</rss>\n")
         f (feed/read-feed xml "03990582-c211-4b7a-9bca-a673300727c9")]
     (is (= ["Cats in the Hall" "Strange Love" "music"] ((juxt :item-title :artist :medium) f)))))
+
+(deftest a-song-the-bot-cannot-read-costs-only-the-song
+  ;; An emoji written as an entity is past U+FFFF, where `char` throws. That
+  ;; once read as no feed at all -- on the msp-bot, no generator, so the boost
+  ;; was not announced.
+  (let [xml (str "<rss><channel><generator>MSP 2.0 - Music Side Project Studio</generator>"
+                 "<podcast:medium>music</podcast:medium>"
+                 "<itunes:author>Band &#x1F3B8;</itunes:author>"
+                 "<item><title>Song &#127925; &#99999999999; &#xD800; &#x110000;</title>"
+                 "<guid>g1</guid></item></channel></rss>")
+        f (feed/read-feed xml "g1")]
+    (is (= "MSP 2.0 - Music Side Project Studio" (:generator f)))
+    (is (= "Song \uD83C\uDFB5 &#99999999999; &#xD800; &#x110000;" (:item-title f))
+        "a real character decodes; a number that names none stays as written")
+    (is (= "Band \uD83C\uDFB8" (:artist f))))
+  (is (= "a\uD83C\uDFB5b" (feed/decode-xml-text "a&#x1F3B5;b")))
+  (is (= "\u00e9" (feed/decode-xml-text "&#233;"))))
